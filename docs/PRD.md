@@ -129,7 +129,7 @@ Per SQL tab:
 - Run All
 - Explain
 - Stop
-- Row Limit control (default 10)
+- Row Limit control (see Automatic Row Limit)
 
 ## 12. Execution Semantics
 
@@ -143,6 +143,8 @@ Execution states should include queued/running/completed/failed/cancelling/cance
 ## 13. Automatic Row Limit
 
 Default **Row Limit: 10**.
+
+This intentionally conservative default favors safety and responsiveness for ad-hoc queries.
 
 Requirements:
 
