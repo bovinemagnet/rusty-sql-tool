@@ -1,4 +1,4 @@
-# RustSQL / GPUI SQL Client
+# rusty-sql-tool (RustSQL / GPUI SQL Client)
 
 A fast, native desktop SQL client written in Rust with GPUI, focused on PostgreSQL in Phase 1.
 
@@ -10,7 +10,7 @@ Draft implementation repository. This project is currently driven by a product r
 
 See the full specification in:
 
-- `docs/PRD.md`
+- `docs/prd/initial-prd.md`
 
 ## Phase 1 Summary
 
