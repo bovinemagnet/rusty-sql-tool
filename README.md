@@ -11,14 +11,29 @@ cargo run
 ```
 
 At startup the application reads a project-local `.env` when present (FR-003). Supported forms:
+Copy [`.env.sample`](.env.sample) to `.env` and replace its placeholders, or create `.env`
+manually using one of the following forms.
 
 ```dotenv
+CONNECTION_NAME=Local Development
 DATABASE_URL=postgresql://user:password@localhost:5432/database?sslmode=prefer
+```
+
+Multiple connections can be listed with matching suffixes. They are shown by name in the
+Connections pane and can be assigned to the active SQL editor before connecting:
+
+```dotenv
+CONNECTION_NAME_STAGING=Staging
+DATABASE_URL_STAGING=postgresql://user:password@staging.example:5432/database?sslmode=require
+
+CONNECTION_NAME_PRODUCTION=Production Read Only
+DATABASE_URL_PRODUCTION=postgresql://readonly:password@db.example:5432/database?sslmode=require
 ```
 
 or:
 
 ```dotenv
+CONNECTION_NAME=Local Development
 PGHOST=localhost
 PGPORT=5432
 PGDATABASE=database
@@ -43,8 +58,16 @@ logs/errors (FR-002, FR-033).
 - Schema/object metadata is loaded lazily and can be refreshed with `↻` (FR-006–FR-010, FR-030).
 
 The logical command IDs are defined separately from key bindings in `application::command`, as
-required by section 51. `Ctrl/Cmd+Enter` runs the current statement; normal editor copy, cut,
-paste, select-all, undo, and redo shortcuts are supported.
+required by section 51. Current bindings are:
+
+- `Ctrl/Cmd+Enter` — run the current or selected statement.
+- `Ctrl/Cmd+Shift+Enter` — run all statements.
+- `Ctrl/Cmd+Alt+Enter` — explain the current or selected statement.
+- `Escape` or `Ctrl/Cmd+.` — stop a running query.
+- `Ctrl/Cmd+N` — open a new SQL editor.
+- `Ctrl/Cmd+Shift+D` — connect or disconnect.
+
+Normal editor copy, cut, paste, select-all, undo, and redo shortcuts are also supported.
 
 ## Verify
 

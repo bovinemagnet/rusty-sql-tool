@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use rustls::crypto::CryptoProvider;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode as DriverSslMode;
@@ -111,6 +112,9 @@ impl PostgresProvider {
     }
 
     fn tls_connector() -> Option<MakeRustlsConnect> {
+        if !ensure_rustls_crypto_provider() {
+            return None;
+        }
         MakeRustlsConnect::with_native_certs()
             .map(|(connector, _certificate_warnings)| connector)
             .ok()
@@ -131,6 +135,17 @@ impl PostgresProvider {
             .await
             .map_err(|error| safe_error(&error, "PostgreSQL operation failed"))
     }
+}
+
+/// GPUI and the PostgreSQL TLS adapter enable different Rustls crypto backends.
+/// Rustls deliberately panics if both features are present and no process-level
+/// provider was selected, so Phase 1 consistently selects Ring before TLS setup.
+fn ensure_rustls_crypto_provider() -> bool {
+    if CryptoProvider::get_default().is_some() {
+        return true;
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    CryptoProvider::get_default().is_some()
 }
 
 #[async_trait]
@@ -421,5 +436,12 @@ mod tests {
             value_from_text("\\x00ff", "bytea"),
             CellValue::Binary("\\x00ff".into())
         );
+    }
+
+    #[test]
+    fn installs_explicit_rustls_provider_when_multiple_backends_are_enabled() {
+        assert!(ensure_rustls_crypto_provider());
+        assert!(CryptoProvider::get_default().is_some());
+        assert!(PostgresProvider::tls_connector().is_some());
     }
 }

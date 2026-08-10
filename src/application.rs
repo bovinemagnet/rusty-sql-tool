@@ -145,11 +145,7 @@ impl CommandService {
                 Ok(result)
             }
             Err(error) => {
-                editor.execution_status = if error.code.as_deref() == Some("57014") {
-                    ExecutionStatus::Cancelled
-                } else {
-                    ExecutionStatus::Failed
-                };
+                editor.execution_status = failure_status(&error);
                 editor.error = Some(error.clone());
                 Err(error)
             }
@@ -170,7 +166,7 @@ impl CommandService {
                     outcome.results.push(result);
                 }
                 Err(error) => {
-                    editor.execution_status = ExecutionStatus::Failed;
+                    editor.execution_status = failure_status(&error);
                     editor.error = Some(error.clone());
                     outcome.failure = Some(StatementFailure {
                         statement_index,
@@ -199,7 +195,7 @@ impl CommandService {
                 Ok(result)
             }
             Err(error) => {
-                editor.execution_status = ExecutionStatus::Failed;
+                editor.execution_status = failure_status(&error);
                 editor.error = Some(error.clone());
                 Err(error)
             }
@@ -222,6 +218,14 @@ impl CommandService {
     }
 }
 
+fn failure_status(error: &QueryError) -> ExecutionStatus {
+    if error.code.as_deref() == Some("57014") {
+        ExecutionStatus::Cancelled
+    } else {
+        ExecutionStatus::Failed
+    }
+}
+
 fn query_selection_error(error: SqlError) -> QueryError {
     QueryError {
         message: error.to_string(),
@@ -236,6 +240,7 @@ fn query_selection_error(error: SqlError) -> QueryError {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
@@ -243,9 +248,26 @@ mod tests {
     use crate::config::{PostgresConfiguration, SecretString, SslMode};
     use crate::database::ObjectKind;
 
-    #[derive(Default)]
     struct FakeProvider {
         statements: Mutex<Vec<String>>,
+        state: AtomicU8,
+        connect_calls: AtomicUsize,
+        disconnect_calls: AtomicUsize,
+        cancel_calls: AtomicUsize,
+        cancel_fails: AtomicBool,
+    }
+
+    impl Default for FakeProvider {
+        fn default() -> Self {
+            Self {
+                statements: Mutex::default(),
+                state: AtomicU8::new(ConnectionState::Disconnected as u8),
+                connect_calls: AtomicUsize::default(),
+                disconnect_calls: AtomicUsize::default(),
+                cancel_calls: AtomicUsize::default(),
+                cancel_fails: AtomicBool::default(),
+            }
+        }
     }
 
     #[async_trait]
@@ -254,6 +276,9 @@ mod tests {
             &self,
             _profile: &ConnectionProfile,
         ) -> Result<ConnectionInfo, QueryError> {
+            self.connect_calls.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .store(ConnectionState::Connected as u8, Ordering::Release);
             Ok(ConnectionInfo {
                 database: "test".into(),
                 server_version: "PostgreSQL test".into(),
@@ -261,25 +286,28 @@ mod tests {
         }
 
         async fn disconnect(&self) -> Result<(), QueryError> {
+            self.disconnect_calls.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .store(ConnectionState::Disconnected as u8, Ordering::Release);
             Ok(())
         }
 
         async fn execute(&self, sql: &str) -> Result<QueryResult, QueryError> {
             self.statements.lock().unwrap().push(sql.to_owned());
             if sql.contains("FAIL") {
-                return Err(QueryError {
-                    message: "synthetic failure".into(),
-                    severity: None,
-                    code: None,
-                    detail: None,
-                    hint: None,
-                    position: None,
-                });
+                return Err(test_error("synthetic failure", None));
+            }
+            if sql.contains("CANCELLED") {
+                return Err(test_error("cancelled", Some("57014")));
             }
             Ok(QueryResult::default())
         }
 
         async fn cancel(&self) -> Result<(), QueryError> {
+            self.cancel_calls.fetch_add(1, Ordering::Relaxed);
+            if self.cancel_fails.load(Ordering::Acquire) {
+                return Err(test_error("cancellation failed", None));
+            }
             Ok(())
         }
 
@@ -300,7 +328,22 @@ mod tests {
         }
 
         fn state(&self) -> ConnectionState {
-            ConnectionState::Connected
+            match self.state.load(Ordering::Acquire) {
+                value if value == ConnectionState::Connected as u8 => ConnectionState::Connected,
+                value if value == ConnectionState::Failed as u8 => ConnectionState::Failed,
+                _ => ConnectionState::Disconnected,
+            }
+        }
+    }
+
+    fn test_error(message: &str, code: Option<&str>) -> QueryError {
+        QueryError {
+            message: message.into(),
+            severity: None,
+            code: code.map(ToOwned::to_owned),
+            detail: None,
+            hint: None,
+            position: None,
         }
     }
 
@@ -362,5 +405,152 @@ mod tests {
         let sql = &provider.statements.lock().unwrap()[0];
         assert_eq!(sql, "EXPLAIN SELECT 1;");
         assert!(!sql.contains("ANALYZE"));
+    }
+
+    #[tokio::test]
+    async fn connect_and_disconnect_update_state_and_cancel_before_closing() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider.clone());
+        let editor = editor();
+
+        assert_eq!(service.connection_state(), ConnectionState::Disconnected);
+        service.connect(&editor.connection).await.unwrap();
+        assert_eq!(service.connection_state(), ConnectionState::Connected);
+
+        service.disconnect().await.unwrap();
+
+        assert_eq!(service.connection_state(), ConnectionState::Disconnected);
+        assert_eq!(provider.connect_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.cancel_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.disconnect_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_while_already_disconnected_does_not_cancel() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider.clone());
+
+        service.disconnect().await.unwrap();
+
+        assert_eq!(provider.cancel_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.disconnect_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_still_closes_when_cancellation_fails() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider.clone());
+        let editor = editor();
+        service.connect(&editor.connection).await.unwrap();
+        provider.cancel_fails.store(true, Ordering::Release);
+
+        service.disconnect().await.unwrap();
+
+        assert_eq!(service.connection_state(), ConnectionState::Disconnected);
+        assert_eq!(provider.cancel_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.disconnect_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn query_failure_preserves_document_and_previous_results() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider);
+        let mut editor = editor();
+        editor.document = "FAIL;".into();
+        editor.cursor = 2;
+        editor.results = vec![QueryResult {
+            command_tag: Some("PREVIOUS".into()),
+            ..QueryResult::default()
+        }];
+
+        let error = service.run(&mut editor).await.unwrap_err();
+
+        assert_eq!(error.message, "synthetic failure");
+        assert_eq!(editor.execution_status, ExecutionStatus::Failed);
+        assert_eq!(editor.document, "FAIL;");
+        assert_eq!(editor.results[0].command_tag.as_deref(), Some("PREVIOUS"));
+        assert_eq!(editor.error.as_ref(), Some(&error));
+    }
+
+    #[tokio::test]
+    async fn database_cancellation_sets_cancelled_state() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider);
+        let mut editor = editor();
+        editor.document = "CANCELLED;".into();
+        editor.cursor = 3;
+
+        let error = service.run(&mut editor).await.unwrap_err();
+
+        assert_eq!(error.code.as_deref(), Some("57014"));
+        assert_eq!(editor.execution_status, ExecutionStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn explain_cancellation_sets_cancelled_state() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider);
+        let mut editor = editor();
+        editor.document = "CANCELLED;".into();
+        editor.cursor = 3;
+
+        let error = service.explain(&mut editor).await.unwrap_err();
+
+        assert_eq!(error.code.as_deref(), Some("57014"));
+        assert_eq!(editor.execution_status, ExecutionStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn run_all_reports_database_cancellation_as_cancelled() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider);
+        let mut editor = editor();
+        editor.document = "SELECT 1; CANCELLED; SELECT 3;".into();
+
+        let outcome = service.run_all(&mut editor).await.unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.failure.unwrap().statement_index, 1);
+        assert_eq!(editor.execution_status, ExecutionStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn stop_transitions_to_cancelled_on_success() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider.clone());
+        let mut editor = editor();
+        editor.execution_status = ExecutionStatus::Running;
+
+        service.cancel(&mut editor).await.unwrap();
+
+        assert_eq!(editor.execution_status, ExecutionStatus::Cancelled);
+        assert_eq!(provider.cancel_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_failure_is_visible_and_sets_failed_state() {
+        let provider = Arc::new(FakeProvider::default());
+        provider.cancel_fails.store(true, Ordering::Release);
+        let service = CommandService::new(provider);
+        let mut editor = editor();
+        editor.execution_status = ExecutionStatus::Running;
+
+        let error = service.cancel(&mut editor).await.unwrap_err();
+
+        assert_eq!(editor.execution_status, ExecutionStatus::Failed);
+        assert_eq!(editor.error.as_ref(), Some(&error));
+    }
+
+    #[test]
+    fn row_limit_accepts_only_supported_positive_values() {
+        let mut editor = editor();
+
+        assert!(editor.set_row_limit(1).is_ok());
+        assert!(editor.set_row_limit(MAX_ROW_LIMIT).is_ok());
+        assert_eq!(editor.set_row_limit(0), Err(SqlError::InvalidLimit));
+        assert_eq!(
+            editor.set_row_limit(MAX_ROW_LIMIT + 1),
+            Err(SqlError::InvalidLimit)
+        );
     }
 }

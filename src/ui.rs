@@ -8,7 +8,7 @@ use gpui::{
 };
 use tokio::runtime::Runtime;
 
-use crate::application::{CommandService, EditorState, ResultDestination, ResultDisplay};
+use crate::application::{CommandService, EditorState, ResultDestination, ResultDisplay, command};
 use crate::config::{ConnectionProfile, local_profile};
 use crate::database::{ConnectionState, DatabaseObject, ObjectKind};
 use crate::postgres::PostgresProvider;
@@ -52,6 +52,7 @@ pub fn launch() {
 struct AppView {
     service: Arc<CommandService>,
     runtime: Arc<Runtime>,
+    profiles: Vec<ConnectionProfile>,
     editor: EditorState,
     background_editors: Vec<EditorState>,
     connection_state: ConnectionState,
@@ -70,12 +71,17 @@ struct AppView {
 
 impl AppView {
     fn new(cx: &mut Context<Self>) -> Self {
-        let profile = discover_profile();
+        let profiles = discover_profiles();
+        let profile = profiles
+            .first()
+            .cloned()
+            .expect("at least one connection profile should be available");
         let provider = PostgresProvider::new();
         let service = Arc::new(CommandService::new(provider));
         Self {
             service,
             runtime: Arc::new(Runtime::new().expect("could not start asynchronous runtime")),
+            profiles,
             editor: EditorState::new(profile),
             background_editors: Vec::new(),
             connection_state: ConnectionState::Disconnected,
@@ -362,7 +368,8 @@ impl AppView {
                     match ConnectionProfile::from_database_url(&self.connection_buffer) {
                         Ok(mut profile) => {
                             profile.name = "Manual".into();
-                            self.editor.connection = profile;
+                            self.editor.connection = profile.clone();
+                            self.profiles.push(profile);
                             self.status = "Manual connection configured".into();
                             self.connection_buffer.clear();
                             self.connection_dialog = false;
@@ -386,9 +393,19 @@ impl AppView {
             }
             return;
         }
+        if let Some(command_id) = shortcut_command(
+            key,
+            command,
+            modifiers.shift,
+            modifiers.alt,
+            self.editor.execution_status == ExecutionStatus::Running,
+            self.connection_state == ConnectionState::Connected,
+        ) {
+            self.dispatch_command(command_id, cx);
+            return;
+        }
         if command {
             match key {
-                "enter" => self.run(RunMode::Current, cx),
                 "a" => {
                     self.editor.selection = Some(0..self.editor.document.len());
                     self.editor.cursor = self.editor.document.len();
@@ -442,6 +459,20 @@ impl AppView {
                     self.insert_text(character, cx);
                 }
             }
+        }
+    }
+
+    /// Dispatches stable command IDs independently from their current key bindings (section 51).
+    fn dispatch_command(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        match command_id {
+            command::RUN => self.run(RunMode::Current, cx),
+            command::RUN_ALL => self.run(RunMode::All, cx),
+            command::EXPLAIN => self.run(RunMode::Explain, cx),
+            command::CANCEL => self.cancel(cx),
+            command::NEW_EDITOR => self.new_editor(cx),
+            command::CONNECT => self.connect(cx),
+            command::DISCONNECT => self.disconnect(cx),
+            _ => {}
         }
     }
 
@@ -603,6 +634,30 @@ impl AppView {
         }
     }
 
+    fn select_connection(&mut self, profile_id: uuid::Uuid, cx: &mut Context<Self>) {
+        if self.connection_state != ConnectionState::Disconnected
+            || matches!(
+                self.editor.execution_status,
+                ExecutionStatus::Running | ExecutionStatus::Cancelling
+            )
+        {
+            return;
+        }
+        if let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        {
+            self.editor.connection = profile;
+            self.schemas.clear();
+            self.objects.clear();
+            self.expanded_schema = None;
+            self.status = format!("Target: {}", self.editor.connection_identity());
+            cx.notify();
+        }
+    }
+
     fn change_limit(&mut self, increase: bool, cx: &mut Context<Self>) {
         let new = if increase {
             self.editor.row_limit.saturating_mul(10)
@@ -616,57 +671,89 @@ impl AppView {
 
     fn connection_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tree = div().flex().flex_col().gap_1().text_sm();
-        if self.schemas.is_empty() {
-            tree = tree.child(div().p_3().text_color(rgb(MUTED)).child(
-                if self.connection_state == ConnectionState::Connected {
-                    "No user schemas"
-                } else {
-                    "No database connections.\nLoad .env or connect manually."
-                },
-            ));
-        }
-        for schema in &self.schemas {
-            let selected = self.expanded_schema.as_deref() == Some(schema);
-            let schema_for_click = schema.clone();
+        for profile in &self.profiles {
+            let active = profile.id == self.editor.connection.id;
+            let profile_id = profile.id;
+            let indicator = if active && self.connection_state == ConnectionState::Connected {
+                "●"
+            } else {
+                "○"
+            };
             tree = tree.child(
                 div()
-                    .id(SharedString::from(format!("schema-{schema}")))
+                    .id(SharedString::from(format!("connection-{profile_id}")))
                     .px_3()
-                    .py_1()
+                    .py_2()
+                    .bg(if active { rgb(PANEL_LIGHT) } else { rgb(PANEL) })
                     .hover(|style| style.bg(rgb(PANEL_LIGHT)))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.load_schema(schema_for_click.clone(), false, cx)
-                    }))
-                    .child(format!("{} {schema}", if selected { "▾" } else { "▸" })),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_connection(profile_id, cx)),
+                    )
+                    .child(format!("{indicator} {}", profile.name))
+                    .child(div().pl_5().text_color(rgb(MUTED)).child(format!(
+                        "{} · {}:{}",
+                        profile.configuration.database,
+                        profile.configuration.host,
+                        profile.configuration.port
+                    ))),
             );
-            if selected {
-                if let Some(objects) = self.objects.get(schema) {
-                    for kind in [
-                        ObjectKind::Table,
-                        ObjectKind::View,
-                        ObjectKind::MaterialisedView,
-                        ObjectKind::Function,
-                        ObjectKind::Procedure,
-                        ObjectKind::Sequence,
-                    ] {
-                        let matching: Vec<_> = objects
-                            .iter()
-                            .filter(|object| object.kind == kind)
-                            .collect();
-                        tree = tree.child(
-                            div()
-                                .pl_6()
-                                .py_1()
-                                .text_color(rgb(MUTED))
-                                .child(format!("{kind} ({})", matching.len())),
-                        );
-                        for object in matching {
-                            tree = tree.child(div().pl_10().py_1().child(object.name.clone()));
+            if active && self.connection_state == ConnectionState::Connected {
+                if self.schemas.is_empty() {
+                    tree = tree.child(
+                        div()
+                            .pl_8()
+                            .py_2()
+                            .text_color(rgb(MUTED))
+                            .child("No user schemas"),
+                    );
+                }
+                for schema in &self.schemas {
+                    let selected = self.expanded_schema.as_deref() == Some(schema);
+                    let schema_for_click = schema.clone();
+                    tree = tree.child(
+                        div()
+                            .id(SharedString::from(format!("schema-{schema}")))
+                            .pl_8()
+                            .pr_3()
+                            .py_1()
+                            .hover(|style| style.bg(rgb(PANEL_LIGHT)))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.load_schema(schema_for_click.clone(), false, cx)
+                            }))
+                            .child(format!("{} {schema}", if selected { "▾" } else { "▸" })),
+                    );
+                    if selected {
+                        if let Some(objects) = self.objects.get(schema) {
+                            for kind in [
+                                ObjectKind::Table,
+                                ObjectKind::View,
+                                ObjectKind::MaterialisedView,
+                                ObjectKind::Function,
+                                ObjectKind::Procedure,
+                                ObjectKind::Sequence,
+                            ] {
+                                let matching: Vec<_> = objects
+                                    .iter()
+                                    .filter(|object| object.kind == kind)
+                                    .collect();
+                                tree = tree.child(
+                                    div()
+                                        .pl_10()
+                                        .py_1()
+                                        .text_color(rgb(MUTED))
+                                        .child(format!("{kind} ({})", matching.len())),
+                                );
+                                for object in matching {
+                                    tree =
+                                        tree.child(div().pl_12().py_1().child(object.name.clone()));
+                                }
+                            }
+                        } else {
+                            tree = tree.child(div().pl_10().py_1().child("Loading…"));
                         }
                     }
-                } else {
-                    tree = tree.child(div().pl_6().py_1().child("Loading…"));
                 }
             }
         }
@@ -867,13 +954,6 @@ impl Render for AppView {
                                             .child("↻"),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .text_color(if connected { rgb(GREEN) } else { rgb(MUTED) })
-                                    .child(self.editor.connection_identity()),
-                            )
                             .child(self.connection_tree(cx)),
                     )
                     .child(
@@ -955,9 +1035,9 @@ impl Render for AppView {
                                             .rounded_sm()
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(BORDER)))
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.new_editor(cx)),
-                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.dispatch_command(command::NEW_EDITOR, cx)
+                                            }))
                                             .child("+"),
                                     )
                                     .child(
@@ -981,41 +1061,49 @@ impl Render for AppView {
                                         "connect",
                                         "Connect",
                                         !connected && !running,
-                                        cx.listener(|this, _, _, cx| this.connect(cx)),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dispatch_command(command::CONNECT, cx)
+                                        }),
                                     ))
                                     .child(button(
                                         "disconnect",
                                         "Disconnect",
-                                        connected && !running,
-                                        cx.listener(|this, _, _, cx| this.disconnect(cx)),
+                                        connected,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dispatch_command(command::DISCONNECT, cx)
+                                        }),
                                     ))
                                     .child(button(
                                         "run",
                                         "▶ Run",
                                         connected && !running,
                                         cx.listener(|this, _, _, cx| {
-                                            this.run(RunMode::Current, cx)
+                                            this.dispatch_command(command::RUN, cx)
                                         }),
                                     ))
                                     .child(button(
                                         "run-all",
                                         "▶▶ Run All",
                                         connected && !running,
-                                        cx.listener(|this, _, _, cx| this.run(RunMode::All, cx)),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dispatch_command(command::RUN_ALL, cx)
+                                        }),
                                     ))
                                     .child(button(
                                         "explain",
                                         "Explain",
                                         connected && !running,
                                         cx.listener(|this, _, _, cx| {
-                                            this.run(RunMode::Explain, cx)
+                                            this.dispatch_command(command::EXPLAIN, cx)
                                         }),
                                     ))
                                     .child(button(
                                         "stop",
                                         "■ Stop",
                                         running,
-                                        cx.listener(|this, _, _, cx| this.cancel(cx)),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dispatch_command(command::CANCEL, cx)
+                                        }),
                                     ))
                                     .child(div().ml_auto().text_sm().child("Row Limit"))
                                     .child(button(
@@ -1319,21 +1407,45 @@ fn completion_status(results: &[QueryResult]) -> String {
     format!("Completed in {elapsed} ms · {rows} rows")
 }
 
-fn discover_profile() -> ConnectionProfile {
+fn shortcut_command(
+    key: &str,
+    command_modifier: bool,
+    shift: bool,
+    alt: bool,
+    running: bool,
+    connected: bool,
+) -> Option<&'static str> {
+    if command_modifier {
+        return match key {
+            "enter" if shift => Some(command::RUN_ALL),
+            "enter" if alt => Some(command::EXPLAIN),
+            "enter" => Some(command::RUN),
+            "." if running => Some(command::CANCEL),
+            "n" => Some(command::NEW_EDITOR),
+            "d" if shift && connected => Some(command::DISCONNECT),
+            "d" if shift => Some(command::CONNECT),
+            _ => None,
+        };
+    }
+    (key == "escape" && running).then_some(command::CANCEL)
+}
+
+fn discover_profiles() -> Vec<ConnectionProfile> {
     if Path::new(".env").is_file()
-        && let Ok(profile) = ConnectionProfile::from_env_file(".env")
+        && let Ok(profiles) = ConnectionProfile::profiles_from_env_file(".env")
+        && !profiles.is_empty()
     {
-        return profile;
+        return profiles;
     }
     if let Ok(Some(profile)) = ConnectionProfile::from_process_env() {
-        return profile;
+        return vec![profile];
     }
-    local_profile().unwrap_or_else(|| {
+    vec![local_profile().unwrap_or_else(|| {
         ConnectionProfile::from_database_url(
             "postgresql://postgres@localhost:5432/postgres?sslmode=disable",
         )
         .expect("built-in PostgreSQL profile should be valid")
-    })
+    })]
 }
 
 fn previous_boundary(text: &str, offset: usize) -> usize {
@@ -1348,4 +1460,111 @@ fn next_boundary(text: &str, offset: usize) -> usize {
         .char_indices()
         .nth(1)
         .map_or(text.len(), |(index, _)| offset + index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn build_app_view(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            let view = AppView::new(cx);
+            window.focus(&view.focus_handle(cx));
+            window.activate_window();
+            window.on_window_should_close(cx, |_, _| true);
+            view
+        })
+    }
+
+    #[test]
+    fn core_shortcuts_resolve_to_stable_command_ids() {
+        assert_eq!(
+            shortcut_command("enter", true, false, false, false, false),
+            Some(command::RUN)
+        );
+        assert_eq!(
+            shortcut_command("enter", true, true, false, false, false),
+            Some(command::RUN_ALL)
+        );
+        assert_eq!(
+            shortcut_command("enter", true, false, true, false, false),
+            Some(command::EXPLAIN)
+        );
+        assert_eq!(
+            shortcut_command("n", true, false, false, false, false),
+            Some(command::NEW_EDITOR)
+        );
+        assert_eq!(
+            shortcut_command("d", true, true, false, false, false),
+            Some(command::CONNECT)
+        );
+        assert_eq!(
+            shortcut_command("d", true, true, false, false, true),
+            Some(command::DISCONNECT)
+        );
+    }
+
+    #[test]
+    fn stop_shortcuts_only_dispatch_while_running() {
+        assert_eq!(
+            shortcut_command("escape", false, false, false, true, true),
+            Some(command::CANCEL)
+        );
+        assert_eq!(
+            shortcut_command(".", true, false, false, true, true),
+            Some(command::CANCEL)
+        );
+        assert_eq!(
+            shortcut_command("escape", false, false, false, false, true),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn native_keyboard_input_edits_the_focused_document(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        cx.simulate_input("select 1");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("from pg_catalog.pg_tables");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "select 1\nfrom pg_catalog.pg_tables");
+            assert_eq!(app.editor.cursor, app.editor.document.len());
+        });
+    }
+
+    #[gpui::test]
+    fn native_shortcut_opens_and_switches_to_a_new_editor(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        cx.simulate_input("select current_database()");
+
+        cx.simulate_keystrokes("ctrl-n");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.title, "query-2.sql");
+            assert!(app.editor.document.is_empty());
+            assert_eq!(app.background_editors.len(), 1);
+            assert_eq!(
+                app.background_editors[0].document,
+                "select current_database()"
+            );
+            assert_eq!(app.status, "New SQL editor");
+        });
+    }
+
+    #[gpui::test]
+    fn native_window_lifecycle_survives_resize_and_accepts_close(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let editor_id = view.update(cx, |app, _| app.editor.id);
+
+        cx.simulate_resize(size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| assert_eq!(app.editor.id, editor_id));
+        assert!(cx.simulate_close());
+    }
 }

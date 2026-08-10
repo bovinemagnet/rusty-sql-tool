@@ -92,14 +92,62 @@ impl ConnectionProfile {
 
     /// Loads a profile without changing the source file (FR-003).
     pub fn from_env_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let content = fs::read_to_string(path).map_err(ConfigError::ReadEnv)?;
-        Self::from_env_str(&content)
+        Self::profiles_from_env_file(path)?
+            .into_iter()
+            .next()
+            .ok_or(ConfigError::MissingDatabase)
     }
 
     pub fn from_env_str(content: &str) -> Result<Self, ConfigError> {
+        Self::profiles_from_env_str(content)?
+            .into_iter()
+            .next()
+            .ok_or(ConfigError::MissingDatabase)
+    }
+
+    /// Loads every named PostgreSQL profile in a `.env` file.
+    ///
+    /// The primary pair is `CONNECTION_NAME`/`DATABASE_URL`. Additional connections
+    /// use matching suffixes, for example `CONNECTION_NAME_STAGING` and
+    /// `DATABASE_URL_STAGING` (FR-003, FR-031).
+    pub fn profiles_from_env_file(
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<ConnectionProfile>, ConfigError> {
+        let content = fs::read_to_string(path).map_err(ConfigError::ReadEnv)?;
+        Self::profiles_from_env_str(&content)
+    }
+
+    pub fn profiles_from_env_str(content: &str) -> Result<Vec<ConnectionProfile>, ConfigError> {
         let values = parse_env(content)?;
+        let mut profiles = Vec::new();
         if let Some(database_url) = values.get("DATABASE_URL") {
-            return Self::from_database_url(database_url);
+            profiles.push(named_url_profile(
+                database_url,
+                values.get("CONNECTION_NAME").map(String::as_str),
+                "Environment",
+            )?);
+        }
+
+        let mut additional_urls: Vec<_> = values
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("DATABASE_URL_")
+                    .filter(|suffix| !suffix.is_empty())
+                    .map(|suffix| (suffix, value))
+            })
+            .collect();
+        additional_urls.sort_by_key(|(suffix, _)| *suffix);
+        for (suffix, database_url) in additional_urls {
+            let name_key = format!("CONNECTION_NAME_{suffix}");
+            profiles.push(named_url_profile(
+                database_url,
+                values.get(&name_key).map(String::as_str),
+                &connection_name_from_suffix(suffix),
+            )?);
+        }
+
+        if !profiles.is_empty() {
+            return Ok(profiles);
         }
 
         let host = values
@@ -126,8 +174,12 @@ impl ConnectionProfile {
             .transpose()?
             .unwrap_or_default();
 
-        Ok(Self::manual(
-            "Environment",
+        Ok(vec![Self::manual(
+            values
+                .get("CONNECTION_NAME")
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Environment".into()),
             PostgresConfiguration {
                 host,
                 port,
@@ -136,14 +188,15 @@ impl ConnectionProfile {
                 password: SecretString::new(password),
                 ssl_mode,
             },
-        ))
+        )])
     }
 
     /// Loads only the recognised PostgreSQL variables from the process environment.
     /// Values remain in memory and are never logged or persisted (FR-003, FR-033).
     pub fn from_process_env() -> Result<Option<Self>, ConfigError> {
         if let Ok(database_url) = std::env::var("DATABASE_URL") {
-            return Self::from_database_url(&database_url).map(Some);
+            let name = std::env::var("CONNECTION_NAME").ok();
+            return named_url_profile(&database_url, name.as_deref(), "Environment").map(Some);
         }
 
         let recognised = [
@@ -153,6 +206,7 @@ impl ConnectionProfile {
             "PGUSER",
             "PGPASSWORD",
             "PGSSLMODE",
+            "CONNECTION_NAME",
         ];
         let values: HashMap<_, _> = recognised
             .into_iter()
@@ -187,7 +241,11 @@ impl ConnectionProfile {
             .unwrap_or_default();
 
         Ok(Some(Self::manual(
-            "Environment",
+            values
+                .get("CONNECTION_NAME")
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Environment".into()),
             PostgresConfiguration {
                 host,
                 port,
@@ -236,6 +294,33 @@ impl ConnectionProfile {
     pub fn display_identity(&self) -> String {
         format!("{} / {}", self.name, self.configuration.database)
     }
+}
+
+fn named_url_profile(
+    database_url: &str,
+    name: Option<&str>,
+    fallback_name: &str,
+) -> Result<ConnectionProfile, ConfigError> {
+    let mut profile = ConnectionProfile::from_database_url(database_url)?;
+    profile.name = name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(fallback_name)
+        .to_owned();
+    Ok(profile)
+}
+
+fn connection_name_from_suffix(suffix: &str) -> String {
+    suffix
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + &characters.as_str().to_ascii_lowercase()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn local_profile() -> Option<ConnectionProfile> {
@@ -341,10 +426,11 @@ mod tests {
     #[test]
     fn loads_database_url_without_exposing_password() {
         let profile = ConnectionProfile::from_env_str(
-            "DATABASE_URL=postgresql://developer:secret@localhost:5544/example?sslmode=require",
+            "CONNECTION_NAME=Development\nDATABASE_URL=postgresql://developer:secret@localhost:5544/example?sslmode=require",
         )
         .unwrap();
 
+        assert_eq!(profile.name, "Development");
         assert_eq!(profile.configuration.host, "localhost");
         assert_eq!(profile.configuration.port, 5544);
         assert_eq!(profile.configuration.database, "example");
@@ -375,5 +461,23 @@ mod tests {
         .unwrap_err();
 
         assert!(!error.to_string().contains("very-secret"));
+    }
+
+    #[test]
+    fn loads_multiple_named_database_urls_in_stable_order() {
+        let profiles = ConnectionProfile::profiles_from_env_str(
+            "CONNECTION_NAME=Local Paul\n\
+             DATABASE_URL=postgresql://paul@localhost:5432/paul?sslmode=disable\n\
+             DATABASE_URL_PRODUCTION=postgresql://reader@prod.example:5432/app\n\
+             CONNECTION_NAME_PRODUCTION=Production Read Only\n\
+             DATABASE_URL_STAGING_EU=postgresql://reader@staging.example:5432/app",
+        )
+        .unwrap();
+
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles[0].display_identity(), "Local Paul / paul");
+        assert_eq!(profiles[1].name, "Production Read Only");
+        assert_eq!(profiles[2].name, "Staging Eu");
+        assert_eq!(profiles[2].configuration.host, "staging.example");
     }
 }
