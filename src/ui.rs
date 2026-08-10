@@ -635,12 +635,13 @@ impl AppView {
     }
 
     fn select_connection(&mut self, profile_id: uuid::Uuid, cx: &mut Context<Self>) {
-        if self.connection_state != ConnectionState::Disconnected
-            || matches!(
-                self.editor.execution_status,
-                ExecutionStatus::Running | ExecutionStatus::Cancelling
-            )
-        {
+        if !matches!(
+            self.connection_state,
+            ConnectionState::Disconnected | ConnectionState::Failed
+        ) || matches!(
+            self.editor.execution_status,
+            ExecutionStatus::Running | ExecutionStatus::Cancelling
+        ) {
             return;
         }
         if let Some(profile) = self
@@ -658,6 +659,48 @@ impl AppView {
         }
     }
 
+    /// Left-click selects and connects a profile; Alt-click disconnects the active profile
+    /// (FR-004, FR-005). Switching targets while connected remains an explicit operation.
+    fn handle_connection_click(
+        &mut self,
+        profile_id: uuid::Uuid,
+        alt: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.editor.connection.id == profile_id;
+        match self.connection_state {
+            ConnectionState::Disconnected | ConnectionState::Failed if !alt => {
+                if matches!(
+                    self.editor.execution_status,
+                    ExecutionStatus::Running | ExecutionStatus::Cancelling
+                ) {
+                    self.status = "Wait for the active query before changing connection".into();
+                    cx.notify();
+                    return;
+                }
+                self.select_connection(profile_id, cx);
+                self.connect(cx);
+            }
+            ConnectionState::Connected if alt && active => self.disconnect(cx),
+            ConnectionState::Connected if !active => {
+                self.status = "Disconnect the active connection before selecting another".into();
+                cx.notify();
+            }
+            ConnectionState::Connected => {
+                self.status = format!("Connected: {}", self.editor.connection_identity());
+                cx.notify();
+            }
+            ConnectionState::Disconnected | ConnectionState::Failed => {
+                self.status = "Connection is already disconnected".into();
+                cx.notify();
+            }
+            ConnectionState::Connecting | ConnectionState::Disconnecting => {
+                self.status = "Connection change already in progress".into();
+                cx.notify();
+            }
+        }
+    }
+
     fn change_limit(&mut self, increase: bool, cx: &mut Context<Self>) {
         let new = if increase {
             self.editor.row_limit.saturating_mul(10)
@@ -671,26 +714,30 @@ impl AppView {
 
     fn connection_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tree = div().flex().flex_col().gap_1().text_sm();
-        for profile in &self.profiles {
+        for (profile_index, profile) in self.profiles.iter().enumerate() {
             let active = profile.id == self.editor.connection.id;
             let profile_id = profile.id;
-            let indicator = if active && self.connection_state == ConnectionState::Connected {
-                "●"
-            } else {
-                "○"
-            };
+            let indicator_colour = connection_indicator_colour(active, self.connection_state);
             tree = tree.child(
                 div()
                     .id(SharedString::from(format!("connection-{profile_id}")))
+                    .debug_selector(move || format!("connection-row-{profile_index}"))
                     .px_3()
                     .py_2()
                     .bg(if active { rgb(PANEL_LIGHT) } else { rgb(PANEL) })
                     .hover(|style| style.bg(rgb(PANEL_LIGHT)))
                     .cursor_pointer()
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.select_connection(profile_id, cx)),
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        this.handle_connection_click(profile_id, event.modifiers().alt, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(8.)).rounded_full().bg(rgb(indicator_colour)))
+                            .child(profile.name.clone()),
                     )
-                    .child(format!("{indicator} {}", profile.name))
                     .child(div().pl_5().text_color(rgb(MUTED)).child(format!(
                         "{} · {}:{}",
                         profile.configuration.database,
@@ -953,6 +1000,14 @@ impl Render for AppView {
                                             })
                                             .child("↻"),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("Click to connect · Alt-click to disconnect"),
                             )
                             .child(self.connection_tree(cx)),
                     )
@@ -1430,6 +1485,18 @@ fn shortcut_command(
     (key == "escape" && running).then_some(command::CANCEL)
 }
 
+fn connection_indicator_colour(active: bool, state: ConnectionState) -> u32 {
+    if !active {
+        return MUTED;
+    }
+    match state {
+        ConnectionState::Connected => GREEN,
+        ConnectionState::Connecting | ConnectionState::Disconnecting => ACCENT,
+        ConnectionState::Failed => RED,
+        ConnectionState::Disconnected => MUTED,
+    }
+}
+
 fn discover_profiles() -> Vec<ConnectionProfile> {
     if Path::new(".env").is_file()
         && let Ok(profiles) = ConnectionProfile::profiles_from_env_file(".env")
@@ -1464,8 +1531,73 @@ fn next_boundary(text: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
     use super::*;
-    use gpui::TestAppContext;
+    use async_trait::async_trait;
+    use gpui::{Modifiers, TestAppContext};
+
+    use crate::database::{ConnectionInfo, DatabaseProvider};
+    use crate::result::QueryError;
+
+    #[derive(Default)]
+    struct UiTestProvider {
+        state: AtomicU8,
+        connect_calls: AtomicUsize,
+        disconnect_calls: AtomicUsize,
+    }
+
+    impl UiTestProvider {
+        fn set_state(&self, state: ConnectionState) {
+            self.state.store(state as u8, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl DatabaseProvider for UiTestProvider {
+        async fn connect(&self, profile: &ConnectionProfile) -> Result<ConnectionInfo, QueryError> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            self.set_state(ConnectionState::Connected);
+            Ok(ConnectionInfo {
+                database: profile.configuration.database.clone(),
+                server_version: "PostgreSQL test".into(),
+            })
+        }
+
+        async fn disconnect(&self) -> Result<(), QueryError> {
+            self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
+            self.set_state(ConnectionState::Disconnected);
+            Ok(())
+        }
+
+        async fn execute(&self, _: &str) -> Result<QueryResult, QueryError> {
+            panic!("UI connection tests do not execute SQL")
+        }
+
+        async fn cancel(&self) -> Result<(), QueryError> {
+            Ok(())
+        }
+
+        async fn schemas(&self, _: bool) -> Result<Vec<String>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        async fn objects(&self, _: &str, _: bool) -> Result<Vec<DatabaseObject>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn state(&self) -> ConnectionState {
+            match self.state.load(Ordering::SeqCst) {
+                value if value == ConnectionState::Connecting as u8 => ConnectionState::Connecting,
+                value if value == ConnectionState::Connected as u8 => ConnectionState::Connected,
+                value if value == ConnectionState::Disconnecting as u8 => {
+                    ConnectionState::Disconnecting
+                }
+                value if value == ConnectionState::Failed as u8 => ConnectionState::Failed,
+                _ => ConnectionState::Disconnected,
+            }
+        }
+    }
 
     fn build_app_view(
         cx: &mut TestAppContext,
@@ -1477,6 +1609,21 @@ mod tests {
             window.on_window_should_close(cx, |_, _| true);
             view
         })
+    }
+
+    fn wait_for_connection_state(
+        view: &gpui::Entity<AppView>,
+        cx: &mut gpui::VisualTestContext,
+        expected: ConnectionState,
+    ) {
+        for _ in 0..1_000 {
+            cx.run_until_parked();
+            if view.update(cx, |app, _| app.connection_state) == expected {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        view.update(cx, |app, _| assert_eq!(app.connection_state, expected));
     }
 
     #[test]
@@ -1521,6 +1668,59 @@ mod tests {
             shortcut_command("escape", false, false, false, false, true),
             None
         );
+    }
+
+    #[test]
+    fn connected_profile_uses_the_green_status_indicator() {
+        assert_eq!(
+            connection_indicator_colour(true, ConnectionState::Connected),
+            GREEN
+        );
+        assert_eq!(
+            connection_indicator_colour(false, ConnectionState::Connected),
+            MUTED
+        );
+        assert_eq!(
+            connection_indicator_colour(true, ConnectionState::Failed),
+            RED
+        );
+    }
+
+    #[gpui::test]
+    fn native_connection_row_click_connects_and_alt_click_disconnects(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.service = Arc::new(CommandService::new(provider.clone()));
+        });
+
+        let connection_row = cx
+            .debug_bounds("connection-row-0")
+            .expect("the first connection row should be rendered");
+        cx.simulate_click(connection_row.center(), Modifiers::default());
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        assert_eq!(provider.connect_calls.load(Ordering::SeqCst), 1);
+        view.update(cx, |app, _| {
+            assert_eq!(
+                connection_indicator_colour(true, app.connection_state),
+                GREEN
+            );
+        });
+
+        let connection_row = cx
+            .debug_bounds("connection-row-0")
+            .expect("the connected row should remain rendered");
+        cx.simulate_click(
+            connection_row.center(),
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+        );
+        wait_for_connection_state(&view, cx, ConnectionState::Disconnected);
+
+        assert_eq!(provider.disconnect_calls.load(Ordering::SeqCst), 1);
     }
 
     #[gpui::test]
