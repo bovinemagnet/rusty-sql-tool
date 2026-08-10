@@ -1,14 +1,31 @@
-# Product Requirements Document
+# Product Requirements Document — Phase 1
 
 ## Rust SQL Desktop Client using GPUI
 
 **Working title:** RustSQL / GPUI SQL Client
 **Status:** Draft
+**Phase:** 1 — PostgreSQL Query Client
+**Author:** Paul Snow
+**Version:** 0.0.0
 **Target platform:** Desktop
 **Primary implementation language:** Rust
 **UI framework:** GPUI
 **Initial database:** PostgreSQL
 **Primary inspiration:** Zed editor layout and interaction model
+
+### Related documents
+
+This document defines **Phase 1 only**. Later phases are specified separately:
+
+| Document | Theme |
+|---|---|
+| [Phase 2 — PostgreSQL Schema Inspection](phase-2-schema-inspection.md) | Understand database objects |
+| [Phase 3 — Developer Productivity](phase-3-developer-productivity.md) | Write SQL faster and more safely |
+| [Phase 4 — Multi-Database Support](phase-4-multi-database.md) | Additional database engines |
+
+Phase 1 is the only committed phase. Phases 2 to 4 are proposals and remain subject to change.
+
+Phase 1 requirements are numbered `FR-nnn`. Later phases use `FR2-nnn`, `FR3-nnn` and `FR4-nnn` so that requirement identifiers remain unique and stable across documents.
 
 ---
 
@@ -40,7 +57,7 @@ The product should feel like:
 
 > **Zed, but focused on interacting with databases and SQL.**
 
-The product should prioritize:
+The product should prioritise:
 
 1. Fast startup.
 2. Low memory usage.
@@ -59,9 +76,7 @@ It should not require the user to create a project or workspace before executing
 
 ---
 
-# 3. Goals
-
-## 3.1 Phase 1 Goals
+# 3. Phase 1 Goals
 
 Phase 1 will provide a usable PostgreSQL SQL client.
 
@@ -92,14 +107,25 @@ The user must be able to:
 
 # 4. Non-Goals for Phase 1
 
-The following functionality is explicitly outside the Phase 1 scope:
+The following functionality is explicitly outside the Phase 1 scope.
 
-* MySQL.
-* MariaDB.
-* Oracle.
-* Microsoft SQL Server.
-* SQLite.
-* CockroachDB-specific functionality.
+Deferred to a later phase:
+
+| Capability | Phase |
+|---|---|
+| Table, view and function definitions | [Phase 2](phase-2-schema-inspection.md) |
+| Object definition tabs | [Phase 2](phase-2-schema-inspection.md) |
+| SQL autocomplete based on schema metadata | [Phase 3](phase-3-developer-productivity.md) |
+| SQL formatting | [Phase 3](phase-3-developer-productivity.md) |
+| Query history and saved queries | [Phase 3](phase-3-developer-productivity.md) |
+| Import/export tooling, CSV/JSON export | [Phase 3](phase-3-developer-productivity.md) |
+| Graphical `EXPLAIN` plans and `EXPLAIN ANALYZE` | [Phase 3](phase-3-developer-productivity.md) |
+| MySQL, MariaDB, Oracle, SQL Server, SQLite, DuckDB | [Phase 4](phase-4-multi-database.md) |
+| CockroachDB-specific functionality | [Phase 4](phase-4-multi-database.md) |
+| SSH tunnels and TLS certificate configuration | [Phase 4](phase-4-multi-database.md) |
+
+Not currently scheduled for any phase:
+
 * Database object editing.
 * Table data editing.
 * Schema modification UI.
@@ -107,24 +133,17 @@ The following functionality is explicitly outside the Phase 1 scope:
 * Database diagrams.
 * ER diagrams.
 * Git integration.
-* SQL autocomplete based on schema metadata.
 * AI-assisted SQL generation.
-* SQL formatting.
 * Stored procedure debugging.
 * Database migrations.
 * Query scheduling.
-* Query history synchronization.
+* Query history synchronisation.
 * Cloud account integration.
-* SSH tunnels.
 * Connection sharing.
 * Team collaboration.
 * Database monitoring dashboards.
-* Graphical `EXPLAIN` plans.
-* Import/export tooling.
 * CSV editing.
-* Transaction management UI beyond the normal PostgreSQL connection behavior.
-
-Some of these capabilities may be considered for subsequent phases.
+* Transaction management UI beyond the normal PostgreSQL connection behaviour.
 
 ---
 
@@ -196,7 +215,7 @@ Phase 1 should establish commands for at least:
 
 The application must avoid unnecessarily expensive queries where reasonable.
 
-The default result limit is one important safety mechanism.
+The default row limit is one important safety mechanism.
 
 `EXPLAIN` should use plain PostgreSQL `EXPLAIN` in Phase 1 and **must not automatically use `EXPLAIN ANALYZE`**, because `ANALYZE` executes the statement and can have side effects.
 
@@ -212,9 +231,9 @@ The default window will follow a Zed-inspired structure.
 +----------------------+----------------------------------------+
 |                      | SQL Tab                                |
 | Connections          |----------------------------------------|
-|                      | [Connect] [Disconnect]                  |
-| > Development        | [▶ Run] [▶▶ Run All] [Explain] [Stop] |
-|   > public           |                             Limit: [10] |
+|                      | [Connect] [Disconnect]                 |
+| > Development        | [▶ Run] [▶▶ Run All] [Explain] [Stop]  |
+|   > public           |                      Row Limit: [10]   |
 |     > Tables         |----------------------------------------|
 |       > customer     |                                        |
 |       > orders       | SELECT *                               |
@@ -417,7 +436,7 @@ Development
     │   │   │   ├── customer
     │   │   │   └── orders
     │   │   ├── Views
-    │   │   ├── Materialized Views
+    │   │   ├── Materialised Views
     │   │   ├── Functions
     │   │   ├── Procedures
     │   │   ├── Sequences
@@ -431,12 +450,14 @@ At minimum Phase 1 should display:
 * Schemas.
 * Tables.
 * Views.
-* Materialized views.
+* Materialised views.
 * Functions.
 * Procedures where available.
 * Sequences.
 
 Additional object types may be added where metadata retrieval is straightforward.
+
+Phase 1 displays object **names** only. Object **definitions** are [Phase 2](phase-2-schema-inspection.md).
 
 ---
 
@@ -559,10 +580,12 @@ Disconnect
 Explain
 ■ Stop
 
-Result Limit: 10
+Row Limit: 10
 ```
 
 The exact icons may follow the icon conventions available through the GPUI/Zed ecosystem.
+
+The toolbar must also display the target connection and database, as described in section 49.
 
 ---
 
@@ -638,6 +661,8 @@ Execution time: 23 ms
 
 The application must not assume every SQL statement produces rows.
 
+If a statement fails during Run All, execution stops at the failing statement and the results already produced remain visible. The failure is reported against the statement that produced it.
+
 ---
 
 # 23. Explain
@@ -670,7 +695,7 @@ Seq Scan on customer
   Filter: (active = true)
 ```
 
-A richer graphical execution-plan viewer can be considered for a future phase.
+A richer graphical execution-plan viewer and an opt-in `EXPLAIN ANALYZE` are [Phase 3](phase-3-developer-productivity.md).
 
 ---
 
@@ -696,9 +721,9 @@ After cancellation, the SQL editor must remain usable.
 
 ---
 
-# 25. Result Row Limit
+# 25. Row Limit
 
-A **Result Limit** control appears at the top of the SQL editor.
+A **Row Limit** control appears at the top of the SQL editor.
 
 Default:
 
@@ -730,16 +755,18 @@ For example:
 Automatic LIMIT 10 applied
 ```
 
+The control is labelled "Row Limit" rather than "Page Size" for the reasons given in section 59.1.
+
 ---
 
-# 26. User-Defined Result Limit
+# 26. User-Defined Row Limit
 
 The user may change the value.
 
 Example:
 
 ```text
-Result Limit: [100]
+Row Limit: [100]
 ```
 
 A query without a limit will therefore receive:
@@ -756,7 +783,7 @@ A reasonable Phase 1 maximum may be defined to protect application stability, al
 
 # 27. Explicit SQL Limits
 
-An explicitly supplied SQL limit takes precedence over the editor Result Limit.
+An explicitly supplied SQL limit takes precedence over the editor Row Limit.
 
 Example:
 
@@ -832,6 +859,14 @@ COMMIT
 
 must not receive limits.
 
+Statements using `RETURNING`, such as:
+
+```sql
+UPDATE customer SET active = false RETURNING id;
+```
+
+return rows but also modify data. These must **not** receive an automatic limit, because limiting them would change how many rows are modified.
+
 The implementation should perform SQL-aware statement analysis rather than simplistic string matching.
 
 This requirement is important because SQL can contain:
@@ -842,6 +877,8 @@ This requirement is important because SQL can contain:
 * String literals containing words such as `LIMIT`.
 * Trailing semicolons.
 * PostgreSQL-specific syntax.
+
+Where the analysis cannot confidently classify a statement, the application must execute the statement unmodified rather than risk altering its meaning.
 
 The product requirement is therefore:
 
@@ -1002,7 +1039,7 @@ Rows affected: 234
 For automatically limited queries:
 
 ```text
-Result limit: 10
+Row limit: 10
 Automatic limit applied
 ```
 
@@ -1078,102 +1115,11 @@ DatabaseMetadataProvider
 
 rather than allowing GPUI components to directly execute metadata SQL.
 
----
-
-# 37. Phase 2 — Object Definitions
-
-Phase 2 introduces inspection of database object definitions.
-
-The user will be able to select an object from the Connections tree and inspect its definition.
+[Phase 2](phase-2-schema-inspection.md) extends this same abstraction rather than introducing a second schema-inspection mechanism, so the Phase 1 interface should be designed with that extension in mind.
 
 ---
 
-# 38. Table Definition
-
-Selecting or opening a table should provide details including:
-
-* Table name.
-* Schema.
-* Columns.
-* Data types.
-* Nullable state.
-* Default values.
-* Primary keys.
-* Foreign keys.
-* Unique constraints.
-* Check constraints.
-* Indexes.
-
-Example:
-
-```text
-customer
-
-Columns
----------------------------------------------------
-id             bigint        NOT NULL
-name           varchar(200)  NOT NULL
-email          varchar(320)
-active         boolean       NOT NULL DEFAULT true
-created_at     timestamptz   NOT NULL
-
-Primary Key
----------------------------------------------------
-customer_pkey (id)
-
-Indexes
----------------------------------------------------
-customer_email_idx (email)
-```
-
----
-
-# 39. Object Definition SQL
-
-Where PostgreSQL provides a meaningful SQL representation, Phase 2 should expose definition SQL.
-
-Examples include:
-
-* Views.
-* Functions.
-* Procedures.
-* Indexes.
-* Sequences.
-
-For example, opening a view could display its SQL definition in a read-only SQL editor.
-
----
-
-# 40. Phase 2 Interaction
-
-The database tree might eventually support an interaction such as:
-
-```text
-customer
-    Open Definition
-```
-
-or:
-
-```text
-Double-click customer
-```
-
-which opens:
-
-```text
-customer [Definition]
-```
-
-as another workspace tab.
-
-The definition view remains read-only in Phase 2.
-
-Editing database definitions is explicitly deferred.
-
----
-
-# 41. Proposed Architecture
+# 37. Proposed Architecture
 
 The application should maintain strong separation between:
 
@@ -1223,7 +1169,7 @@ A conceptual architecture is:
 
 ---
 
-# 42. Database Provider Abstraction
+# 38. Database Provider Abstraction
 
 Although Phase 1 only supports PostgreSQL, the application should avoid embedding PostgreSQL assumptions throughout the UI.
 
@@ -1246,9 +1192,11 @@ The exact Rust trait design is an implementation concern.
 
 The product requirement is that adding another database engine should primarily require a new provider rather than rewriting the editor and result UI.
 
+[Phase 4](phase-4-multi-database.md) is the test of this requirement.
+
 ---
 
-# 43. Query Execution Model
+# 39. Query Execution Model
 
 Query execution must occur outside the UI/rendering thread.
 
@@ -1288,7 +1236,7 @@ Cancelled
 
 ---
 
-# 44. Query Result Model
+# 40. Query Result Model
 
 The core result representation should be independent of GPUI.
 
@@ -1322,20 +1270,20 @@ This abstraction enables the same result to be rendered:
 
 ---
 
-# 45. Large Result Handling
+# 41. Large Result Handling
 
 Although Phase 1 defaults to only 10 rows, the result architecture should avoid assumptions that result sets are always tiny.
 
 The application should be designed so later versions can support:
 
 * Incremental result fetching.
-* Virtualized tables.
+* Virtualised tables.
 * Pagination.
 * Streaming.
 
 The Phase 1 `LIMIT` feature is primarily a result-safety mechanism rather than full server-side pagination.
 
-For that reason, the UI label should preferably be:
+For that reason, the UI label should be:
 
 ```text
 Row Limit
@@ -1359,7 +1307,7 @@ is clearer to users than implying that there are currently multiple navigable pa
 
 ---
 
-# 46. Connection Pooling
+# 42. Connection Pooling
 
 A SQL desktop client does not necessarily need a large application-style connection pool.
 
@@ -1379,7 +1327,7 @@ The specific PostgreSQL Rust driver and pooling implementation are engineering d
 
 ---
 
-# 47. Security Requirements
+# 43. Security Requirements
 
 Database credentials are sensitive.
 
@@ -1394,11 +1342,11 @@ Phase 1 must:
 
 If connection profiles are persisted, plaintext password persistence should preferably be avoided.
 
-Native OS credential storage can be considered in a later phase.
+Native OS credential storage is [Phase 4](phase-4-multi-database.md). Until then, the safest Phase 1 position is not to persist passwords at all, requiring them to come from `.env` or from the user at connect time.
 
 ---
 
-# 48. Logging
+# 44. Logging
 
 Application logging should assist debugging without leaking SQL credentials or sensitive database content.
 
@@ -1422,7 +1370,7 @@ Whether complete SQL statements are logged should be configurable because SQL it
 
 ---
 
-# 49. Performance Requirements
+# 45. Performance Requirements
 
 The application should target the responsiveness expected of a native editor.
 
@@ -1440,7 +1388,7 @@ Large database schemas may contain tens of thousands of objects, therefore datab
 
 ---
 
-# 50. Reliability Requirements
+# 46. Reliability Requirements
 
 The application must handle common failures gracefully:
 
@@ -1465,7 +1413,7 @@ A failure in one SQL editor should not destroy other open SQL editors.
 
 ---
 
-# 51. SQL Document Behaviour
+# 47. SQL Document Behaviour
 
 SQL editor contents should remain available when:
 
@@ -1481,7 +1429,7 @@ For Phase 1, normal Save/Open behaviour is desirable if straightforward, but dat
 
 ---
 
-# 52. Multiple Connections
+# 48. Multiple Connections
 
 The architecture should support multiple connection profiles from Phase 1 even if only a single database connection is commonly active.
 
@@ -1501,7 +1449,7 @@ The application should avoid situations where users accidentally execute SQL aga
 
 ---
 
-# 53. Connection Assignment
+# 49. Connection Assignment
 
 Each SQL editor should have a selected connection.
 
@@ -1517,7 +1465,7 @@ The current connection should be visually prominent enough that a user can verif
 
 ---
 
-# 54. Destructive SQL
+# 50. Destructive SQL
 
 Phase 1 does not require confirmation dialogs for every:
 
@@ -1539,11 +1487,11 @@ Instead, protection should initially come from:
 * No accidental execution during editing.
 * Distinction between Run and Run All.
 
-A configurable production-environment protection mechanism can be considered later.
+Configurable production-environment protection and read-only connection profiles are [Phase 3](phase-3-developer-productivity.md).
 
 ---
 
-# 55. Keyboard Commands
+# 51. Keyboard Commands
 
 Phase 1 should provide keyboard actions for core operations.
 
@@ -1565,7 +1513,7 @@ Command IDs should be independent of keyboard shortcuts so shortcuts can later b
 
 ---
 
-# 56. Context Menus
+# 52. Context Menus
 
 The connection tree may expose lightweight context menus.
 
@@ -1578,17 +1526,11 @@ Refresh
 New SQL Query
 ```
 
-Phase 2 adds:
-
-```text
-Open Definition
-```
-
 Database modification actions should not appear in the Phase 1 object-tree context menu.
 
 ---
 
-# 57. Visual States
+# 53. Visual States
 
 The UI should clearly communicate asynchronous actions.
 
@@ -1617,7 +1559,7 @@ Long-running operations should not be represented solely through a spinning curs
 
 ---
 
-# 58. Empty States
+# 54. Empty States
 
 When no connection exists:
 
@@ -1647,7 +1589,7 @@ Empty states should be useful but visually lightweight.
 
 ---
 
-# 59. Phase 1 User Flow
+# 55. Phase 1 User Flow
 
 A typical new-user flow:
 
@@ -1738,7 +1680,7 @@ if desired.
 
 ---
 
-# 60. Phase 1 Functional Requirements
+# 56. Phase 1 Functional Requirements
 
 ## FR-001 PostgreSQL Connection
 
@@ -1810,11 +1752,11 @@ Stop shall attempt to cancel the currently executing SQL statement.
 
 ## FR-018 Default Limit
 
-Row-returning queries without an explicit limit shall default to a result limit of 10.
+Row-returning queries without an explicit limit shall default to a row limit of 10.
 
 ## FR-019 Configurable Limit
 
-The user shall be able to change the result limit from the SQL editor.
+The user shall be able to change the row limit from the SQL editor.
 
 ## FR-020 Preserve Explicit Limit
 
@@ -1860,41 +1802,21 @@ The SQL editor shall support multiple SQL statements.
 
 The database object tree shall be refreshable.
 
----
+## FR-031 Connection Identity
 
-# 61. Phase 2 Functional Requirements
+Each SQL editor shall display the connection and database it will execute against.
 
-## FR2-001 Table Details
+## FR-032 Non-Limitable Statements
 
-Users shall be able to inspect table columns.
+The application shall not apply an automatic limit to statements that are not row-returning queries, including statements using `RETURNING`.
 
-## FR2-002 Constraints
+## FR-033 Credential Protection
 
-Users shall be able to inspect table constraints.
-
-## FR2-003 Indexes
-
-Users shall be able to inspect table indexes.
-
-## FR2-004 View Definitions
-
-Users shall be able to inspect view definitions.
-
-## FR2-005 Function Definitions
-
-Users shall be able to inspect PostgreSQL function definitions.
-
-## FR2-006 Definition Tabs
-
-Database object definitions shall be openable in workspace tabs.
-
-## FR2-007 Read Only
-
-Database object definitions shall remain read-only in Phase 2.
+The application shall not write passwords or connection strings containing passwords to logs or error output.
 
 ---
 
-# 62. Phase 1 Acceptance Criteria
+# 57. Phase 1 Acceptance Criteria
 
 Phase 1 is considered functionally complete when the following scenario succeeds.
 
@@ -1938,6 +1860,8 @@ Disconnect
 Row Limit: 10
 ```
 
+together with the target connection and database.
+
 Selecting Run executes the query with an automatic effective limit of 10.
 
 No more than 10 rows are returned unless the SQL contains its own explicit limit.
@@ -1963,9 +1887,11 @@ A long-running query can be cancelled using Stop.
 
 The SQL editor remains responsive while the query is executing.
 
+No password appears in the application log.
+
 ---
 
-# 63. Recommended Phase 1 Milestones
+# 58. Phase 1 Milestones
 
 ## Milestone 1 — GPUI Application Shell
 
@@ -2055,7 +1981,7 @@ SQL can be executed reliably without blocking the UI.
 Implement:
 
 * Default limit 10.
-* Limit control.
+* Row limit control.
 * SQL-aware limit detection.
 * Automatic limit injection.
 
@@ -2135,64 +2061,11 @@ Focus on:
 
 ---
 
-# 64. Phase 2 Milestones
-
-Phase 2 should build on the metadata abstraction rather than introducing a second schema-inspection architecture.
-
-Suggested sequence:
-
-1. Table column metadata.
-2. Keys and constraints.
-3. Indexes.
-4. View definitions.
-5. Function definitions.
-6. Definition tabs.
-7. Additional PostgreSQL object metadata.
-
----
-
-# 65. Future Considerations
-
-The architecture should leave room for subsequent functionality including:
-
-* SQL autocomplete.
-* Schema-aware autocomplete.
-* Hover information.
-* Go-to-table-definition.
-* SQL formatting.
-* SQL diagnostics.
-* Query history.
-* Saved queries.
-* PostgreSQL notices.
-* Multiple active result sets.
-* CSV export.
-* JSON export.
-* Copy rows.
-* Editable table data.
-* Transaction controls.
-* Execution-plan visualization.
-* `EXPLAIN ANALYZE`.
-* SQL snippets.
-* Connection groups.
-* SSH tunnelling.
-* TLS certificate configuration.
-* Secret/keychain storage.
-* Read-only connection profiles.
-* Production environment protection.
-* MySQL.
-* SQLite.
-* Oracle.
-* SQL Server.
-* CockroachDB.
-* DuckDB.
-
----
-
-# 66. Product Decisions Recommended for Phase 1
+# 59. Architectural Decisions
 
 Several decisions should be made early because they significantly affect architecture.
 
-## 66.1 Use “Row Limit”, Not “Page Limit”
+## 59.1 Use "Row Limit", Not "Page Limit"
 
 The first release is limiting rows rather than implementing true pagination.
 
@@ -2220,7 +2093,7 @@ without changing the meaning of the existing control.
 
 ---
 
-## 66.2 Keep Query Results Separate From Database Drivers
+## 59.2 Keep Query Results Separate From Database Drivers
 
 Database-driver row objects should not flow directly into GPUI components.
 
@@ -2232,13 +2105,13 @@ This will make:
 * Separate windows.
 * Additional database engines.
 * Export.
-* Virtualized tables.
+* Virtualised tables.
 
 considerably easier later.
 
 ---
 
-## 66.3 Treat SQL Parsing as a Core Capability
+## 59.3 Treat SQL Parsing as a Core Capability
 
 Statement detection and safe `LIMIT` injection are more complicated than they initially appear.
 
@@ -2252,11 +2125,11 @@ They affect:
 * Future SQL diagnostics.
 * Future autocomplete.
 
-A reusable PostgreSQL-aware SQL parsing/tokenization layer should therefore be treated as part of the application's core architecture rather than implemented independently inside toolbar commands.
+A reusable PostgreSQL-aware SQL parsing/tokenisation layer should therefore be treated as part of the application's core architecture rather than implemented independently inside toolbar commands.
 
 ---
 
-## 66.4 Keep GPUI Away From Database Logic
+## 59.4 Keep GPUI Away From Database Logic
 
 GPUI views should represent state and dispatch commands.
 
@@ -2266,7 +2139,7 @@ This separation will make async execution, testing, cancellation, and additional
 
 ---
 
-## 66.5 Make Connection Identity Highly Visible
+## 59.5 Make Connection Identity Highly Visible
 
 Running:
 
@@ -2288,11 +2161,13 @@ could appear directly in the SQL editor toolbar.
 
 ---
 
-# 67. Proposed Phase Boundaries
+# 60. Phase Roadmap
 
 ## Phase 1 — PostgreSQL Query Client
 
 **Theme:** Connect, query, inspect results.
+
+**Status:** Committed. Specified by this document.
 
 Includes:
 
@@ -2321,54 +2196,25 @@ Includes:
 
 ---
 
-## Phase 2 — PostgreSQL Schema Inspection
+## Later Phases
 
-**Theme:** Understand database objects.
+| Phase | Theme | Document |
+|---|---|---|
+| 2 | PostgreSQL schema inspection | [phase-2-schema-inspection.md](phase-2-schema-inspection.md) |
+| 3 | Developer productivity | [phase-3-developer-productivity.md](phase-3-developer-productivity.md) |
+| 4 | Multi-database support | [phase-4-multi-database.md](phase-4-multi-database.md) |
 
-Includes:
+Later phases are proposals. Their scope may be re-ordered or reduced once Phase 1 is in real use.
 
-* Table definitions.
-* Column metadata.
-* Keys.
-* Constraints.
-* Indexes.
-* View definitions.
-* Function definitions.
-* Definition tabs.
-* Read-only schema inspection.
+The architecture built during Phase 1 is what makes those phases affordable, in particular:
 
----
-
-## Potential Phase 3 — Developer Productivity
-
-Possible scope:
-
-* SQL autocomplete.
-* Schema-aware completion.
-* Query history.
-* Saved SQL.
-* Formatting.
-* Search database objects.
-* Copy/export results.
-* Enhanced `EXPLAIN`.
+* The metadata provider abstraction (Phase 2 extends it).
+* The SQL parsing layer (Phase 3 builds autocomplete, formatting and diagnostics on it).
+* The database provider abstraction and GPUI-independent result model (Phase 4 depends on both).
 
 ---
 
-## Potential Phase 4 — Multi-Database
-
-Possible scope:
-
-* SQLite.
-* MySQL/MariaDB.
-* SQL Server.
-* Oracle.
-* DuckDB.
-
-The generic database-provider architecture created during Phase 1 should significantly reduce the cost of this phase.
-
----
-
-# 68. Definition of Success
+# 61. Definition of Success
 
 Phase 1 will be successful if a developer can install the application and choose it instead of a general-purpose database IDE for everyday PostgreSQL query work.
 
