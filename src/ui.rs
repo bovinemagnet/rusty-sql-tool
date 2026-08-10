@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle, SharedString, Window, WindowBounds,
+    WindowOptions, div, point, prelude::*, px, rgb, size,
 };
 use tokio::runtime::Runtime;
 
@@ -44,6 +46,263 @@ const EDITOR_LINE_HEIGHT: f32 = 25.;
 const EDITOR_TEXT_SIZE: f32 = 14.;
 const GUTTER_WIDTH: f32 = 40.;
 const RESULT_PANE_HEIGHT: f32 = 296.;
+const RESULT_PANE_MIN_HEIGHT: f32 = 120.;
+/// Vertical space the rest of the workspace needs — chrome, header, toolbar, status bar and a
+/// usable editor — so dragging the splitter can never squeeze the editor out of existence.
+const RESULT_PANE_RESERVED: f32 = 380.;
+const SPLITTER_HEIGHT: f32 = 10.;
+const RESULT_TEXT_SIZE: f32 = 13.;
+const RESULT_LINE_HEIGHT: f32 = 22.;
+/// Left inset of a text-result line, matching its `px_5` padding. The selection highlight and the
+/// pointer-to-column arithmetic both measure from here.
+const RESULT_TEXT_INSET: f32 = 20.;
+
+/// The single reusable slot for a connection typed into the dialog.
+const MANUAL_PROFILE_NAME: &str = "Manual";
+
+const SCROLLBAR_THICKNESS: f32 = 10.;
+const SCROLLBAR_THUMB: f32 = 6.;
+const SCROLLBAR_MIN_THUMB: f32 = 24.;
+
+/// GPUI's `overflow_*_scroll` gives wheel scrolling but paints nothing, so the bars are drawn from
+/// the tracked scroll handle's geometry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+/// An in-progress thumb drag. Anchoring to where the drag began keeps the thumb under the pointer
+/// instead of jumping to it.
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    axis: ScrollAxis,
+    pointer_origin: Pixels,
+    offset_origin: Pixels,
+}
+
+/// One scrolling surface: the tracked handle plus any drag in progress. Views own one per surface,
+/// which is what lets the same scrollbar code serve the main window and the results window.
+#[derive(Default)]
+struct ScrollState {
+    handle: ScrollHandle,
+    drag: Option<ScrollbarDrag>,
+}
+
+impl ScrollState {
+    fn set_offset(&self, axis: ScrollAxis, value: Pixels) {
+        let offset = self.handle.offset();
+        self.handle.set_offset(match axis {
+            ScrollAxis::Vertical => point(offset.x, value),
+            ScrollAxis::Horizontal => point(value, offset.y),
+        });
+    }
+
+    /// Advances an in-progress drag. Returns whether anything changed.
+    fn drag(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(drag) = self.drag else {
+            return false;
+        };
+        if !event.dragging() {
+            self.drag = None;
+            return true;
+        }
+        let vertical = drag.axis == ScrollAxis::Vertical;
+        let viewport = self.handle.bounds().size;
+        let overflow = self.handle.max_offset();
+        let (extent, travel, pointer) = if vertical {
+            (viewport.height, overflow.height, event.position.y)
+        } else {
+            (viewport.width, overflow.width, event.position.x)
+        };
+        let Some(metrics) = ThumbMetrics::measure(extent, travel, px(0.)) else {
+            return false;
+        };
+        let moved = (pointer - drag.pointer_origin) * metrics.pixels_per_thumb_pixel;
+        self.set_offset(
+            drag.axis,
+            (drag.offset_origin - moved).clamp(-travel, px(0.)),
+        );
+        true
+    }
+}
+
+/// Reaches a view's scroll surface from inside an event listener.
+type ScrollAccessor<V> = fn(&mut V) -> &mut ScrollState;
+
+/// Wraps scrolling content in a viewport with drawn scrollbars, for any view that owns a
+/// [`ScrollState`]. GPUI paints no scrollbars of its own.
+fn scrollable<V: 'static>(
+    access: ScrollAccessor<V>,
+    state: &ScrollState,
+    id: &'static str,
+    content: impl IntoElement,
+    cx: &mut Context<V>,
+) -> impl IntoElement {
+    let handle = state.handle.clone();
+    let viewport = handle.bounds().size;
+    let overflow = handle.max_offset();
+    let offset = handle.offset();
+    let vertical = ThumbMetrics::measure(viewport.height, overflow.height, offset.y);
+    let horizontal = ThumbMetrics::measure(viewport.width, overflow.width, offset.x);
+
+    div()
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .id(id)
+                .absolute()
+                .size_full()
+                // `items_start` is load-bearing: without it the content stretches to the viewport
+                // width, so a wide grid overflows the content wrapper rather than the scroll
+                // container, and the container measures nothing to scroll sideways.
+                .flex()
+                .flex_col()
+                .items_start()
+                .overflow_y_scroll()
+                .overflow_x_scroll()
+                .track_scroll(&handle)
+                .child(content),
+        )
+        .children(vertical.map(|metrics| scrollbar(access, id, ScrollAxis::Vertical, metrics, cx)))
+        .children(
+            horizontal.map(|metrics| scrollbar(access, id, ScrollAxis::Horizontal, metrics, cx)),
+        )
+}
+
+/// One bar. Clicking the track jumps to that position; dragging the thumb scrolls with it.
+fn scrollbar<V: 'static>(
+    access: ScrollAccessor<V>,
+    id: &'static str,
+    axis: ScrollAxis,
+    metrics: ThumbMetrics,
+    cx: &mut Context<V>,
+) -> impl IntoElement {
+    let vertical = axis == ScrollAxis::Vertical;
+    let suffix = if vertical { "y" } else { "x" };
+    let ThumbMetrics {
+        length,
+        start,
+        pixels_per_thumb_pixel,
+        scrollable,
+    } = metrics;
+
+    let mut thumb = div()
+        .id(SharedString::from(format!("{id}-thumb-{suffix}")))
+        .absolute()
+        .rounded_full()
+        .bg(rgb(PANEL_HIGH))
+        .hover(|style| style.bg(rgb(MUTED)))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                let state = access(view);
+                let offset = state.handle.offset();
+                state.drag = Some(ScrollbarDrag {
+                    axis,
+                    pointer_origin: if vertical {
+                        event.position.y
+                    } else {
+                        event.position.x
+                    },
+                    offset_origin: if vertical { offset.y } else { offset.x },
+                });
+                cx.notify();
+            }),
+        );
+    thumb = if vertical {
+        thumb
+            .top(start)
+            .right(px((SCROLLBAR_THICKNESS - SCROLLBAR_THUMB) / 2.))
+            .w(px(SCROLLBAR_THUMB))
+            .h(length)
+    } else {
+        thumb
+            .left(start)
+            .bottom(px((SCROLLBAR_THICKNESS - SCROLLBAR_THUMB) / 2.))
+            .h(px(SCROLLBAR_THUMB))
+            .w(length)
+    };
+
+    let track = div()
+        .id(SharedString::from(format!("{id}-track-{suffix}")))
+        .absolute()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                // A click on the bare track pages to roughly that position.
+                let state = access(view);
+                let bounds = state.handle.bounds();
+                let (pointer, origin) = if vertical {
+                    (event.position.y, bounds.origin.y)
+                } else {
+                    (event.position.x, bounds.origin.x)
+                };
+                let travelled = (pointer - origin - length / 2.) * pixels_per_thumb_pixel;
+                state.set_offset(axis, -travelled.clamp(px(0.), scrollable));
+                cx.notify();
+            }),
+        )
+        .child(thumb);
+    if vertical {
+        track
+            .top(px(0.))
+            .bottom(px(0.))
+            .right(px(0.))
+            .w(px(SCROLLBAR_THICKNESS))
+    } else {
+        track
+            .left(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .h(px(SCROLLBAR_THICKNESS))
+    }
+}
+
+/// Thumb geometry for one axis, or `None` when the content fits and no bar is warranted.
+struct ThumbMetrics {
+    length: Pixels,
+    start: Pixels,
+    /// Content pixels travelled per pixel of thumb movement.
+    pixels_per_thumb_pixel: f32,
+    scrollable: Pixels,
+}
+
+impl ThumbMetrics {
+    fn measure(viewport: Pixels, overflow: Pixels, offset: Pixels) -> Option<Self> {
+        if overflow <= px(0.) || viewport <= px(0.) {
+            return None;
+        }
+        let content = viewport + overflow;
+        let track = viewport;
+        // The floor keeps the thumb grabbable on very large result sets; on a very short viewport
+        // it can reach the whole track, leaving nothing to travel along.
+        let length = (track * (viewport / content))
+            .max(px(SCROLLBAR_MIN_THUMB))
+            .min(track);
+        let usable = (track - length).max(px(0.));
+        let progress = (-offset / overflow).clamp(0., 1.);
+        Some(Self {
+            length,
+            // Multiplying by a zero progress yields -0px, which sorts below zero under the total
+            // ordering `Pixels` uses, so the zero case is taken directly.
+            start: if progress <= 0. {
+                px(0.)
+            } else {
+                (usable * progress).min(usable)
+            },
+            pixels_per_thumb_pixel: if usable > px(0.) {
+                overflow / usable
+            } else {
+                0.
+            },
+            scrollable: overflow,
+        })
+    }
+}
 
 /// The design names Space Grotesk for headings, Manrope for body copy and JetBrains Mono for every
 /// datum. None of the three is guaranteed to be installed, so each resolves against the fonts the
@@ -64,6 +323,20 @@ impl Fonts {
             mono: resolve_family(&available, "JetBrains Mono", "monospace"),
         }
     }
+}
+
+/// The advance width of one monospace character at the result text size. Falls back to a typical
+/// 0.6em ratio if the glyph cannot be measured, which keeps selection usable rather than collapsing
+/// every column onto zero.
+fn measure_mono_advance(fonts: &Fonts, cx: &App) -> Pixels {
+    let text_system = cx.text_system();
+    let font_id = text_system.resolve_font(&gpui::font(fonts.mono.clone()));
+    text_system
+        .advance(font_id, px(RESULT_TEXT_SIZE), '0')
+        .map(|advance| advance.width)
+        .ok()
+        .filter(|advance| *advance > px(0.))
+        .unwrap_or(px(RESULT_TEXT_SIZE * 0.6))
 }
 
 fn resolve_family(available: &[String], preferred: &str, fallback: &'static str) -> SharedString {
@@ -116,12 +389,113 @@ struct AppView {
     connection_dialog: bool,
     connection_buffer: String,
     fonts: Fonts,
+    /// The profile the single provider session is actually bound to. There is exactly one session,
+    /// so this — not the active editor — is the truth about which database SQL will reach.
+    session_profile: Option<ConnectionProfile>,
+    /// Whether the profile list came from real configuration rather than the built-in fallback.
+    configured: bool,
+    editor_scroll: ScrollState,
+    results_scroll: ScrollState,
+    /// Selected text in the results, and whether a drag is extending it.
+    result_selection: Option<ResultSelection>,
+    selecting_results: bool,
+    /// Advance width of one monospace character at the result text size, used to turn a pointer
+    /// position into a column and to size the selection highlight.
+    mono_advance: Pixels,
+    result_pane_height: Pixels,
+    pane_drag: Option<PaneDrag>,
+}
+
+/// An in-progress splitter drag, anchored to where it began so the grip stays under the pointer.
+#[derive(Clone, Copy)]
+struct PaneDrag {
+    pointer_origin: Pixels,
+    height_origin: Pixels,
+}
+
+/// A caret position in the rendered results: which line, and how many characters into it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ResultPosition {
+    line: usize,
+    column: usize,
+}
+
+/// Selected text, held as the two ends of the gesture so dragging backwards works.
+///
+/// GPUI paints no text selection of its own, so the highlight is drawn and the column derived
+/// arithmetically from the pointer — sound here because the results are monospace.
+#[derive(Clone, Copy)]
+struct ResultSelection {
+    anchor: ResultPosition,
+    head: ResultPosition,
+}
+
+impl ResultSelection {
+    /// Whole lines end to end, for grid rows and select-all where a partial line has no meaning.
+    fn whole_lines(first: usize, last: usize) -> Self {
+        Self {
+            anchor: ResultPosition {
+                line: first,
+                column: 0,
+            },
+            head: ResultPosition {
+                line: last,
+                column: usize::MAX,
+            },
+        }
+    }
+
+    fn ordered(&self) -> (ResultPosition, ResultPosition) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn bounds(&self) -> (usize, usize) {
+        let (start, end) = self.ordered();
+        (start.line, end.line)
+    }
+
+    fn contains(&self, line: usize) -> bool {
+        let (first, last) = self.bounds();
+        (first..=last).contains(&line)
+    }
+
+    /// The selected characters within one line, clamped to its length. `None` only when the line
+    /// falls outside the selection — a line inside it that contributes no characters still yields
+    /// an empty range, because it is a blank line the copy must preserve as a line break.
+    fn clamped_span(&self, line: usize, length: usize) -> Option<Range<usize>> {
+        let (start, end) = self.ordered();
+        if line < start.line || line > end.line {
+            return None;
+        }
+        let from = if line == start.line {
+            start.column.min(length)
+        } else {
+            0
+        };
+        let to = if line == end.line {
+            end.column.min(length)
+        } else {
+            length
+        };
+        Some(from..to.max(from))
+    }
+
+    /// The span worth painting a highlight over: as above, minus the empty ones.
+    fn span_for(&self, line: usize, length: usize) -> Option<Range<usize>> {
+        self.clamped_span(line, length)
+            .filter(|span| !span.is_empty())
+    }
 }
 
 impl AppView {
     fn new(cx: &mut Context<Self>) -> Self {
-        let profiles = discover_profiles();
+        let (profiles, configured) = discover_profiles();
         let fonts = Fonts::resolve(cx);
+        let fonts_for_advance = fonts.clone();
         let profile = profiles
             .first()
             .cloned()
@@ -147,7 +521,224 @@ impl AppView {
             connection_dialog: false,
             connection_buffer: String::new(),
             fonts,
+            session_profile: None,
+            configured,
+            editor_scroll: ScrollState::default(),
+            results_scroll: ScrollState::default(),
+            result_selection: None,
+            selecting_results: false,
+            mono_advance: measure_mono_advance(&fonts_for_advance, cx),
+            result_pane_height: px(RESULT_PANE_HEIGHT),
+            pane_drag: None,
         }
+    }
+
+    /// Advances a splitter drag. The pane sits at the bottom, so dragging up makes it taller.
+    fn drag_pane(&mut self, pointer: Pixels, viewport_height: Pixels) -> bool {
+        let Some(drag) = self.pane_drag else {
+            return false;
+        };
+        let ceiling = (viewport_height - px(RESULT_PANE_RESERVED)).max(px(RESULT_PANE_MIN_HEIGHT));
+        let height = (drag.height_origin + (drag.pointer_origin - pointer))
+            .clamp(px(RESULT_PANE_MIN_HEIGHT), ceiling);
+        if height == self.result_pane_height {
+            return false;
+        }
+        self.result_pane_height = height;
+        true
+    }
+
+    /// The drag handle between the editor and the results pane.
+    fn results_splitter(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dragging = self.pane_drag.is_some();
+        div()
+            .id("results-splitter")
+            .flex_none()
+            .h(px(SPLITTER_HEIGHT))
+            .mx(px(30.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(gpui::CursorStyle::ResizeUpDown)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.pane_drag = Some(PaneDrag {
+                        pointer_origin: event.position.y,
+                        height_origin: this.result_pane_height,
+                    });
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(48.))
+                    .h(px(3.))
+                    .rounded_full()
+                    .bg(rgb(if dragging { ACCENT } else { PANEL_HIGH })),
+            )
+    }
+
+    /// Turns a pointer x-position into a character column. Every text line shares one left edge, so
+    /// this needs no per-line geometry; rounding gives caret-between-characters behaviour.
+    fn column_at(&self, x: Pixels) -> usize {
+        if self.mono_advance <= px(0.) {
+            return 0;
+        }
+        let bounds = self.results_scroll.handle.bounds();
+        let offset = self.results_scroll.handle.offset();
+        let text_left = bounds.origin.x + offset.x + px(RESULT_TEXT_INSET);
+        let columns = ((x - text_left) / self.mono_advance).round();
+        if columns <= 0. { 0 } else { columns as usize }
+    }
+
+    fn begin_selection(&mut self, position: ResultPosition, extend: bool) {
+        self.selecting_results = true;
+        self.result_selection = Some(match (extend, self.result_selection) {
+            (true, Some(existing)) => ResultSelection {
+                anchor: existing.anchor,
+                head: position,
+            },
+            _ => ResultSelection {
+                anchor: position,
+                head: position,
+            },
+        });
+    }
+
+    /// Extends an in-progress drag. Returns whether anything moved.
+    fn extend_selection(&mut self, position: ResultPosition) -> bool {
+        if !self.selecting_results {
+            return false;
+        }
+        match self.result_selection.as_mut() {
+            Some(selection) if selection.head != position => {
+                selection.head = position;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Every selectable unit of every result, in render order — one entry per rendered line in
+    /// Text mode, per header and data row in Table mode. Selection indices point into this, and it
+    /// is also what gets copied, so what you select is exactly what you get.
+    ///
+    /// Table rows are tab separated so a paste lands in spreadsheet columns.
+    fn selectable_lines(&self) -> Vec<String> {
+        self.editor
+            .results
+            .iter()
+            .flat_map(|result| match self.editor.display {
+                ResultDisplay::Text => result
+                    .as_text()
+                    .lines()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+                ResultDisplay::Table => {
+                    let mut lines = Vec::with_capacity(result.rows.len() + 1);
+                    if !result.columns.is_empty() {
+                        lines.push(
+                            result
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect::<Vec<_>>()
+                                .join("\t"),
+                        );
+                    }
+                    lines.extend(result.rows.iter().map(|row| {
+                        row.iter()
+                            .map(CellValue::to_display_string)
+                            .collect::<Vec<_>>()
+                            .join("\t")
+                    }));
+                    lines
+                }
+            })
+            .collect()
+    }
+
+    /// The selected lines, or the whole result when nothing is selected — copying with no selection
+    /// should still give the user their data.
+    fn copyable_result_text(&self) -> Option<String> {
+        let lines = self.selectable_lines();
+        if lines.is_empty() {
+            return None;
+        }
+        let Some(selection) = self.result_selection else {
+            return Some(lines.join("\n"));
+        };
+        let (start, end) = selection.ordered();
+        let last = end.line.min(lines.len().saturating_sub(1));
+        if start.line > last {
+            return None;
+        }
+        let mut selected = Vec::new();
+        for (index, line) in lines.iter().enumerate().take(last + 1).skip(start.line) {
+            let characters: Vec<char> = line.chars().collect();
+            if let Some(span) = selection.clamped_span(index, characters.len()) {
+                selected.push(characters[span].iter().collect::<String>());
+            }
+        }
+        // An unmoved caret selects no text at all, so there is nothing to put on the clipboard.
+        let text = selected.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn copy_results(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.copyable_result_text() else {
+            return;
+        };
+        let lines = text.lines().count();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.status = format!("Copied {lines} line{}", if lines == 1 { "" } else { "s" });
+        cx.notify();
+    }
+
+    fn select_all_results(&mut self, cx: &mut Context<Self>) {
+        let count = self.selectable_lines().len();
+        if count == 0 {
+            return;
+        }
+        self.result_selection = Some(ResultSelection::whole_lines(0, count - 1));
+        cx.notify();
+    }
+
+    /// True when the results surface, rather than the SQL document, should answer copy and
+    /// select-all: the result tab is in front, or lines are already selected.
+    fn results_have_focus(&self) -> bool {
+        !self.editor.results.is_empty()
+            && (self.active_result_tab || self.result_selection.is_some())
+    }
+
+    /// The connection SQL will actually run against: the live session when there is one, otherwise
+    /// the target the editor is pointed at.
+    fn target_profile(&self) -> &ConnectionProfile {
+        self.session_profile
+            .as_ref()
+            .unwrap_or(&self.editor.connection)
+    }
+
+    fn target_identity(&self) -> String {
+        self.target_profile().display_identity()
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(
+            self.editor.execution_status,
+            ExecutionStatus::Running | ExecutionStatus::Cancelling
+        )
+    }
+
+    /// Binds every editor to the profile the session actually opened, so switching tabs can never
+    /// surface a stale target while one connection is live.
+    fn adopt_session_profile(&mut self, profile: ConnectionProfile) {
+        self.editor.connection = profile.clone();
+        for editor in &mut self.background_editors {
+            editor.connection = profile.clone();
+        }
+        self.session_profile = Some(profile);
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
@@ -162,6 +753,7 @@ impl AppView {
         let service = self.service.clone();
         let runtime = self.runtime.clone();
         let profile = self.editor.connection.clone();
+        let connected_profile = profile.clone();
         cx.spawn(async move |view, cx| {
             let joined = runtime
                 .spawn(async move {
@@ -176,7 +768,10 @@ impl AppView {
                         this.connection_state = ConnectionState::Connected;
                         this.server_version = Some(info.server_version);
                         this.schemas = schemas;
-                        this.status = format!("Connected: {}", this.editor.connection_identity());
+                        // Record what the session is bound to, and point every editor at it so no
+                        // tab can display a target the session is not using (§49, §50).
+                        this.adopt_session_profile(connected_profile);
+                        this.status = format!("Connected: {}", this.target_identity());
                     }
                     Ok(Err(error)) => {
                         this.connection_state = ConnectionState::Failed;
@@ -195,6 +790,13 @@ impl AppView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        // Closing the session cancels whatever is in flight and loses its results, so the running
+        // query has to finish or be stopped first — the same rule the connection rows enforce.
+        if self.is_running() {
+            self.status = "Wait for the active query before disconnecting".into();
+            cx.notify();
+            return;
+        }
         self.connection_state = ConnectionState::Disconnecting;
         self.status = "Disconnecting…".into();
         let service = self.service.clone();
@@ -207,8 +809,10 @@ impl AppView {
                 match result {
                     Ok(Ok(())) => {
                         this.connection_state = ConnectionState::Disconnected;
+                        this.session_profile = None;
                         this.schemas.clear();
                         this.objects.clear();
+                        this.expanded_schema = None;
                         this.status = "Disconnected · SQL and results preserved".into();
                     }
                     _ => {
@@ -289,6 +893,13 @@ impl AppView {
             cx.notify();
             return;
         }
+        // One session means one statement at a time. Guarding here covers every route in — the
+        // toolbar, the shortcuts, and anything added later.
+        if self.is_running() {
+            self.status = "A query is already running".into();
+            cx.notify();
+            return;
+        }
         self.editor.execution_status = ExecutionStatus::Running;
         self.status = match mode {
             RunMode::Current => "Running statement…",
@@ -302,31 +913,61 @@ impl AppView {
         cx.spawn(async move |view, cx| {
             let joined = runtime
                 .spawn(async move {
-                    let status = match mode {
-                        RunMode::Current => service.run(&mut editor).await.map(|_| ()),
-                        RunMode::Explain => service.explain(&mut editor).await.map(|_| ()),
-                        RunMode::All => {
-                            service
-                                .run_all(&mut editor)
+                    let status =
+                        match mode {
+                            RunMode::Current => {
+                                service.run(&mut editor).await.map(|_| ()).map_err(|error| {
+                                    RunFailure {
+                                        statement_index: None,
+                                        error,
+                                    }
+                                })
+                            }
+                            RunMode::Explain => service
+                                .explain(&mut editor)
                                 .await
                                 .map(|_| ())
-                                .map_err(|error| crate::result::QueryError {
-                                    message: error.to_string(),
-                                    severity: None,
-                                    code: None,
-                                    detail: None,
-                                    hint: None,
-                                    position: None,
-                                })
-                        }
-                    };
+                                .map_err(|error| RunFailure {
+                                    statement_index: None,
+                                    error,
+                                }),
+                            // `run_all` reports a failing statement inside a successful `Result`, so
+                            // the outcome has to be inspected or a failure reads as a clean run.
+                            RunMode::All => match service.run_all(&mut editor).await {
+                                Ok(outcome) => match outcome.failure {
+                                    Some(failure) => Err(RunFailure {
+                                        statement_index: Some(failure.statement_index),
+                                        error: failure.error,
+                                    }),
+                                    None => Ok(()),
+                                },
+                                Err(error) => Err(RunFailure {
+                                    statement_index: None,
+                                    error: crate::result::QueryError {
+                                        message: error.to_string(),
+                                        severity: None,
+                                        code: None,
+                                        detail: None,
+                                        hint: None,
+                                        position: None,
+                                    },
+                                }),
+                            },
+                        };
                     (editor, status)
                 })
                 .await;
             let _ = view.update(cx, |this, cx| {
                 match joined {
                     Ok((editor, result)) => {
-                        this.editor = editor;
+                        // Only the execution outcome comes back. The document, cursor and
+                        // selection stay as they are so anything typed while the query ran
+                        // survives (FR-046, FR-047).
+                        this.editor.results = editor.results;
+                        this.editor.error = editor.error;
+                        this.editor.execution_status = editor.execution_status;
+                        // A selection into the previous result set means nothing against this one.
+                        this.result_selection = None;
                         if result.is_ok() {
                             match this.editor.destination {
                                 ResultDestination::Pane => this.active_result_tab = false,
@@ -352,6 +993,7 @@ impl AppView {
                                                 results,
                                                 display,
                                                 fonts,
+                                                scroll: ScrollState::default(),
                                             })
                                         },
                                     );
@@ -360,7 +1002,7 @@ impl AppView {
                         }
                         this.status = match result {
                             Ok(()) => completion_status(&this.editor.results),
-                            Err(error) => format!("Query failed: {error}"),
+                            Err(failure) => failure.status_message(),
                         };
                     }
                     Err(_) => this.status = "Query task failed".into(),
@@ -390,7 +1032,8 @@ impl AppView {
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if let Ok((editor, outcome)) = result {
-                    this.editor = editor;
+                    this.editor.execution_status = editor.execution_status;
+                    this.editor.error = editor.error;
                     this.status = if outcome.is_ok() {
                         "Query cancelled".into()
                     } else {
@@ -425,9 +1068,18 @@ impl AppView {
                 "enter" => {
                     match ConnectionProfile::from_database_url(&self.connection_buffer) {
                         Ok(mut profile) => {
-                            profile.name = "Manual".into();
+                            profile.name = MANUAL_PROFILE_NAME.into();
                             self.editor.connection = profile.clone();
-                            self.profiles.push(profile);
+                            // One manual slot, reused. Correcting a mistyped URL must not leave the
+                            // unreachable host behind as a second identical row.
+                            match self
+                                .profiles
+                                .iter_mut()
+                                .find(|candidate| candidate.name == MANUAL_PROFILE_NAME)
+                            {
+                                Some(existing) => *existing = profile,
+                                None => self.profiles.push(profile),
+                            }
                             self.status = "Manual connection configured".into();
                             self.connection_buffer.clear();
                             self.connection_dialog = false;
@@ -464,11 +1116,15 @@ impl AppView {
         }
         if command {
             match key {
+                // Copy and select-all address the results when those are what the user is looking
+                // at, and the SQL document otherwise.
+                "a" if self.results_have_focus() => self.select_all_results(cx),
                 "a" => {
                     self.editor.selection = Some(0..self.editor.document.len());
                     self.editor.cursor = self.editor.document.len();
                     cx.notify();
                 }
+                "c" if self.results_have_focus() => self.copy_results(cx),
                 "c" => {
                     if let Some(range) = self.editor.selection.clone()
                         && !range.is_empty()
@@ -635,6 +1291,11 @@ impl AppView {
     }
 
     fn set_display(&mut self, display: ResultDisplay, cx: &mut Context<Self>) {
+        if self.editor.display != display {
+            // Indices address rendered lines in Text mode and rows in Table mode, so a selection
+            // carried across the switch would highlight unrelated data.
+            self.result_selection = None;
+        }
         self.editor.display = display;
         cx.notify();
     }
@@ -766,10 +1427,16 @@ impl AppView {
     fn connection_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tree = div().flex().flex_col().gap(px(3.));
         for (profile_index, profile) in self.profiles.iter().enumerate() {
-            let active = profile.id == self.editor.connection.id;
             let profile_id = profile.id;
+            // "Connected" is a property of the one session, not of whichever editor is in front.
+            let live = self
+                .session_profile
+                .as_ref()
+                .is_some_and(|session| session.id == profile_id)
+                && self.connection_state == ConnectionState::Connected;
+            let active =
+                live || (self.session_profile.is_none() && profile_id == self.editor.connection.id);
             let indicator_colour = connection_indicator_colour(active, self.connection_state);
-            let live = active && self.connection_state == ConnectionState::Connected;
             tree = tree.child(
                 div()
                     .id(SharedString::from(format!("connection-{profile_id}")))
@@ -1163,16 +1830,133 @@ impl AppView {
         )
     }
 
-    fn results_surface(&self) -> impl IntoElement {
-        let mut content = div()
-            .id("results-scroll")
-            .flex()
-            .flex_col()
-            .size_full()
-            .overflow_y_scroll()
-            .overflow_x_scroll();
+    /// Makes one grid row selectable. Rows select whole, which is how SQL grids normally behave —
+    /// character selection belongs to the text view, where the output is one aligned block.
+    fn selectable_row(
+        &self,
+        index: usize,
+        id: &'static str,
+        row: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = self
+            .result_selection
+            .is_some_and(|selection| selection.contains(index));
+        row.id(SharedString::from(format!("{id}-{index}")))
+            .when(selected, |row| row.bg(rgb(ACCENT_SOFT)))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let extend = event.modifiers.shift;
+                    let anchor = match (extend, this.result_selection) {
+                        (true, Some(existing)) => existing.ordered().0.line,
+                        _ => index,
+                    };
+                    this.selecting_results = true;
+                    this.result_selection = Some(ResultSelection::whole_lines(
+                        anchor.min(index),
+                        anchor.max(index),
+                    ));
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                if this.selecting_results
+                    && let Some(existing) = this.result_selection
+                {
+                    let anchor = existing.ordered().0.line;
+                    let extended =
+                        ResultSelection::whole_lines(anchor.min(index), anchor.max(index));
+                    if existing.bounds() != extended.bounds() {
+                        this.result_selection = Some(extended);
+                        cx.notify();
+                    }
+                }
+            }))
+    }
+
+    /// One character-selectable line of a text result. The highlight is a rectangle painted behind
+    /// the glyphs, sized from the monospace advance, so the text itself is never split up.
+    fn result_line(&self, index: usize, line: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let length = line.chars().count();
+        let span = self
+            .result_selection
+            .and_then(|selection| selection.span_for(index, length));
+        let advance = self.mono_advance;
+        div()
+            .id(SharedString::from(format!("result-line-{index}")))
+            .relative()
+            .min_w_full()
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let column = this.column_at(event.position.x);
+                    this.begin_selection(
+                        ResultPosition {
+                            line: index,
+                            column,
+                        },
+                        event.modifiers.shift,
+                    );
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                let column = this.column_at(event.position.x);
+                if this.extend_selection(ResultPosition {
+                    line: index,
+                    column,
+                }) {
+                    cx.notify();
+                }
+            }))
+            // Painted before the text, so it sits behind the glyphs.
+            .children(span.map(|span| {
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .left(px(RESULT_TEXT_INSET) + advance * span.start as f32)
+                    .w(advance * span.len() as f32)
+                    .bg(rgb(ACCENT_SOFT))
+            }))
+            .child(div().px_5().child(SharedString::from(line.to_owned())))
+    }
+
+    /// The grid, with every header and data row selectable.
+    fn selectable_table(
+        &self,
+        result: &QueryResult,
+        line_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut table = table_shell(&self.fonts);
+        if !result.columns.is_empty() {
+            table = table.child(self.selectable_row(
+                *line_index,
+                "result-header",
+                header_row(result),
+                cx,
+            ));
+            *line_index += 1;
+        }
+        for row in &result.rows {
+            table = table.child(self.selectable_row(*line_index, "result-row", data_row(row), cx));
+            *line_index += 1;
+        }
+        table
+    }
+
+    /// The result content itself. Scrolling and the bars belong to the viewport that wraps this,
+    /// so the same content works in the pane, the result tab and the separate window.
+    fn results_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut content = div().flex().flex_col().items_start().min_w_full();
+        let mut line_index = 0;
         if self.editor.results.is_empty() && self.editor.error.is_none() {
             return content
+                .h_full()
                 .items_center()
                 .justify_center()
                 .gap_3()
@@ -1186,28 +1970,37 @@ impl AppView {
                         .font_family(self.fonts.mono.clone())
                         .text_color(rgb(PANEL_LIGHT))
                         .child("⌘↵ RUN · ⇧⌘↵ RUN ALL · ⌥⌘↵ EXPLAIN"),
-                );
+                )
+                .into_any_element();
         }
         for (index, result) in self.editor.results.iter().enumerate() {
             content = content.child(result_header(&self.fonts, index, result));
             content = match self.editor.display {
-                ResultDisplay::Text => content.child(
-                    div()
-                        .px_5()
+                ResultDisplay::Text => {
+                    let mut block = div()
+                        .flex()
+                        .flex_col()
                         .py_3()
+                        .min_w_full()
                         .font_family(self.fonts.mono.clone())
-                        .text_size(px(13.))
-                        .line_height(px(22.))
-                        .child(result.as_text()),
-                ),
-                ResultDisplay::Table => content.child(result_table(&self.fonts, result)),
+                        .text_size(px(RESULT_TEXT_SIZE))
+                        .line_height(px(RESULT_LINE_HEIGHT));
+                    for line in result.as_text().lines() {
+                        block = block.child(self.result_line(line_index, line, cx));
+                        line_index += 1;
+                    }
+                    content.child(block)
+                }
+                ResultDisplay::Table => {
+                    content.child(self.selectable_table(result, &mut line_index, cx))
+                }
             };
         }
         // Earlier results stay on screen beneath the failure (§46, §47).
         if let Some(error) = &self.editor.error {
             content = content.child(self.error_card(error));
         }
-        content
+        content.into_any_element()
     }
 
     /// The failure card: severity strip, SQLSTATE, message, and a reassurance that whatever ran
@@ -1264,29 +2057,37 @@ enum RunMode {
     Explain,
 }
 
+/// A failed execution. Run All also records which statement stopped the batch, so the user is told
+/// what actually happened rather than being shown a success line.
+struct RunFailure {
+    statement_index: Option<usize>,
+    error: crate::result::QueryError,
+}
+
+impl RunFailure {
+    fn status_message(&self) -> String {
+        match self.statement_index {
+            Some(index) => format!("Statement {} failed: {}", index + 1, self.error),
+            None => format!("Query failed: {}", self.error),
+        }
+    }
+}
+
 struct ResultWindow {
     results: Vec<QueryResult>,
     display: ResultDisplay,
     fonts: Fonts,
+    scroll: ScrollState,
 }
 
 impl Render for ResultWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let mut surface = div()
-            .id("separate-results-scroll")
-            .size_full()
-            .overflow_scroll()
-            .flex()
-            .flex_col()
-            .pt_4()
-            .bg(rgb(BACKGROUND))
-            .text_color(rgb(TEXT))
-            .font_family(self.fonts.body.clone());
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut content = div().flex().flex_col().items_start().min_w_full().pt_4();
         for (index, result) in self.results.iter().enumerate() {
-            surface = surface.child(result_header(&self.fonts, index, result));
-            surface = match self.display {
-                ResultDisplay::Table => surface.child(result_table(&self.fonts, result)),
-                ResultDisplay::Text => surface.child(
+            content = content.child(result_header(&self.fonts, index, result));
+            content = match self.display {
+                ResultDisplay::Table => content.child(result_table(&self.fonts, result)),
+                ResultDisplay::Text => content.child(
                     div()
                         .px_5()
                         .py_3()
@@ -1297,7 +2098,32 @@ impl Render for ResultWindow {
                 ),
             };
         }
-        surface
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(BACKGROUND))
+            .text_color(rgb(TEXT))
+            .font_family(self.fonts.body.clone())
+            .on_mouse_move(cx.listener(|this, event, _, cx| {
+                if this.scroll.drag(event) {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.scroll.drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(scrollable(
+                |view: &mut Self| &mut view.scroll,
+                &self.scroll,
+                "separate-results-scroll",
+                content,
+                cx,
+            ))
     }
 }
 
@@ -1310,14 +2136,36 @@ impl Focusable for AppView {
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.connection_state == ConnectionState::Connected;
-        let running = matches!(
-            self.editor.execution_status,
-            ExecutionStatus::Running | ExecutionStatus::Cancelling
-        );
+        let running = self.is_running();
+        let pane_visible =
+            self.editor.destination == ResultDestination::Pane && !self.active_result_tab;
         div()
             .track_focus(&self.focus_handle)
             .key_context("SqlEditor")
             .on_key_down(cx.listener(|this, event, _, cx| this.handle_key(event, cx)))
+            // A thumb drag continues wherever the pointer goes, so it is tracked at the root.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                let viewport_height = window.viewport_size().height;
+                if this.editor_scroll.drag(event)
+                    | this.results_scroll.drag(event)
+                    | this.drag_pane(event.position.y, viewport_height)
+                {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let was_dragging = this.editor_scroll.drag.take().is_some()
+                        | this.results_scroll.drag.take().is_some()
+                        | this.pane_drag.take().is_some()
+                        | this.selecting_results;
+                    this.selecting_results = false;
+                    if was_dragging {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -1422,6 +2270,25 @@ impl Render for AppView {
                                     .text_color(rgb(FAINT))
                                     .child("Click to connect · Alt-click to disconnect"),
                             )
+                            // Without configuration the list below is a built-in guess, not
+                            // anything the user set up. Say so rather than letting it fail silently.
+                            .when(!self.configured, |pane| {
+                                pane.child(
+                                    div()
+                                        .mx_1()
+                                        .mb_2()
+                                        .px_3()
+                                        .py_3()
+                                        .rounded(px(13.))
+                                        .bg(rgb(PANEL))
+                                        .text_size(px(12.))
+                                        .text_color(rgb(MUTED))
+                                        .child(
+                                            "No database connections found. \
+                                             Load a .env file or connect manually with ＋.",
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("connection-tree-scroll")
@@ -1464,7 +2331,7 @@ impl Render for AppView {
                                                 div()
                                                     .text_size(px(13.))
                                                     .text_color(rgb(MUTED))
-                                                    .child(self.editor.connection_identity()),
+                                                    .child(self.target_identity()),
                                             ),
                                     )
                                     .child(div().flex_1())
@@ -1475,7 +2342,7 @@ impl Render for AppView {
                                             "disconnect",
                                             "Disconnect",
                                             Tone::Neutral,
-                                            true,
+                                            !running,
                                             cx.listener(|this, _, _, cx| {
                                                 this.dispatch_command(command::DISCONNECT, cx)
                                             }),
@@ -1591,13 +2458,11 @@ impl Render for AppView {
                             )
                             .child(
                                 div()
-                                    .id("editor-scroll")
                                     .flex_1()
                                     .min_h_0()
+                                    .flex()
                                     .px(px(30.))
                                     .py(px(20.))
-                                    .overflow_y_scroll()
-                                    .overflow_x_scroll()
                                     .cursor_text()
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -1605,23 +2470,38 @@ impl Render for AppView {
                                             window.focus(&this.focus_handle(cx));
                                         }),
                                     )
+                                    // The result tab shares this surface with the editor, so it
+                                    // scrolls against whichever handle is currently showing.
                                     .child(if self.active_result_tab {
-                                        self.results_surface().into_any_element()
+                                        scrollable(
+                                            |view: &mut Self| &mut view.results_scroll,
+                                            &self.results_scroll,
+                                            "editor-scroll",
+                                            self.results_surface(cx),
+                                            cx,
+                                        )
+                                        .into_any_element()
                                     } else {
-                                        self.editor_surface().into_any_element()
+                                        scrollable(
+                                            |view: &mut Self| &mut view.editor_scroll,
+                                            &self.editor_scroll,
+                                            "editor-scroll",
+                                            self.editor_surface(),
+                                            cx,
+                                        )
+                                        .into_any_element()
                                     }),
                             )
+                            .when(pane_visible, |column| {
+                                column.child(self.results_splitter(cx))
+                            })
                             .child(
                                 div()
-                                    .h(
-                                        if self.editor.destination == ResultDestination::Pane
-                                            && !self.active_result_tab
-                                        {
-                                            px(RESULT_PANE_HEIGHT)
-                                        } else {
-                                            px(0.)
-                                        },
-                                    )
+                                    .h(if pane_visible {
+                                        self.result_pane_height
+                                    } else {
+                                        px(0.)
+                                    })
                                     .flex_none()
                                     .flex()
                                     .flex_col()
@@ -1647,10 +2527,35 @@ impl Render for AppView {
                                                     .child("RESULTS"),
                                             )
                                             .child(div().flex_1())
+                                            .when(!self.editor.results.is_empty(), |bar| {
+                                                bar.child(segment(
+                                                    &self.fonts,
+                                                    "copy-results",
+                                                    match self.result_selection {
+                                                        Some(_) => "COPY SELECTION",
+                                                        None => "COPY ALL",
+                                                    },
+                                                    false,
+                                                    true,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.copy_results(cx)
+                                                    }),
+                                                ))
+                                            })
                                             .child(self.display_segments(cx))
                                             .child(self.destination_segments(cx)),
                                     )
-                                    .child(self.results_surface()),
+                                    // Only the visible surface tracks the results scroll handle;
+                                    // the collapsed pane must not claim it from the result tab.
+                                    .when(pane_visible, |pane| {
+                                        pane.child(scrollable(
+                                            |view: &mut Self| &mut view.results_scroll,
+                                            &self.results_scroll,
+                                            "results-scroll",
+                                            self.results_surface(cx),
+                                            cx,
+                                        ))
+                                    }),
                             ),
                     ),
             )
@@ -1915,49 +2820,76 @@ fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl Into
         )
 }
 
-fn result_table(fonts: &Fonts, result: &QueryResult) -> impl IntoElement {
-    let mut table = div()
+/// The grid shell. `flex_none` here and on the cells keeps the grid at its intrinsic width so it
+/// overflows sideways rather than compressing its columns; `overflow_hidden` clips selected-row
+/// backgrounds to the rounded corners.
+fn table_shell(fonts: &Fonts) -> gpui::Div {
+    div()
         .flex()
+        .flex_none()
         .flex_col()
         .mx_5()
         .mb_4()
         .rounded(px(CARD_RADIUS))
         .overflow_hidden()
         .bg(rgb(PANEL))
-        .font_family(fonts.mono.clone());
+        .font_family(fonts.mono.clone())
+}
+
+fn header_row(result: &QueryResult) -> gpui::Div {
+    let mut header = div()
+        .flex()
+        .flex_none()
+        .border_b_1()
+        .border_color(rgb(BORDER));
+    for column in &result.columns {
+        header = header.child(
+            div()
+                .w(px(180.))
+                .flex_none()
+                .px_4()
+                .py(px(11.))
+                .text_size(px(10.))
+                .text_color(rgb(FAINT))
+                .child(column.name.to_uppercase()),
+        );
+    }
+    header
+}
+
+fn data_row(values: &[CellValue]) -> gpui::Div {
+    let mut row = div()
+        .flex()
+        .flex_none()
+        .border_b_1()
+        .border_color(rgb(BORDER));
+    for value in values {
+        row = row.child(
+            div()
+                .w(px(180.))
+                .flex_none()
+                .px_4()
+                .py_3()
+                .text_size(px(13.))
+                .text_color(if matches!(value, CellValue::Null) {
+                    rgb(FAINT)
+                } else {
+                    rgb(TEXT)
+                })
+                .child(value.to_display_string()),
+        );
+    }
+    row
+}
+
+/// The read-only grid used by the separate results window.
+fn result_table(fonts: &Fonts, result: &QueryResult) -> impl IntoElement {
+    let mut table = table_shell(fonts);
     if !result.columns.is_empty() {
-        let mut header = div().flex().border_b_1().border_color(rgb(BORDER));
-        for column in &result.columns {
-            header = header.child(
-                div()
-                    .w(px(180.))
-                    .px_4()
-                    .py(px(11.))
-                    .text_size(px(10.))
-                    .text_color(rgb(FAINT))
-                    .child(column.name.to_uppercase()),
-            );
-        }
-        table = table.child(header);
+        table = table.child(header_row(result));
     }
     for row in &result.rows {
-        let mut rendered_row = div().flex().border_b_1().border_color(rgb(BORDER));
-        for value in row {
-            rendered_row = rendered_row.child(
-                div()
-                    .w(px(180.))
-                    .px_4()
-                    .py_3()
-                    .text_size(px(13.))
-                    .text_color(if matches!(value, CellValue::Null) {
-                        rgb(FAINT)
-                    } else {
-                        rgb(TEXT)
-                    })
-                    .child(value.to_display_string()),
-            );
-        }
-        table = table.child(rendered_row);
+        table = table.child(data_row(row));
     }
     table
 }
@@ -1979,13 +2911,17 @@ fn shortcut_command(
     running: bool,
     connected: bool,
 ) -> Option<&'static str> {
+    // Shortcuts honour exactly the same preconditions as the toolbar buttons, so a key binding can
+    // never reach a command the equivalent button refuses to dispatch.
+    let runnable = connected && !running;
     if command_modifier {
         return match key {
-            "enter" if shift => Some(command::RUN_ALL),
-            "enter" if alt => Some(command::EXPLAIN),
-            "enter" => Some(command::RUN),
+            "enter" if shift => runnable.then_some(command::RUN_ALL),
+            "enter" if alt => runnable.then_some(command::EXPLAIN),
+            "enter" => runnable.then_some(command::RUN),
             "." if running => Some(command::CANCEL),
             "n" => Some(command::NEW_EDITOR),
+            "d" if shift && running => None,
             "d" if shift && connected => Some(command::DISCONNECT),
             "d" if shift => Some(command::CONNECT),
             _ => None,
@@ -2008,22 +2944,27 @@ fn connection_indicator_colour(active: bool, state: ConnectionState) -> u32 {
     }
 }
 
-fn discover_profiles() -> Vec<ConnectionProfile> {
+/// The discovered connections, and whether they came from real configuration. The built-in
+/// fallback must not be presented as though the user had configured it.
+fn discover_profiles() -> (Vec<ConnectionProfile>, bool) {
     if Path::new(".env").is_file()
         && let Ok(profiles) = ConnectionProfile::profiles_from_env_file(".env")
         && !profiles.is_empty()
     {
-        return profiles;
+        return (profiles, true);
     }
-    if let Ok(Some(profile)) = ConnectionProfile::from_process_env() {
-        return vec![profile];
+    if let Ok(profiles) = ConnectionProfile::profiles_from_process_env()
+        && !profiles.is_empty()
+    {
+        return (profiles, true);
     }
-    vec![local_profile().unwrap_or_else(|| {
+    let fallback = local_profile().unwrap_or_else(|| {
         ConnectionProfile::from_database_url(
             "postgresql://postgres@localhost:5432/postgres?sslmode=disable",
         )
         .expect("built-in PostgreSQL profile should be valid")
-    })]
+    });
+    (vec![fallback], false)
 }
 
 fn previous_boundary(text: &str, offset: usize) -> usize {
@@ -2042,7 +2983,7 @@ fn next_boundary(text: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use super::*;
     use async_trait::async_trait;
@@ -2056,6 +2997,8 @@ mod tests {
         state: AtomicU8,
         connect_calls: AtomicUsize,
         disconnect_calls: AtomicUsize,
+        /// Holds `execute` open so a test can act while a query is genuinely in flight.
+        blocked: AtomicBool,
     }
 
     impl UiTestProvider {
@@ -2082,7 +3025,10 @@ mod tests {
         }
 
         async fn execute(&self, _: &str) -> Result<QueryResult, QueryError> {
-            panic!("UI connection tests do not execute SQL")
+            while self.blocked.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            Ok(QueryResult::default())
         }
 
         async fn cancel(&self) -> Result<(), QueryError> {
@@ -2140,15 +3086,15 @@ mod tests {
     #[test]
     fn core_shortcuts_resolve_to_stable_command_ids() {
         assert_eq!(
-            shortcut_command("enter", true, false, false, false, false),
+            shortcut_command("enter", true, false, false, false, true),
             Some(command::RUN)
         );
         assert_eq!(
-            shortcut_command("enter", true, true, false, false, false),
+            shortcut_command("enter", true, true, false, false, true),
             Some(command::RUN_ALL)
         );
         assert_eq!(
-            shortcut_command("enter", true, false, true, false, false),
+            shortcut_command("enter", true, false, true, false, true),
             Some(command::EXPLAIN)
         );
         assert_eq!(
@@ -2162,6 +3108,45 @@ mod tests {
         assert_eq!(
             shortcut_command("d", true, true, false, false, true),
             Some(command::DISCONNECT)
+        );
+    }
+
+    /// A key binding must not reach a command the equivalent toolbar button refuses to dispatch:
+    /// two concurrent runs share one session, and disconnecting mid-query discards its results.
+    #[test]
+    fn execution_shortcuts_are_refused_while_a_query_is_running() {
+        for key in ["enter"] {
+            for (shift, alt) in [(false, false), (true, false), (false, true)] {
+                assert_eq!(
+                    shortcut_command(key, true, shift, alt, true, true),
+                    None,
+                    "{key} shift={shift} alt={alt} should be refused while running"
+                );
+            }
+        }
+        assert_eq!(shortcut_command("d", true, true, false, true, true), None);
+        assert_eq!(shortcut_command("d", true, true, false, true, false), None);
+        // Cancelling is the one thing that must still work mid-query.
+        assert_eq!(
+            shortcut_command(".", true, false, false, true, true),
+            Some(command::CANCEL)
+        );
+    }
+
+    /// Run and friends need a connection, not just an idle editor.
+    #[test]
+    fn execution_shortcuts_are_refused_while_disconnected() {
+        assert_eq!(
+            shortcut_command("enter", true, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            shortcut_command("enter", true, true, false, false, false),
+            None
+        );
+        assert_eq!(
+            shortcut_command("enter", true, false, true, false, false),
+            None
         );
     }
 
@@ -2198,6 +3183,499 @@ mod tests {
             resolve_family(&[], "Manrope", "sans-serif"),
             SharedString::from("sans-serif")
         );
+    }
+
+    fn result_with_rows(rows: &[&str]) -> QueryResult {
+        use crate::result::Column;
+        QueryResult {
+            columns: vec![Column {
+                name: "value".into(),
+                database_type: "text".into(),
+                nullable: Some(false),
+            }],
+            rows: rows
+                .iter()
+                .map(|value| vec![CellValue::Text((*value).into())])
+                .collect(),
+            ..QueryResult::default()
+        }
+    }
+
+    /// Dragging over the lines selects an inclusive range, and copying yields just those lines.
+    #[gpui::test]
+    fn selected_result_lines_are_the_ones_copied(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![result_with_rows(&["alpha", "beta", "gamma"])];
+        });
+
+        let lines = view.update(cx, |app, _| app.selectable_lines());
+        assert!(lines.len() >= 3, "text output should have several lines");
+        let last = lines.len() - 1;
+
+        // Drag backwards, from the final line up to the one before it.
+        view.update(cx, |app, _| {
+            app.result_selection = ResultSelection::whole_lines(last - 1, last).into();
+        });
+
+        view.update(cx, |app, cx| {
+            let copied = app
+                .copyable_result_text()
+                .expect("there are results to copy");
+            assert_eq!(copied, format!("{}\n{}", lines[last - 1], lines[last]));
+            app.copy_results(cx);
+            assert_eq!(app.status, "Copied 2 lines");
+        });
+
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            clipboard.as_deref(),
+            Some(format!("{}\n{}", lines[last - 1], lines[last]).as_str())
+        );
+    }
+
+    /// Dragging the splitter up makes the bottom pane taller, and it is clamped so neither the
+    /// pane nor the editor can be squeezed away.
+    #[gpui::test]
+    fn dragging_the_splitter_resizes_the_results_pane(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let viewport = px(820.);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.result_pane_height, px(RESULT_PANE_HEIGHT));
+
+            app.pane_drag = Some(PaneDrag {
+                pointer_origin: px(500.),
+                height_origin: px(RESULT_PANE_HEIGHT),
+            });
+
+            // Up 100px: the pane grows by 100.
+            assert!(app.drag_pane(px(400.), viewport));
+            assert_eq!(app.result_pane_height, px(RESULT_PANE_HEIGHT + 100.));
+
+            // Back down past the start: it shrinks.
+            assert!(app.drag_pane(px(600.), viewport));
+            assert_eq!(app.result_pane_height, px(RESULT_PANE_HEIGHT - 100.));
+
+            // Dragging far down stops at the floor rather than collapsing the pane.
+            assert!(app.drag_pane(px(5_000.), viewport));
+            assert_eq!(app.result_pane_height, px(RESULT_PANE_MIN_HEIGHT));
+
+            // Dragging far up leaves room for the editor rather than filling the window.
+            assert!(app.drag_pane(px(-5_000.), viewport));
+            assert_eq!(app.result_pane_height, viewport - px(RESULT_PANE_RESERVED));
+            assert!(app.result_pane_height < viewport);
+        });
+    }
+
+    /// On a window too short for the reserved space, the floor still wins over the ceiling so the
+    /// clamp can never invert and panic.
+    #[gpui::test]
+    fn splitter_clamp_survives_a_very_short_window(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        view.update(cx, |app, _| {
+            app.pane_drag = Some(PaneDrag {
+                pointer_origin: px(100.),
+                height_origin: px(RESULT_PANE_HEIGHT),
+            });
+
+            app.drag_pane(px(0.), px(200.));
+            assert_eq!(app.result_pane_height, px(RESULT_PANE_MIN_HEIGHT));
+        });
+    }
+
+    /// Nothing moves unless a drag is actually in progress.
+    #[gpui::test]
+    fn pointer_movement_without_a_drag_leaves_the_pane_alone(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        view.update(cx, |app, _| {
+            assert!(!app.drag_pane(px(50.), px(820.)));
+            assert_eq!(app.result_pane_height, px(RESULT_PANE_HEIGHT));
+        });
+    }
+
+    /// Partial lines at each end, whole lines in between — the standard shape of a text selection.
+    #[test]
+    fn a_selection_spans_partial_lines_at_each_end() {
+        let selection = ResultSelection {
+            anchor: ResultPosition { line: 1, column: 4 },
+            head: ResultPosition { line: 3, column: 2 },
+        };
+
+        assert_eq!(selection.span_for(0, 10), None, "before the selection");
+        assert_eq!(
+            selection.span_for(1, 10),
+            Some(4..10),
+            "from column 4 to EOL"
+        );
+        assert_eq!(selection.span_for(2, 10), Some(0..10), "whole middle line");
+        assert_eq!(selection.span_for(3, 10), Some(0..2), "up to column 2");
+        assert_eq!(selection.span_for(4, 10), None, "after the selection");
+
+        // Columns beyond the end of a short line clamp to its length.
+        assert_eq!(selection.span_for(1, 6), Some(4..6));
+        assert_eq!(selection.span_for(2, 3), Some(0..3));
+    }
+
+    /// Dragging right-to-left or bottom-to-top selects the same text as the forward gesture.
+    #[test]
+    fn a_backwards_drag_selects_the_same_span() {
+        let forwards = ResultSelection {
+            anchor: ResultPosition { line: 1, column: 2 },
+            head: ResultPosition { line: 2, column: 5 },
+        };
+        let backwards = ResultSelection {
+            anchor: ResultPosition { line: 2, column: 5 },
+            head: ResultPosition { line: 1, column: 2 },
+        };
+
+        for line in 0..4 {
+            assert_eq!(
+                forwards.span_for(line, 8),
+                backwards.span_for(line, 8),
+                "line {line}"
+            );
+        }
+    }
+
+    /// A single click selects nothing until it is dragged; it must not copy a stray character.
+    #[test]
+    fn an_unmoved_caret_selects_nothing() {
+        let caret = ResultSelection {
+            anchor: ResultPosition { line: 2, column: 3 },
+            head: ResultPosition { line: 2, column: 3 },
+        };
+
+        assert_eq!(caret.span_for(2, 10), None, "nothing to highlight");
+        assert_eq!(
+            caret.clamped_span(2, 10),
+            Some(3..3),
+            "the line is still inside the selection, it just contributes no characters"
+        );
+    }
+
+    /// A blank line inside the selection is a line break that copying must preserve, so it is
+    /// distinguished from a line that falls outside the selection entirely.
+    #[test]
+    fn blank_lines_inside_a_selection_survive_the_copy() {
+        let selection = ResultSelection::whole_lines(0, 2);
+
+        assert_eq!(
+            selection.clamped_span(1, 0),
+            Some(0..0),
+            "blank middle line"
+        );
+        assert_eq!(selection.span_for(1, 0), None, "but nothing to highlight");
+        assert_eq!(selection.clamped_span(3, 5), None, "outside the selection");
+    }
+
+    /// Grid rows and select-all cover each line end to end regardless of its length.
+    #[test]
+    fn whole_line_selections_cover_every_column() {
+        let rows = ResultSelection::whole_lines(1, 2);
+
+        assert_eq!(rows.span_for(1, 4), Some(0..4));
+        assert_eq!(rows.span_for(2, 120), Some(0..120));
+        assert_eq!(rows.span_for(3, 10), None);
+    }
+
+    /// Copying a character-level selection yields exactly the selected substring.
+    #[gpui::test]
+    fn copying_a_character_selection_yields_the_selected_substring(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![result_with_rows(&["alpha", "beta"])];
+
+            let lines = app.selectable_lines();
+            let first = lines[0].chars().count();
+            // From two characters into the first line, to two into the second.
+            app.result_selection = Some(ResultSelection {
+                anchor: ResultPosition { line: 0, column: 2 },
+                head: ResultPosition { line: 1, column: 2 },
+            });
+
+            let copied = app.copyable_result_text().expect("results exist");
+            let expected = format!(
+                "{}\n{}",
+                lines[0].chars().skip(2).take(first - 2).collect::<String>(),
+                lines[1].chars().take(2).collect::<String>()
+            );
+            assert_eq!(copied, expected);
+            app.copy_results(cx);
+        });
+
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert!(clipboard.is_some_and(|text| !text.is_empty()));
+    }
+
+    /// The pointer maps to a column through the monospace advance, measured from the shared left
+    /// edge of every line and following the horizontal scroll.
+    #[gpui::test]
+    fn pointer_position_maps_to_a_character_column(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let advance = app.mono_advance;
+            assert!(advance > px(0.), "the monospace advance should be measured");
+
+            let origin = app.results_scroll.handle.bounds().origin.x;
+            let text_left = origin + px(RESULT_TEXT_INSET);
+
+            assert_eq!(app.column_at(text_left), 0);
+            assert_eq!(app.column_at(text_left + advance * 5.), 5);
+            // Rounding puts the caret at the nearest boundary, not the one to the left.
+            assert_eq!(app.column_at(text_left + advance * 5. + advance * 0.6), 6);
+            // Left of the text can never produce a negative column.
+            assert_eq!(app.column_at(text_left - advance * 3.), 0);
+        });
+    }
+
+    /// A table wider than its viewport must overflow so the horizontal bar has something to
+    /// scroll. `overflow_hidden` on the grid used to zero taffy's automatic minimum size, letting
+    /// it shrink to the viewport and clip its own columns instead.
+    #[gpui::test]
+    fn a_wide_table_overflows_sideways_instead_of_being_clipped(cx: &mut TestAppContext) {
+        use crate::result::Column;
+        let (view, cx) = build_app_view(cx);
+
+        // Twenty 180px columns is far wider than the 1280px test window.
+        let columns: Vec<_> = (0..20)
+            .map(|index| Column {
+                name: format!("column_{index}"),
+                database_type: "text".into(),
+                nullable: Some(false),
+            })
+            .collect();
+        let row: Vec<_> = (0..20)
+            .map(|index| CellValue::Text(format!("value_{index}")))
+            .collect();
+
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Table;
+            app.editor.results = vec![QueryResult {
+                columns,
+                rows: vec![row],
+                ..QueryResult::default()
+            }];
+            app.editor.destination = ResultDestination::Pane;
+            app.active_result_tab = false;
+        });
+        // Force a layout pass so the scroll handle has measured geometry.
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let overflow = app.results_scroll.handle.max_offset();
+            assert!(
+                overflow.width > px(0.),
+                "a 20-column grid should overflow its viewport, got {:?}",
+                overflow.width
+            );
+            // And the drawn bar follows from that overflow.
+            let viewport = app.results_scroll.handle.bounds().size;
+            assert!(
+                ThumbMetrics::measure(viewport.width, overflow.width, px(0.)).is_some(),
+                "a horizontal scrollbar should be warranted"
+            );
+        });
+    }
+
+    /// Table rows are selectable too, and copy as tab-separated values so a paste lands in
+    /// spreadsheet columns. The header is a selectable unit in its own right.
+    #[gpui::test]
+    fn table_rows_are_selectable_and_copy_as_tab_separated_values(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Table;
+            app.editor.results = vec![result_with_rows(&["alpha", "beta", "gamma"])];
+        });
+
+        view.update(cx, |app, _| {
+            // Header, then one entry per row.
+            assert_eq!(
+                app.selectable_lines(),
+                vec!["value", "alpha", "beta", "gamma"]
+            );
+        });
+
+        // Select the two middle data rows, skipping the header.
+        view.update(cx, |app, cx| {
+            app.result_selection = Some(ResultSelection::whole_lines(1, 2));
+            app.copy_results(cx);
+            assert_eq!(app.status, "Copied 2 lines");
+        });
+
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(clipboard.as_deref(), Some("alpha\nbeta"));
+    }
+
+    /// Multi-column rows keep their columns tab separated.
+    #[gpui::test]
+    fn multi_column_rows_copy_one_tab_separated_line_each(cx: &mut TestAppContext) {
+        use crate::result::Column;
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Table;
+            app.editor.results = vec![QueryResult {
+                columns: vec![
+                    Column {
+                        name: "muscle_group".into(),
+                        database_type: "text".into(),
+                        nullable: Some(false),
+                    },
+                    Column {
+                        name: "sets".into(),
+                        database_type: "int8".into(),
+                        nullable: Some(true),
+                    },
+                ],
+                rows: vec![
+                    vec![CellValue::Text("back".into()), CellValue::Integer(48)],
+                    vec![CellValue::Text("legs".into()), CellValue::Null],
+                ],
+                ..QueryResult::default()
+            }];
+        });
+
+        view.update(cx, |app, _| {
+            let lines = app.selectable_lines();
+            assert_eq!(lines[0], "muscle_group\tsets");
+            assert_eq!(lines[1], "back\t48");
+            // NULL copies as its display form rather than an empty cell.
+            assert!(lines[2].starts_with("legs\t"));
+            assert_ne!(lines[2], "legs\t");
+        });
+    }
+
+    /// Indices mean lines in Text mode and rows in Table mode, so a selection must not survive the
+    /// switch and highlight unrelated data.
+    #[gpui::test]
+    fn switching_display_mode_clears_the_selection(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.display = ResultDisplay::Table;
+            app.editor.results = vec![result_with_rows(&["alpha", "beta"])];
+            app.result_selection = Some(ResultSelection::whole_lines(1, 2));
+
+            app.set_display(ResultDisplay::Text, cx);
+            assert!(app.result_selection.is_none());
+
+            // Re-selecting and setting the same mode again is not a change, so it survives.
+            app.result_selection = Some(ResultSelection::whole_lines(0, 0));
+            app.set_display(ResultDisplay::Text, cx);
+            assert!(app.result_selection.is_some());
+        });
+    }
+
+    /// Copying with nothing selected should still hand over the data, not an empty clipboard.
+    #[gpui::test]
+    fn copying_with_no_selection_copies_the_whole_result(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![result_with_rows(&["alpha", "beta"])];
+        });
+
+        let (expected, copied) = view.update(cx, |app, _| {
+            (
+                app.selectable_lines().join("\n"),
+                app.copyable_result_text().expect("results exist"),
+            )
+        });
+
+        assert_eq!(copied, expected);
+        assert!(copied.contains("alpha") && copied.contains("beta"));
+    }
+
+    /// Ctrl+C and Ctrl+A go to the results when the result tab is in front, and to the SQL
+    /// document otherwise.
+    #[gpui::test]
+    fn copy_and_select_all_follow_whichever_surface_is_in_front(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![result_with_rows(&["alpha"])];
+        });
+
+        // Editor in front: select-all targets the document.
+        view.update(cx, |app, cx| {
+            app.active_result_tab = false;
+            assert!(!app.results_have_focus());
+            app.handle_key(&command_key("a"), cx);
+            assert_eq!(app.editor.selection, Some(0..app.editor.document.len()));
+        });
+
+        // Result tab in front: select-all targets the result lines instead.
+        view.update(cx, |app, cx| {
+            app.active_result_tab = true;
+            app.editor.selection = None;
+            assert!(app.results_have_focus());
+            app.handle_key(&command_key("a"), cx);
+            assert!(app.editor.selection.is_none());
+            let expected = app.selectable_lines().len() - 1;
+            assert_eq!(
+                app.result_selection.map(|s| s.bounds()),
+                Some((0, expected))
+            );
+        });
+
+        view.update(cx, |app, cx| app.handle_key(&command_key("c"), cx));
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            clipboard.as_deref().map(|text| text.contains("alpha")),
+            Some(true)
+        );
+    }
+
+    fn command_key(key: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+        }
+    }
+
+    /// No bar when everything fits; otherwise a thumb proportional to the visible fraction that
+    /// reaches the far end at full scroll.
+    #[test]
+    fn scrollbar_thumb_tracks_the_visible_fraction() {
+        assert!(ThumbMetrics::measure(px(300.), px(0.), px(0.)).is_none());
+
+        // 300px of viewport over 900px of content: a third of the track, parked at the top.
+        let top = ThumbMetrics::measure(px(300.), px(600.), px(0.)).expect("content overflows");
+        assert_eq!(top.length, px(100.));
+        assert_eq!(top.start, px(0.));
+
+        // Fully scrolled: the thumb ends flush with the bottom of the track.
+        let bottom =
+            ThumbMetrics::measure(px(300.), px(600.), px(-600.)).expect("content overflows");
+        assert_eq!(bottom.start + bottom.length, px(300.));
+
+        // Dragging the thumb one pixel moves the content by the overflow-to-track ratio.
+        assert_eq!(top.pixels_per_thumb_pixel, 3.);
+    }
+
+    /// A tiny thumb on a huge result set would be unusable, so it has a floor.
+    #[test]
+    fn scrollbar_thumb_never_shrinks_below_the_minimum() {
+        let metrics =
+            ThumbMetrics::measure(px(300.), px(100_000.), px(0.)).expect("content overflows");
+
+        assert_eq!(metrics.length, px(SCROLLBAR_MIN_THUMB));
+        assert!(metrics.start >= px(0.), "start was {:?}", metrics.start);
     }
 
     #[test]
@@ -2295,6 +3773,137 @@ mod tests {
             );
             assert_eq!(app.status, "New SQL editor");
         });
+    }
+
+    fn profile_named(name: &str, database: &str) -> ConnectionProfile {
+        let mut profile = ConnectionProfile::from_database_url(&format!(
+            "postgresql://user@localhost:5432/{database}"
+        ))
+        .expect("test profile should be valid");
+        profile.name = name.to_owned();
+        profile
+    }
+
+    /// There is one session. Every editor must name the database that session opened, or a tab can
+    /// claim to target one database while its SQL reaches another (§49, §50).
+    #[gpui::test]
+    fn every_editor_reports_the_database_the_session_actually_opened(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let production = profile_named("Production", "production");
+
+        view.update(cx, |app, _| {
+            app.profiles.push(production.clone());
+            app.background_editors
+                .push(EditorState::new(profile_named("Local", "local")));
+            app.editor.connection = profile_named("Local", "local");
+
+            app.adopt_session_profile(production.clone());
+        });
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.target_identity(), "Production / production");
+            assert_eq!(app.editor.connection.id, production.id);
+            assert_eq!(app.background_editors[0].connection.id, production.id);
+        });
+
+        // Switching to the other tab must not resurrect the stale target.
+        view.update(cx, |app, cx| app.switch_editor(0, cx));
+        view.update(cx, |app, _| {
+            assert_eq!(app.target_identity(), "Production / production");
+            assert_eq!(app.editor.connection.id, production.id);
+        });
+    }
+
+    /// A completing query writes back only its outcome, so text typed while it ran survives. The
+    /// query is held open by the provider so the typing genuinely races the in-flight run.
+    #[gpui::test]
+    fn text_typed_while_a_query_runs_is_not_discarded(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.service = Arc::new(CommandService::new(provider.clone()));
+        });
+
+        provider.blocked.store(true, Ordering::SeqCst);
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = app.editor.document.len();
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.dispatch_command(command::RUN, cx));
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.execution_status, ExecutionStatus::Running)
+        });
+
+        // The user carries on typing while the statement is still executing.
+        cx.simulate_input(" -- note");
+        provider.blocked.store(false, Ordering::SeqCst);
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "SELECT 1; -- note");
+            assert_eq!(app.editor.results.len(), 1);
+        });
+    }
+
+    fn wait_for_execution_status(
+        view: &gpui::Entity<AppView>,
+        cx: &mut gpui::VisualTestContext,
+        expected: ExecutionStatus,
+    ) {
+        // The provider polls on a separate runtime, so this has to yield real time rather than
+        // just spinning the GPUI executor.
+        for _ in 0..1_000 {
+            cx.run_until_parked();
+            if view.update(cx, |app, _| app.editor.execution_status) == expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.execution_status, expected)
+        });
+    }
+
+    /// Re-entering a corrected URL replaces the manual row rather than stacking a second one that
+    /// still points at the unreachable host.
+    #[gpui::test]
+    fn correcting_a_manual_connection_reuses_the_single_manual_row(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let baseline = view.update(cx, |app, _| app.profiles.len());
+
+        for database in ["typo", "corrected"] {
+            view.update(cx, |app, cx| {
+                app.connection_dialog = true;
+                app.connection_buffer = format!("postgresql://user@localhost:5432/{database}");
+                app.handle_key(&key_event("enter"), cx);
+            });
+        }
+
+        view.update(cx, |app, _| {
+            let manual: Vec<_> = app
+                .profiles
+                .iter()
+                .filter(|profile| profile.name == MANUAL_PROFILE_NAME)
+                .collect();
+            assert_eq!(manual.len(), 1);
+            assert_eq!(manual[0].configuration.database, "corrected");
+            assert_eq!(app.profiles.len(), baseline + 1);
+        });
+    }
+
+    fn key_event(key: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: Modifiers::default(),
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+        }
     }
 
     #[gpui::test]
