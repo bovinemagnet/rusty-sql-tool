@@ -240,6 +240,138 @@ pub fn prepare_explain(sql: &str) -> String {
     format!("EXPLAIN {}", sql.trim())
 }
 
+/// What the editor should paint a stretch of SQL as (FR-012).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Highlight {
+    Keyword,
+    Literal,
+    Comment,
+    Function,
+    Plain,
+}
+
+/// A run of one line, coloured as a whole. `range` indexes the line, not the document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HighlightSpan {
+    pub range: Range<usize>,
+    pub highlight: Highlight,
+}
+
+/// Colours a document line by line. One entry per `split('\n')` line, in order, together covering
+/// that line exactly — so a renderer can paint the spans and reproduce the text (FR-012, 59.3).
+pub fn highlight_lines(sql: &str) -> Vec<Vec<HighlightSpan>> {
+    let starts = line_starts(sql);
+    let mut lines = vec![Vec::new(); starts.len()];
+    for span in document_spans(sql) {
+        // A comment or a dollar-quoted literal is one token over several lines, so it is cut at
+        // each newline and handed to the line it belongs to.
+        let mut start = span.range.start;
+        loop {
+            let line = starts.partition_point(|&offset| offset <= start) - 1;
+            let line_end = starts.get(line + 1).map_or(sql.len(), |next| next - 1);
+            let end = span.range.end.min(line_end);
+            if end > start {
+                lines[line].push(HighlightSpan {
+                    range: start - starts[line]..end - starts[line],
+                    highlight: span.highlight,
+                });
+            }
+            if end == span.range.end {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    lines
+}
+
+/// The byte offset each line begins at, always including the first.
+fn line_starts(sql: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(
+        sql.bytes()
+            .enumerate()
+            .filter(|&(_, byte)| byte == b'\n')
+            .map(|(index, _)| index + 1),
+    );
+    starts
+}
+
+/// The whole document as coloured runs, in order and without gaps.
+fn document_spans(sql: &str) -> Vec<HighlightSpan> {
+    let (tokens, _) = scan(sql);
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (position, token) in tokens.iter().enumerate() {
+        if token.range.start > cursor {
+            spans.push(HighlightSpan {
+                range: cursor..token.range.start,
+                highlight: Highlight::Plain,
+            });
+        }
+        spans.push(HighlightSpan {
+            range: token.range.clone(),
+            highlight: classify(token, tokens.get(position + 1)),
+        });
+        cursor = token.range.end;
+    }
+    if cursor < sql.len() {
+        spans.push(HighlightSpan {
+            range: cursor..sql.len(),
+            highlight: Highlight::Plain,
+        });
+    }
+    spans
+}
+
+fn classify(token: &Token, next: Option<&Token>) -> Highlight {
+    match &token.kind {
+        TokenKind::Comment => Highlight::Comment,
+        TokenKind::Literal => Highlight::Literal,
+        TokenKind::Word(word) if KEYWORDS.contains(&word.as_str()) => Highlight::Keyword,
+        TokenKind::Word(_) if opens_a_call(token, next) => Highlight::Function,
+        TokenKind::Word(_) | TokenKind::Symbol(_) => Highlight::Plain,
+    }
+}
+
+/// A call is a word with `(` against it — `count(` is a call, `VALUES (` is not.
+fn opens_a_call(token: &Token, next: Option<&Token>) -> bool {
+    next.is_some_and(|next| {
+        next.kind == TokenKind::Symbol('(') && next.range.start == token.range.end
+    })
+}
+
+/// Uppercase because [`TokenKind::Word`] already folds case.
+const KEYWORDS: [&str; 27] = [
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "WITH",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "JOIN",
+    "WHERE",
+    "GROUP",
+    "BY",
+    "ORDER",
+    "HAVING",
+    "LIMIT",
+    "RETURNING",
+    "EXPLAIN",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "FROM",
+    "AS",
+    "VALUES",
+    "FETCH",
+    "FIRST",
+    "ROWS",
+    "ONLY",
+];
+
 fn has_top_level_word(tokens: &[&Token], expected: &str) -> bool {
     tokens
         .iter()
@@ -258,8 +390,19 @@ fn trimmed_range(sql: &str, range: Range<usize>) -> Option<Range<usize>> {
 }
 
 fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
+    match scan(sql) {
+        (_, Some(error)) => Err(error),
+        (tokens, None) => Ok(tokens),
+    }
+}
+
+/// Tokenises as far as the text allows, reporting the first thing wrong with it rather than
+/// stopping. Statement splitting refuses a document it cannot read; highlighting has to colour one
+/// that is halfway through being typed, and both need the same reading of the SQL (59.3).
+fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
+    let mut error = None;
     let mut index = 0;
     let mut depth = 0usize;
     while index < bytes.len() {
@@ -295,7 +438,7 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
                 }
             }
             if nesting != 0 {
-                return Err(SqlError::UnterminatedComment);
+                error = error.or(Some(SqlError::UnterminatedComment));
             }
             tokens.push(Token {
                 kind: TokenKind::Comment,
@@ -324,7 +467,7 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
                 }
             }
             if !closed {
-                return Err(SqlError::UnterminatedQuote);
+                error = error.or(Some(SqlError::UnterminatedQuote));
             }
             tokens.push(Token {
                 kind: TokenKind::Literal,
@@ -338,13 +481,16 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
         {
             let delimiter = &bytes[index..delimiter_end];
             index = delimiter_end;
-            let Some(relative_end) = bytes[index..]
+            match bytes[index..]
                 .windows(delimiter.len())
                 .position(|window| window == delimiter)
-            else {
-                return Err(SqlError::UnterminatedQuote);
-            };
-            index += relative_end + delimiter.len();
+            {
+                Some(relative_end) => index += relative_end + delimiter.len(),
+                None => {
+                    error = error.or(Some(SqlError::UnterminatedQuote));
+                    index = bytes.len();
+                }
+            }
             tokens.push(Token {
                 kind: TokenKind::Literal,
                 range: start..index,
@@ -367,11 +513,16 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
         let character = sql[index..].chars().next().expect("valid UTF-8");
         index += character.len_utf8();
         let token_depth = if character == ')' {
-            if depth == 0 {
-                return Err(SqlError::UnbalancedParentheses);
+            match depth.checked_sub(1) {
+                Some(outer) => {
+                    depth = outer;
+                    outer
+                }
+                None => {
+                    error = error.or(Some(SqlError::UnbalancedParentheses));
+                    0
+                }
             }
-            depth -= 1;
-            depth
         } else {
             depth
         };
@@ -385,9 +536,9 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
         }
     }
     if depth != 0 {
-        return Err(SqlError::UnbalancedParentheses);
+        error = error.or(Some(SqlError::UnbalancedParentheses));
     }
-    Ok(tokens)
+    (tokens, error)
 }
 
 fn dollar_delimiter_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -409,6 +560,91 @@ fn is_word_continue(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Maps each line's spans back to the text they cover, which is what the editor paints.
+    fn painted(sql: &str) -> Vec<Vec<(&str, Highlight)>> {
+        highlight_lines(sql)
+            .into_iter()
+            .zip(sql.split('\n'))
+            .map(|(spans, line)| {
+                spans
+                    .into_iter()
+                    .map(|span| (&line[span.range], span.highlight))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_keyword_inside_a_string_literal_is_not_a_keyword() {
+        assert_eq!(
+            painted("SELECT 'from the table'")[0],
+            [
+                ("SELECT", Highlight::Keyword),
+                (" ", Highlight::Plain),
+                ("'from the table'", Highlight::Literal),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comment_marker_inside_a_literal_does_not_start_a_comment() {
+        assert_eq!(
+            painted("SELECT '--not a comment', 1")[0][2],
+            ("'--not a comment'", Highlight::Literal)
+        );
+    }
+
+    #[test]
+    fn a_dollar_quoted_body_is_a_literal() {
+        assert_eq!(
+            painted("SELECT $$SELECT FROM$$")[0][2],
+            ("$$SELECT FROM$$", Highlight::Literal)
+        );
+    }
+
+    /// Every keystroke leaves the document briefly unparseable, so highlighting cannot depend on
+    /// the document being valid the way statement splitting does.
+    #[test]
+    fn a_half_typed_literal_is_still_highlighted() {
+        assert_eq!(
+            painted("SELECT 'abc")[0],
+            [
+                ("SELECT", Highlight::Keyword),
+                (" ", Highlight::Plain),
+                ("'abc", Highlight::Literal),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_word_calling_a_function_is_a_function() {
+        assert_eq!(
+            painted("SELECT count(*)")[0],
+            [
+                ("SELECT", Highlight::Keyword),
+                (" ", Highlight::Plain),
+                ("count", Highlight::Function),
+                ("(", Highlight::Plain),
+                ("*", Highlight::Plain),
+                (")", Highlight::Plain),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_block_comment_stays_a_comment_across_lines() {
+        let painted = painted("/* two\nline */ SELECT");
+        assert_eq!(painted[0], [("/* two", Highlight::Comment)]);
+        assert_eq!(
+            painted[1],
+            [
+                ("line */", Highlight::Comment),
+                (" ", Highlight::Plain),
+                ("SELECT", Highlight::Keyword),
+            ]
+        );
+    }
 
     #[test]
     fn splits_only_top_level_semicolons() {

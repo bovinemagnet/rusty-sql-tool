@@ -15,6 +15,7 @@ use crate::config::{ConnectionProfile, local_profile};
 use crate::database::{ConnectionState, DatabaseObject, ObjectKind};
 use crate::postgres::PostgresProvider;
 use crate::result::{CellValue, ExecutionStatus, QueryResult};
+use crate::sql::{Highlight, HighlightSpan, highlight_lines};
 
 // RepFoundry desktop — Kinetic Green.
 const BACKGROUND: u32 = 0x0a0b0d; // window canvas
@@ -1955,6 +1956,9 @@ impl AppView {
         let (total, widest) = editor_lines(displayed).fold((0, 0), |(count, widest), line| {
             (count + 1, widest.max(line.chars().count()))
         });
+        // Colours are worked out for the whole document, not the visible window: a block comment or
+        // a dollar-quoted body opened above the fold still governs the lines on screen.
+        let highlights = highlight_lines(displayed);
         let visible = visible_lines(
             total,
             handle.bounds().size.height,
@@ -2000,6 +2004,11 @@ impl AppView {
                     // Fixed, not a minimum: the virtual window positions lines by multiplying
                     // this, so a line that can grow puts every line below it out of place.
                     .h(px(EDITOR_LINE_HEIGHT))
+                    // Width is arithmetic for the same reason the caret and selection are: each
+                    // coloured run is laid out separately and rounds up on its own, so a line built
+                    // from several runs would otherwise measure wider than the strut below and the
+                    // horizontal extent would change as you scrolled past it.
+                    .w(px(GUTTER_WIDTH) + advance * line.chars().count() as f32)
                     .flex_none()
                     .cursor_text()
                     .on_mouse_down(
@@ -2029,7 +2038,10 @@ impl AppView {
                             .w(advance * span.len() as f32)
                             .bg(rgb(ACCENT_SOFT))
                     }))
-                    .child(highlight_line(line))
+                    .child(highlight_line(
+                        line,
+                        highlights.get(index).map_or(&[][..], Vec::as_slice),
+                    ))
                     .children((caret.line == index).then(|| {
                         div()
                             .absolute()
@@ -2967,60 +2979,24 @@ fn segment(
         .child(label.into())
 }
 
-fn highlight_line(line: &str) -> impl IntoElement {
-    let keywords = [
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "WITH",
-        "CREATE",
-        "ALTER",
-        "DROP",
-        "JOIN",
-        "WHERE",
-        "GROUP",
-        "BY",
-        "ORDER",
-        "HAVING",
-        "LIMIT",
-        "RETURNING",
-        "EXPLAIN",
-        "BEGIN",
-        "COMMIT",
-        "ROLLBACK",
-        "FROM",
-        "AS",
-        "VALUES",
-        "FETCH",
-        "FIRST",
-        "ROWS",
-        "ONLY",
-    ];
-    let comment_start = line.find("--");
+/// Paints one line from the spans [`highlight_lines`] worked out for it. The view classifies
+/// nothing itself: reading SQL is the parser's job, and a second reading here would disagree with
+/// it (59.3).
+fn highlight_line(line: &str, spans: &[HighlightSpan]) -> impl IntoElement {
     let mut row = div().flex().flex_row().whitespace_nowrap();
-    for (index, piece) in line
-        .split_inclusive(|character: char| character.is_whitespace())
-        .enumerate()
-    {
-        let offset: usize = line
-            .split_inclusive(|character: char| character.is_whitespace())
-            .take(index)
-            .map(str::len)
-            .sum();
-        let word = piece.trim_matches(|character: char| !character.is_ascii_alphabetic());
-        let colour = if comment_start.is_some_and(|start| offset >= start) {
-            FAINT
-        } else if keywords.contains(&word.to_ascii_uppercase().as_str()) {
-            ACCENT
-        } else if piece.contains('\'') {
-            STRING
-        } else if piece.contains('(') && !word.is_empty() {
-            FUNCTION
-        } else {
-            TEXT
+    for span in spans {
+        let colour = match span.highlight {
+            Highlight::Keyword => ACCENT,
+            Highlight::Literal => STRING,
+            Highlight::Comment => FAINT,
+            Highlight::Function => FUNCTION,
+            Highlight::Plain => TEXT,
         };
-        row = row.child(div().text_color(rgb(colour)).child(piece.to_owned()));
+        row = row.child(
+            div()
+                .text_color(rgb(colour))
+                .child(line[span.range.clone()].to_owned()),
+        );
     }
     row
 }
