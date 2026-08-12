@@ -65,9 +65,12 @@ required by section 51. Current bindings are:
 - `Ctrl/Cmd+Alt+Enter` — explain the current or selected statement.
 - `Escape` or `Ctrl/Cmd+.` — stop a running query.
 - `Ctrl/Cmd+N` — open a new SQL editor.
+- `Ctrl/Cmd+W` — close the active SQL editor. Alt-click a tab to close that one. The last editor
+  stays open, and an editor with a query in flight is not closed.
 - `Ctrl/Cmd+Shift+D` — connect or disconnect.
 
-Normal editor copy, cut, paste, select-all, undo, and redo shortcuts are also supported.
+Normal editor copy, cut, paste, select-all, undo, and redo shortcuts are also supported, along
+with arrow-key and `Home`/`End` movement, `Shift` selection, and click/drag selection.
 
 ## Logging
 

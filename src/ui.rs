@@ -43,6 +43,10 @@ const CONTROL_HEIGHT: f32 = 42.;
 const CARD_RADIUS: f32 = 18.;
 const CONTROL_RADIUS: f32 = 12.;
 const EDITOR_LINE_HEIGHT: f32 = 25.;
+/// Editor lines kept built beyond each edge of the viewport, so a scroll does not expose a gap.
+const EDITOR_OVERSCAN: usize = 8;
+/// How many lines to assume before the first layout pass has measured the editor viewport.
+const UNMEASURED_VIEWPORT_LINES: usize = 80;
 const EDITOR_TEXT_SIZE: f32 = 14.;
 const GUTTER_WIDTH: f32 = 40.;
 const RESULT_PANE_HEIGHT: f32 = 296.;
@@ -53,6 +57,12 @@ const RESULT_PANE_RESERVED: f32 = 380.;
 const SPLITTER_HEIGHT: f32 = 10.;
 const RESULT_TEXT_SIZE: f32 = 13.;
 const RESULT_LINE_HEIGHT: f32 = 22.;
+/// Height of one grid row. Fixed so the windowed grid can place rows by multiplying it.
+const RESULT_ROW_HEIGHT: f32 = 46.;
+/// Rows of slack allowed per result for chrome the row arithmetic does not model — the result
+/// header and block padding, whose heights belong to the styling. Overshooting builds a few extra
+/// rows; undershooting would leave a blank band at the edge of the viewport.
+const RESULT_CHROME_SLOP_ROWS: usize = 12;
 /// Left inset of a text-result line, matching its `px_5` padding. The selection highlight and the
 /// pointer-to-column arithmetic both measure from here.
 const RESULT_TEXT_INSET: f32 = 20.;
@@ -328,15 +338,17 @@ impl Fonts {
 /// The advance width of one monospace character at the result text size. Falls back to a typical
 /// 0.6em ratio if the glyph cannot be measured, which keeps selection usable rather than collapsing
 /// every column onto zero.
-fn measure_mono_advance(fonts: &Fonts, cx: &App) -> Pixels {
+/// The width of one monospace character at `text_size`. Selection highlights and the editor caret
+/// are positioned by multiplying this, so it must be measured at the size the surface renders.
+fn measure_mono_advance(fonts: &Fonts, text_size: f32, cx: &App) -> Pixels {
     let text_system = cx.text_system();
     let font_id = text_system.resolve_font(&gpui::font(fonts.mono.clone()));
     text_system
-        .advance(font_id, px(RESULT_TEXT_SIZE), '0')
+        .advance(font_id, px(text_size), '0')
         .map(|advance| advance.width)
         .ok()
         .filter(|advance| *advance > px(0.))
-        .unwrap_or(px(RESULT_TEXT_SIZE * 0.6))
+        .unwrap_or(px(text_size * 0.6))
 }
 
 fn resolve_family(available: &[String], preferred: &str, fallback: &'static str) -> SharedString {
@@ -384,8 +396,9 @@ struct AppView {
     active_result_tab: bool,
     status: String,
     focus_handle: FocusHandle,
-    undo: Vec<String>,
-    redo: Vec<String>,
+    /// Document snapshots paired with the caret they were taken at.
+    undo: Vec<(String, usize)>,
+    redo: Vec<(String, usize)>,
     connection_dialog: bool,
     connection_buffer: String,
     fonts: Fonts,
@@ -399,9 +412,13 @@ struct AppView {
     /// Selected text in the results, and whether a drag is extending it.
     result_selection: Option<ResultSelection>,
     selecting_results: bool,
+    /// Whether a pointer drag is currently extending the SQL editor's selection.
+    selecting_editor: bool,
     /// Advance width of one monospace character at the result text size, used to turn a pointer
     /// position into a column and to size the selection highlight.
     mono_advance: Pixels,
+    /// The same measurement for the SQL editor, which renders at its own larger text size.
+    editor_advance: Pixels,
     result_pane_height: Pixels,
     pane_drag: Option<PaneDrag>,
 }
@@ -527,7 +544,9 @@ impl AppView {
             results_scroll: ScrollState::default(),
             result_selection: None,
             selecting_results: false,
-            mono_advance: measure_mono_advance(&fonts_for_advance, cx),
+            selecting_editor: false,
+            mono_advance: measure_mono_advance(&fonts_for_advance, RESULT_TEXT_SIZE, cx),
+            editor_advance: measure_mono_advance(&fonts_for_advance, EDITOR_TEXT_SIZE, cx),
             result_pane_height: px(RESULT_PANE_HEIGHT),
             pane_drag: None,
         }
@@ -581,6 +600,35 @@ impl AppView {
 
     /// Turns a pointer x-position into a character column. Every text line shares one left edge, so
     /// this needs no per-line geometry; rounding gives caret-between-characters behaviour.
+    /// Turns a pointer position into a column of the SQL document.
+    fn editor_column_at(&self, x: Pixels) -> usize {
+        if self.editor_advance <= px(0.) {
+            return 0;
+        }
+        let handle = &self.editor_scroll.handle;
+        let text_left = handle.bounds().origin.x + handle.offset().x + px(GUTTER_WIDTH);
+        let columns = ((x - text_left) / self.editor_advance).round();
+        if columns <= 0. { 0 } else { columns as usize }
+    }
+
+    /// Places the caret under the pointer and arms a drag selection.
+    fn click_editor(&mut self, line: usize, x: Pixels, extend: bool, cx: &mut Context<Self>) {
+        self.selecting_editor = true;
+        let offset = offset_of(&self.editor.document, line, self.editor_column_at(x));
+        self.place_cursor(offset, extend, cx);
+    }
+
+    /// Extends an armed drag to the pointer. Does nothing when no drag is in progress.
+    fn drag_editor(&mut self, line: usize, x: Pixels, cx: &mut Context<Self>) {
+        if !self.selecting_editor {
+            return;
+        }
+        let offset = offset_of(&self.editor.document, line, self.editor_column_at(x));
+        if offset != self.editor.cursor {
+            self.place_cursor(offset, true, cx);
+        }
+    }
+
     fn column_at(&self, x: Pixels) -> usize {
         if self.mono_advance <= px(0.) {
             return 0;
@@ -725,10 +773,7 @@ impl AppView {
     }
 
     fn is_running(&self) -> bool {
-        matches!(
-            self.editor.execution_status,
-            ExecutionStatus::Running | ExecutionStatus::Cancelling
-        )
+        is_busy(self.editor.execution_status)
     }
 
     /// Binds every editor to the profile the session actually opened, so switching tabs can never
@@ -1164,6 +1209,10 @@ impl AppView {
             "delete" => self.delete(cx),
             "left" => self.move_cursor(false, modifiers.shift, cx),
             "right" => self.move_cursor(true, modifiers.shift, cx),
+            "up" => self.move_line(false, modifiers.shift, cx),
+            "down" => self.move_line(true, modifiers.shift, cx),
+            "home" => self.move_to_line_edge(false, modifiers.shift, cx),
+            "end" => self.move_to_line_edge(true, modifiers.shift, cx),
             "enter" => self.insert_text("\n", cx),
             "tab" => self.insert_text("    ", cx),
             _ => {
@@ -1184,6 +1233,7 @@ impl AppView {
             command::EXPLAIN => self.run(RunMode::Explain, cx),
             command::CANCEL => self.cancel(cx),
             command::NEW_EDITOR => self.new_editor(cx),
+            command::CLOSE_EDITOR => self.close_active_editor(cx),
             command::CONNECT => self.connect(cx),
             command::DISCONNECT => self.disconnect(cx),
             _ => {}
@@ -1200,8 +1250,11 @@ impl AppView {
         cx.notify();
     }
 
+    /// Snapshots the document *and* the caret before an edit, so undo can put the user back where
+    /// they were working rather than at the end of the document.
     fn record_edit(&mut self) {
-        self.undo.push(self.editor.document.clone());
+        self.undo
+            .push((self.editor.document.clone(), self.editor.cursor));
         if self.undo.len() > 200 {
             self.undo.remove(0);
         }
@@ -1253,41 +1306,81 @@ impl AppView {
         }
     }
 
-    fn move_cursor(&mut self, right: bool, selecting: bool, cx: &mut Context<Self>) {
-        let old = self.editor.cursor;
-        let new = if right {
-            next_boundary(&self.editor.document, old)
-        } else {
-            previous_boundary(&self.editor.document, old)
-        };
-        self.editor.cursor = new;
-        if selecting {
-            let existing = self.editor.selection.take().unwrap_or(old..old);
-            self.editor.selection = Some(existing.start.min(new)..existing.end.max(new));
-        } else {
-            self.editor.selection = None;
+    /// The fixed end of the current selection — the end the cursor is not sitting on. Holding it
+    /// implicitly rather than as extra state is what lets a shift-selection shrink as well as grow.
+    fn selection_anchor(&self) -> usize {
+        match &self.editor.selection {
+            Some(range) if self.editor.cursor == range.start => range.end,
+            Some(range) => range.start,
+            None => self.editor.cursor,
         }
+    }
+
+    /// Moves the caret, either collapsing the selection or dragging its free end along.
+    fn place_cursor(&mut self, offset: usize, selecting: bool, cx: &mut Context<Self>) {
+        self.editor.selection = selecting.then(|| {
+            let anchor = self.selection_anchor();
+            anchor.min(offset)..anchor.max(offset)
+        });
+        self.editor.cursor = offset;
         cx.notify();
+    }
+
+    fn move_cursor(&mut self, right: bool, selecting: bool, cx: &mut Context<Self>) {
+        let offset = if right {
+            next_boundary(&self.editor.document, self.editor.cursor)
+        } else {
+            previous_boundary(&self.editor.document, self.editor.cursor)
+        };
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// Moves a line at a time, holding the column wherever the target line is long enough for it.
+    fn move_line(&mut self, down: bool, selecting: bool, cx: &mut Context<Self>) {
+        let position = document_position(&self.editor.document, self.editor.cursor);
+        let line = if down {
+            position.line + 1
+        } else {
+            position.line.saturating_sub(1)
+        };
+        let offset = offset_of(&self.editor.document, line, position.column);
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// Home and End, which stay within the current line.
+    fn move_to_line_edge(&mut self, end: bool, selecting: bool, cx: &mut Context<Self>) {
+        let line = document_position(&self.editor.document, self.editor.cursor).line;
+        let column = if end { usize::MAX } else { 0 };
+        let offset = offset_of(&self.editor.document, line, column);
+        self.place_cursor(offset, selecting, cx);
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
         if let Some(previous) = self.undo.pop() {
-            self.redo
-                .push(std::mem::replace(&mut self.editor.document, previous));
-            self.editor.cursor = self.editor.document.len();
-            self.editor.selection = None;
+            let current = self.restore(previous);
+            self.redo.push(current);
             cx.notify();
         }
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
         if let Some(next) = self.redo.pop() {
-            self.undo
-                .push(std::mem::replace(&mut self.editor.document, next));
-            self.editor.cursor = self.editor.document.len();
-            self.editor.selection = None;
+            let current = self.restore(next);
+            self.undo.push(current);
             cx.notify();
         }
+    }
+
+    /// Swaps a history entry into the editor, returning the state it replaced for the other stack.
+    /// Each entry's caret was recorded against its own document, so it needs no clamping.
+    fn restore(&mut self, (document, cursor): (String, usize)) -> (String, usize) {
+        let replaced = (
+            std::mem::replace(&mut self.editor.document, document),
+            self.editor.cursor,
+        );
+        self.editor.cursor = cursor;
+        self.editor.selection = None;
+        replaced
     }
 
     fn set_display(&mut self, display: ResultDisplay, cx: &mut Context<Self>) {
@@ -1328,6 +1421,38 @@ impl AppView {
             .push(std::mem::replace(&mut self.editor, editor));
         self.active_result_tab = false;
         self.status = "New SQL editor".into();
+        cx.notify();
+    }
+
+    /// Closes a background editor by index. A running editor keeps its tab until its query
+    /// settles, so a result never arrives for a document that is no longer there.
+    fn close_editor(&mut self, index: usize, cx: &mut Context<Self>) {
+        let running = self
+            .background_editors
+            .get(index)
+            .is_some_and(|editor| is_busy(editor.execution_status));
+        if running || index >= self.background_editors.len() {
+            return;
+        }
+        let closed = self.background_editors.remove(index);
+        self.status = format!("Closed {}", closed.title);
+        cx.notify();
+    }
+
+    /// Closes the editor in front, promoting the most recent background editor in its place.
+    /// The workspace always keeps one editor, so the last one stays.
+    fn close_active_editor(&mut self, cx: &mut Context<Self>) {
+        if is_busy(self.editor.execution_status) || self.background_editors.is_empty() {
+            return;
+        }
+        let promoted = self
+            .background_editors
+            .pop()
+            .expect("a background editor exists");
+        let closed = std::mem::replace(&mut self.editor, promoted);
+        self.active_result_tab = false;
+        self.result_selection = None;
+        self.status = format!("Closed {}", closed.title);
         cx.notify();
     }
 
@@ -1611,6 +1736,8 @@ impl AppView {
 
     fn editor_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tabs = segmented();
+        // Alt-clicking a tab closes it, matching the alt-click-to-disconnect gesture the
+        // Connections pane already uses.
         for (index, editor) in self.background_editors.iter().enumerate() {
             tabs = tabs.child(segment(
                 &self.fonts,
@@ -1618,7 +1745,13 @@ impl AppView {
                 editor.title.clone(),
                 false,
                 true,
-                cx.listener(move |this, _, _, cx| this.switch_editor(index, cx)),
+                cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    if event.modifiers().alt {
+                        this.close_editor(index, cx);
+                    } else {
+                        this.switch_editor(index, cx);
+                    }
+                }),
             ));
         }
         tabs = tabs.child(segment(
@@ -1627,7 +1760,13 @@ impl AppView {
             self.editor.title.clone(),
             !self.active_result_tab,
             true,
-            cx.listener(|this, _, _, cx| this.show_editor_tab(cx)),
+            cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                if event.modifiers().alt {
+                    this.close_active_editor(cx);
+                } else {
+                    this.show_editor_tab(cx);
+                }
+            }),
         ));
         if !self.editor.results.is_empty() {
             tabs = tabs.child(segment(
@@ -1792,25 +1931,86 @@ impl AppView {
             )
     }
 
-    fn editor_surface(&self) -> impl IntoElement {
+    /// The SQL document, with the caret drawn where the cursor actually is and the selection
+    /// painted behind the glyphs. GPUI paints neither of those itself, so both are placed
+    /// arithmetically from the character advance — sound because the editor is monospace.
+    ///
+    /// The caret and selection are derived from the real document even while the placeholder is
+    /// showing, so an empty editor still shows a caret at the point typing will start.
+    fn editor_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let document = &self.editor.document;
+        let displayed = if document.is_empty() {
+            "-- Write PostgreSQL here\nSELECT current_database();"
+        } else {
+            document
+        };
+        let caret = document_position(document, self.editor.cursor);
+        let advance = self.editor_advance;
+        // Only the lines the pane can see are built; the rest become the two spacers below, so a
+        // large document costs a screenful of elements rather than one per line (§19).
+        let handle = &self.editor_scroll.handle;
+        // One pass for both: how many lines there are, and how wide the widest is. Only the
+        // visible lines get measured by the layout engine, so the widest line has to be known
+        // arithmetically or the horizontal extent would change as you scroll past it.
+        let (total, widest) = editor_lines(displayed).fold((0, 0), |(count, widest), line| {
+            (count + 1, widest.max(line.chars().count()))
+        });
+        let visible = visible_lines(
+            total,
+            handle.bounds().size.height,
+            handle.offset().y,
+            EDITOR_OVERSCAN,
+        );
         let mut lines = div()
             .flex()
             .flex_col()
-            .min_h_full()
+            .items_start()
+            // `min_w_full`, never `min_h_full`: a minimum height of one viewport is also a licence
+            // for the flex row to shrink the lines to fit, which leaves a long document with
+            // nothing to scroll. The results surface is sized the same way.
+            .min_w_full()
             .font_family(self.fonts.mono.clone())
             .text_size(px(EDITOR_TEXT_SIZE))
-            .line_height(px(EDITOR_LINE_HEIGHT));
-        let document = if self.editor.document.is_empty() {
-            "-- Write PostgreSQL here\nSELECT current_database();"
-        } else {
-            &self.editor.document
-        };
-        for (index, line) in document.lines().enumerate() {
+            .line_height(px(EDITOR_LINE_HEIGHT))
+            // A flat strut as wide as the longest line, holding the horizontal extent steady no
+            // matter which lines the window happens to be showing.
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(0.))
+                    .w(px(GUTTER_WIDTH) + advance * widest as f32),
+            )
+            .child(line_spacer(visible.above));
+        for (index, line) in editor_lines(displayed)
+            .enumerate()
+            .skip(visible.range.start)
+            .take(visible.range.len())
+        {
+            let span = self
+                .editor
+                .selection
+                .as_ref()
+                .and_then(|selection| selected_columns(document, selection, index));
             lines = lines.child(
                 div()
+                    .id(SharedString::from(format!("editor-line-{index}")))
                     .flex()
                     .flex_row()
-                    .min_h(px(EDITOR_LINE_HEIGHT))
+                    .relative()
+                    // Fixed, not a minimum: the virtual window positions lines by multiplying
+                    // this, so a line that can grow puts every line below it out of place.
+                    .h(px(EDITOR_LINE_HEIGHT))
+                    .flex_none()
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.click_editor(index, event.position.x, event.modifiers.shift, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        this.drag_editor(index, event.position.x, cx);
+                    }))
                     .child(
                         div()
                             .w(px(GUTTER_WIDTH))
@@ -1819,15 +2019,29 @@ impl AppView {
                             .text_color(rgb(FAINT))
                             .child((index + 1).to_string()),
                     )
-                    .child(highlight_line(line)),
+                    // Painted before the text, so it sits behind the glyphs.
+                    .children(span.map(|span| {
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .bottom(px(0.))
+                            .left(px(GUTTER_WIDTH) + advance * span.start as f32)
+                            .w(advance * span.len() as f32)
+                            .bg(rgb(ACCENT_SOFT))
+                    }))
+                    .child(highlight_line(line))
+                    .children((caret.line == index).then(|| {
+                        div()
+                            .absolute()
+                            .top(px(3.))
+                            .bottom(px(3.))
+                            .left(px(GUTTER_WIDTH) + advance * caret.column as f32)
+                            .w(px(2.))
+                            .bg(rgb(ACCENT))
+                    })),
             );
         }
-        lines.child(
-            div()
-                .pl(px(GUTTER_WIDTH))
-                .text_color(rgb(ACCENT))
-                .child("▏"),
-        )
+        lines.child(line_spacer(visible.below)).into_any_element()
     }
 
     /// Makes one grid row selectable. Rows select whole, which is how SQL grids normally behave —
@@ -1925,28 +2139,52 @@ impl AppView {
             .child(div().px_5().child(SharedString::from(line.to_owned())))
     }
 
-    /// The grid, with every header and data row selectable.
+    /// The grid, with every header and data row selectable. Only the rows the viewport can reach
+    /// are built; `line_index` still advances over all of them, because selection and copy address
+    /// rows by their position in the whole result, not by what happens to be on screen.
     fn selectable_table(
         &self,
         result: &QueryResult,
         line_index: &mut usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut table = table_shell(&self.fonts);
-        if !result.columns.is_empty() {
-            table = table.child(self.selectable_row(
-                *line_index,
-                "result-header",
-                header_row(result),
-                cx,
-            ));
-            *line_index += 1;
+        let has_header = usize::from(!result.columns.is_empty());
+        let visible = self.visible_result_rows(
+            *line_index,
+            has_header + result.rows.len(),
+            px(RESULT_ROW_HEIGHT),
+        );
+        let first = *line_index;
+        let mut table = table_shell(&self.fonts).child(row_spacer(visible.above));
+        if has_header == 1 && visible.range.contains(&0) {
+            table =
+                table.child(self.selectable_row(first, "result-header", header_row(result), cx));
         }
-        for row in &result.rows {
-            table = table.child(self.selectable_row(*line_index, "result-row", data_row(row), cx));
-            *line_index += 1;
+        for (offset, row) in result.rows.iter().enumerate() {
+            if visible.range.contains(&(offset + has_header)) {
+                table = table.child(self.selectable_row(
+                    first + offset + has_header,
+                    "result-row",
+                    data_row(row),
+                    cx,
+                ));
+            }
         }
-        table
+        *line_index += has_header + result.rows.len();
+        table.child(row_spacer(visible.below))
+    }
+
+    /// The window for one block of result rows, given how many rows precede it on the surface.
+    fn visible_result_rows(&self, before: usize, count: usize, row_height: Pixels) -> VisibleLines {
+        let handle = &self.results_scroll.handle;
+        visible_rows(
+            before,
+            count,
+            row_height,
+            handle.bounds().size.height,
+            handle.offset().y,
+            RESULT_CHROME_SLOP_ROWS,
+        )
     }
 
     /// The result content itself. Scrolling and the bars belong to the viewport that wraps this,
@@ -1977,6 +2215,12 @@ impl AppView {
             content = content.child(result_header(&self.fonts, index, result));
             content = match self.editor.display {
                 ResultDisplay::Text => {
+                    let text = result.as_text();
+                    let visible = self.visible_result_rows(
+                        line_index,
+                        text.lines().count(),
+                        px(RESULT_LINE_HEIGHT),
+                    );
                     let mut block = div()
                         .flex()
                         .flex_col()
@@ -1984,12 +2228,15 @@ impl AppView {
                         .min_w_full()
                         .font_family(self.fonts.mono.clone())
                         .text_size(px(RESULT_TEXT_SIZE))
-                        .line_height(px(RESULT_LINE_HEIGHT));
-                    for line in result.as_text().lines() {
-                        block = block.child(self.result_line(line_index, line, cx));
-                        line_index += 1;
+                        .line_height(px(RESULT_LINE_HEIGHT))
+                        .child(text_spacer(visible.above));
+                    for (offset, line) in text.lines().enumerate() {
+                        if visible.range.contains(&offset) {
+                            block = block.child(self.result_line(line_index + offset, line, cx));
+                        }
                     }
-                    content.child(block)
+                    line_index += text.lines().count();
+                    content.child(block.child(text_spacer(visible.below)))
                 }
                 ResultDisplay::Table => {
                     content.child(self.selectable_table(result, &mut line_index, cx))
@@ -2159,8 +2406,10 @@ impl Render for AppView {
                     let was_dragging = this.editor_scroll.drag.take().is_some()
                         | this.results_scroll.drag.take().is_some()
                         | this.pane_drag.take().is_some()
-                        | this.selecting_results;
+                        | this.selecting_results
+                        | this.selecting_editor;
                     this.selecting_results = false;
+                    this.selecting_editor = false;
                     if was_dragging {
                         cx.notify();
                     }
@@ -2486,7 +2735,7 @@ impl Render for AppView {
                                             |view: &mut Self| &mut view.editor_scroll,
                                             &self.editor_scroll,
                                             "editor-scroll",
-                                            self.editor_surface(),
+                                            self.editor_surface(cx),
                                             cx,
                                         )
                                         .into_any_element()
@@ -2840,6 +3089,7 @@ fn header_row(result: &QueryResult) -> gpui::Div {
     let mut header = div()
         .flex()
         .flex_none()
+        .h(px(RESULT_ROW_HEIGHT))
         .border_b_1()
         .border_color(rgb(BORDER));
     for column in &result.columns {
@@ -2861,6 +3111,8 @@ fn data_row(values: &[CellValue]) -> gpui::Div {
     let mut row = div()
         .flex()
         .flex_none()
+        // Fixed rather than padding-derived, so the windowed grid places rows exactly.
+        .h(px(RESULT_ROW_HEIGHT))
         .border_b_1()
         .border_color(rgb(BORDER));
     for value in values {
@@ -2921,6 +3173,8 @@ fn shortcut_command(
             "enter" => runnable.then_some(command::RUN),
             "." if running => Some(command::CANCEL),
             "n" => Some(command::NEW_EDITOR),
+            "w" if running => None,
+            "w" => Some(command::CLOSE_EDITOR),
             "d" if shift && running => None,
             "d" if shift && connected => Some(command::DISCONNECT),
             "d" if shift => Some(command::CONNECT),
@@ -2965,6 +3219,161 @@ fn discover_profiles() -> (Vec<ConnectionProfile>, bool) {
         .expect("built-in PostgreSQL profile should be valid")
     });
     (vec![fallback], false)
+}
+
+/// A caret position in the SQL document: which line, and how many characters into it.
+///
+/// Columns are characters rather than bytes because they address rendered glyphs — the editor is
+/// monospace, so a column is also what turns a pointer position into an offset.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct DocumentPosition {
+    line: usize,
+    column: usize,
+}
+
+/// The line and column a byte offset falls on.
+fn document_position(document: &str, offset: usize) -> DocumentPosition {
+    let preceding = &document[..offset.min(document.len())];
+    let line_start = preceding.rfind('\n').map_or(0, |index| index + 1);
+    DocumentPosition {
+        line: preceding.matches('\n').count(),
+        column: preceding[line_start..].chars().count(),
+    }
+}
+
+/// The columns of `line` a byte-offset selection covers, or `None` where there is nothing to paint.
+fn selected_columns(document: &str, selection: &Range<usize>, line: usize) -> Option<Range<usize>> {
+    if selection.is_empty() {
+        return None;
+    }
+    let start = document_position(document, selection.start);
+    let end = document_position(document, selection.end);
+    if line < start.line || line > end.line {
+        return None;
+    }
+    let from = if line == start.line { start.column } else { 0 };
+    let to = if line == end.line {
+        end.column
+    } else {
+        line_length(document, line)
+    };
+    (from < to).then_some(from..to)
+}
+
+/// Whether an editor has a query in flight, and so must not be closed or swapped out from under it.
+fn is_busy(status: ExecutionStatus) -> bool {
+    matches!(
+        status,
+        ExecutionStatus::Running | ExecutionStatus::Cancelling
+    )
+}
+
+/// Stands in for lines outside the window, holding the scroll height the document really needs so
+/// the scrollbar and the pointer arithmetic both stay honest.
+fn line_spacer(lines: usize) -> gpui::Div {
+    div().flex_none().h(px(EDITOR_LINE_HEIGHT) * lines as f32)
+}
+
+/// The same, for the rows of a results grid.
+fn row_spacer(rows: usize) -> gpui::Div {
+    div().flex_none().h(px(RESULT_ROW_HEIGHT) * rows as f32)
+}
+
+/// The same, for the lines of a text result.
+fn text_spacer(lines: usize) -> gpui::Div {
+    div().flex_none().h(px(RESULT_LINE_HEIGHT) * lines as f32)
+}
+
+/// The lines the editor should actually build elements for, and how many it is skipping at each
+/// end. The skipped lines become spacers, so the scroll height still covers the whole document.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct VisibleLines {
+    range: Range<usize>,
+    above: usize,
+    below: usize,
+}
+
+/// Which lines a viewport can see. Editor lines are a fixed height, so this is exact rather than a
+/// measurement, and `overscan` keeps a few lines built beyond each edge so a scroll does not
+/// expose an unrendered gap before the next frame.
+fn visible_lines(
+    total: usize,
+    viewport_height: Pixels,
+    offset_y: Pixels,
+    overscan: usize,
+) -> VisibleLines {
+    visible_rows(
+        0,
+        total,
+        px(EDITOR_LINE_HEIGHT),
+        viewport_height,
+        offset_y,
+        overscan,
+    )
+}
+
+/// The same window for one block of uniform rows sitting `before` rows into a taller surface.
+/// Results stack a header above each block whose height belongs to the stylesheet rather than to
+/// this arithmetic, so `slop` widens the window enough to cover it; overshooting costs a handful
+/// of extra rows, while undershooting would leave a blank band at the edge of the viewport.
+fn visible_rows(
+    before: usize,
+    count: usize,
+    row_height: Pixels,
+    viewport_height: Pixels,
+    offset_y: Pixels,
+    slop: usize,
+) -> VisibleLines {
+    // Offsets run negative as the content moves up past the viewport.
+    let scrolled = (f32::from(-offset_y).max(0.) / f32::from(row_height)) as usize;
+    // Before the first layout pass the viewport measures zero. Rendering nothing then would leave
+    // the surface blank for a frame, so an unmeasured viewport falls back to a screenful.
+    let deep = if viewport_height > px(0.) {
+        (f32::from(viewport_height) / f32::from(row_height)).ceil() as usize + 1
+    } else {
+        UNMEASURED_VIEWPORT_LINES
+    };
+    let first = scrolled.saturating_sub(slop);
+    let last = scrolled.saturating_add(deep + slop);
+    // Translate the global window into this block's own rows.
+    let start = first.saturating_sub(before).min(count);
+    let end = last.saturating_sub(before).min(count);
+    VisibleLines {
+        above: start,
+        below: count - end,
+        range: start..end,
+    }
+}
+
+/// The document as the editor renders it. Unlike `str::lines` this keeps the empty line after a
+/// trailing newline, which is a line the caret can occupy and so a line that must be drawn.
+fn editor_lines(document: &str) -> std::str::Split<'_, char> {
+    document.split('\n')
+}
+
+fn line_length(document: &str, line: usize) -> usize {
+    editor_lines(document)
+        .nth(line)
+        .map_or(0, |line| line.chars().count())
+}
+
+/// The byte offset of a line and column, each clamped to what the document actually has.
+fn offset_of(document: &str, line: usize, column: usize) -> usize {
+    let mut line_start = 0;
+    for _ in 0..line {
+        match document[line_start..].find('\n') {
+            Some(index) => line_start += index + 1,
+            // Past the last line, which is where End and a click below the text both land.
+            None => break,
+        }
+    }
+    let line_end = document[line_start..]
+        .find('\n')
+        .map_or(document.len(), |index| line_start + index);
+    document[line_start..line_end]
+        .char_indices()
+        .nth(column)
+        .map_or(line_end, |(index, _)| line_start + index)
 }
 
 fn previous_boundary(text: &str, offset: usize) -> usize {
@@ -3916,5 +4325,920 @@ mod tests {
 
         view.update(cx, |app, _| assert_eq!(app.editor.id, editor_id));
         assert!(cx.simulate_close());
+    }
+
+    /// `SELECT one\nFROM t\nWHERE x` — a short middle line so clamping is visible.
+    fn three_line_editor(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = "SELECT one\nFROM t\nWHERE x".into();
+            app.editor.cursor = 0;
+        });
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn down_holds_the_column_on_the_line_below(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 4);
+
+        cx.simulate_keystrokes("down");
+
+        // Column 4 of "FROM t" is the offset of its space.
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 15));
+    }
+
+    #[gpui::test]
+    fn down_onto_a_shorter_line_stops_at_its_end(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 9);
+
+        cx.simulate_keystrokes("down");
+
+        // "FROM t" has no column 9, so the caret lands on its end rather than overshooting.
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 17));
+    }
+
+    #[gpui::test]
+    fn up_returns_to_the_line_above(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 20);
+
+        cx.simulate_keystrokes("up");
+
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 13));
+    }
+
+    #[gpui::test]
+    fn up_on_the_first_line_keeps_the_caret_where_it_is(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 4);
+
+        cx.simulate_keystrokes("up");
+
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 4));
+    }
+
+    #[gpui::test]
+    fn home_and_end_travel_to_the_bounds_of_the_current_line(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 14);
+
+        cx.simulate_keystrokes("home");
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 11));
+
+        cx.simulate_keystrokes("end");
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 17));
+    }
+
+    #[gpui::test]
+    fn shift_down_selects_through_to_the_line_below(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 4);
+
+        cx.simulate_keystrokes("shift-down");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.selection, Some(4..15));
+            assert_eq!(app.editor.cursor, 15);
+        });
+    }
+
+    #[gpui::test]
+    fn vertical_movement_without_shift_drops_the_selection(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        view.update(cx, |app, _| {
+            app.editor.cursor = 4;
+            app.editor.selection = Some(0..4);
+        });
+
+        cx.simulate_keystrokes("down");
+
+        view.update(cx, |app, _| assert_eq!(app.editor.selection, None));
+    }
+
+    #[gpui::test]
+    fn shrinking_a_shift_selection_back_to_its_start_selects_nothing(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = "SELECT 1".into();
+            app.editor.cursor = 0;
+        });
+
+        cx.simulate_keystrokes("shift-right shift-right shift-left");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, 1);
+            assert_eq!(app.editor.selection, Some(0..1));
+        });
+    }
+
+    #[gpui::test]
+    fn shift_selecting_leftwards_grows_away_from_the_anchor(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = "SELECT 1".into();
+            app.editor.cursor = 4;
+        });
+
+        cx.simulate_keystrokes("shift-left shift-left");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, 2);
+            assert_eq!(app.editor.selection, Some(2..4));
+        });
+    }
+
+    const THREE_LINES: &str = "SELECT one\nFROM t\nWHERE x";
+
+    /// A viewport exactly ten lines tall, to keep the arithmetic in these tests obvious.
+    const TEN_LINES: Pixels = px(EDITOR_LINE_HEIGHT * 10.);
+
+    #[test]
+    fn a_document_shorter_than_the_viewport_is_rendered_whole() {
+        let visible = visible_lines(4, TEN_LINES, px(0.), 3);
+
+        assert_eq!(visible.range, 0..4);
+        assert_eq!(visible.above, 0);
+        assert_eq!(visible.below, 0);
+    }
+
+    #[test]
+    fn only_a_window_of_a_large_document_is_rendered() {
+        let visible = visible_lines(50_000, TEN_LINES, px(0.), 3);
+
+        assert!(
+            visible.range.len() < 40,
+            "a ten-line viewport should not render {} lines",
+            visible.range.len()
+        );
+        assert_eq!(visible.below, 50_000 - visible.range.end);
+    }
+
+    #[test]
+    fn scrolling_down_moves_the_window_and_counts_the_lines_above_it() {
+        // GPUI scroll offsets run negative as content moves up. Twenty lines scrolled past, less
+        // three lines of overscan, puts the window at line 17.
+        let visible = visible_lines(1_000, TEN_LINES, px(-EDITOR_LINE_HEIGHT * 20.), 3);
+
+        assert_eq!(visible.range.start, 17);
+        assert_eq!(visible.above, 17);
+    }
+
+    #[test]
+    fn the_window_never_runs_past_the_end_of_the_document() {
+        let visible = visible_lines(30, TEN_LINES, px(-EDITOR_LINE_HEIGHT * 25.), 3);
+
+        assert_eq!(visible.range.end, 30);
+        assert_eq!(visible.below, 0);
+    }
+
+    #[test]
+    fn every_line_is_either_rendered_or_spaced_over() {
+        // The spacers stand in for the lines that are not rendered, so together they must always
+        // account for the whole document or the scroll height is wrong.
+        for (total, offset) in [
+            (0, 0.),
+            (1, 0.),
+            (500, 0.),
+            (500, -120.),
+            (500, -12_400.),
+            (500, -999_999.),
+        ] {
+            let visible = visible_lines(total, TEN_LINES, px(offset), 3);
+
+            assert_eq!(
+                visible.above + visible.range.len() + visible.below,
+                total,
+                "{total} lines at offset {offset} did not add up"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_still_renders_something() {
+        // Bounds are zero until the first layout pass; rendering nothing would blank the editor.
+        let visible = visible_lines(500, px(0.), px(0.), 3);
+
+        assert!(!visible.range.is_empty());
+    }
+
+    #[gpui::test]
+    fn undo_returns_the_caret_to_where_the_edit_was_made(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+
+        view.update(cx, |app, cx| {
+            app.editor.cursor = 4;
+            app.insert_text("X", cx);
+            assert_eq!(app.editor.cursor, 5);
+
+            app.undo(cx);
+
+            assert_eq!(app.editor.document, THREE_LINES);
+            assert_eq!(
+                app.editor.cursor, 4,
+                "the caret should return to the edit, not jump to the end of the document"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn redo_leaves_the_caret_after_the_restored_edit(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+
+        view.update(cx, |app, cx| {
+            app.editor.cursor = 4;
+            app.insert_text("X", cx);
+            app.undo(cx);
+
+            app.redo(cx);
+
+            assert_eq!(app.editor.document, "SELEXCT one\nFROM t\nWHERE x");
+            assert_eq!(app.editor.cursor, 5);
+        });
+    }
+
+    /// The left edge of the editor text, derived the way the pointer mapping derives it.
+    fn editor_text_left(app: &AppView) -> Pixels {
+        let handle = &app.editor_scroll.handle;
+        handle.bounds().origin.x + handle.offset().x + px(GUTTER_WIDTH)
+    }
+
+    /// Windowing the render makes the rendered lines a slice of the document, so a line's click
+    /// handler has to carry its absolute document line. Using the index within the window instead
+    /// would put the caret near the top of the file wherever the user clicked.
+    #[gpui::test]
+    fn a_click_lands_on_the_absolute_line_when_the_document_is_scrolled(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        // Numbered lines, so the caret's offset identifies the line it landed on.
+        let document = (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| app.editor.document = document.clone());
+        // The resize forces the layout pass that measures the content, without which nothing
+        // overflows and the scroll offset set below clamps straight back to zero.
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // Scroll 200 lines down, then click the first line of the viewport.
+        let scrolled = 200.;
+        view.update(cx, |app, cx| {
+            app.editor_scroll
+                .handle
+                .set_offset(point(px(0.), px(-EDITOR_LINE_HEIGHT * scrolled)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let position = view.update(cx, |app, _| {
+            let bounds = app.editor_scroll.handle.bounds();
+            point(
+                editor_text_left(app) + app.editor_advance * 3.,
+                bounds.origin.y + px(EDITOR_LINE_HEIGHT * 0.5),
+            )
+        });
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let line = document_position(&app.editor.document, app.editor.cursor).line;
+            assert_eq!(
+                line, scrolled as usize,
+                "clicking the top of the viewport should land on line {scrolled}, not line {line}"
+            );
+        });
+    }
+
+    /// The handlers above are reached through the rendered lines, so this drives a real pointer
+    /// event rather than calling them, and would catch the listeners being lost from the surface.
+    #[gpui::test]
+    fn a_real_click_on_the_rendered_editor_moves_the_caret(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        let position = view.update(cx, |app, _| {
+            let bounds = app.editor_scroll.handle.bounds();
+            point(
+                editor_text_left(app) + app.editor_advance * 3.,
+                // The middle of the second rendered line.
+                bounds.origin.y + px(EDITOR_LINE_HEIGHT * 1.5),
+            )
+        });
+
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        // Column 3 of "FROM t".
+        view.update(cx, |app, _| assert_eq!(app.editor.cursor, 14));
+    }
+
+    #[gpui::test]
+    fn the_editor_pointer_maps_to_a_character_column(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let advance = app.editor_advance;
+            let left = editor_text_left(app);
+
+            assert_eq!(app.editor_column_at(left), 0);
+            assert_eq!(app.editor_column_at(left + advance * 5.), 5);
+            // Rounding puts the caret at the nearest boundary, not the one to the left.
+            assert_eq!(app.editor_column_at(left + advance * 5.6), 6);
+            // Left of the text, in the gutter, can never produce a negative column.
+            assert_eq!(app.editor_column_at(left - advance * 3.), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_a_line_puts_the_caret_under_the_pointer(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, cx| {
+            let x = editor_text_left(app) + app.editor_advance * 3.;
+            app.click_editor(1, x, false, cx);
+
+            // Column 3 of "FROM t".
+            assert_eq!(app.editor.cursor, 14);
+            assert_eq!(app.editor.selection, None);
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_past_the_end_of_a_line_puts_the_caret_at_its_end(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, cx| {
+            let x = editor_text_left(app) + app.editor_advance * 80.;
+            app.click_editor(1, x, false, cx);
+
+            assert_eq!(app.editor.cursor, 17);
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_from_a_click_selects_the_span_between(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, cx| {
+            let left = editor_text_left(app);
+            app.click_editor(0, left + app.editor_advance * 2., false, cx);
+            app.drag_editor(2, left + app.editor_advance * 3., cx);
+
+            // Column 2 of line 0 through to column 3 of line 2.
+            assert_eq!(app.editor.selection, Some(2..21));
+            assert_eq!(app.editor.cursor, 21);
+        });
+    }
+
+    #[gpui::test]
+    fn a_backwards_editor_drag_selects_the_same_span(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, cx| {
+            let left = editor_text_left(app);
+            app.click_editor(2, left + app.editor_advance * 3., false, cx);
+            app.drag_editor(0, left + app.editor_advance * 2., cx);
+
+            assert_eq!(app.editor.selection, Some(2..21));
+            assert_eq!(app.editor.cursor, 2);
+        });
+    }
+
+    #[gpui::test]
+    fn pointer_movement_without_a_click_leaves_the_caret_alone(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, cx| {
+            app.editor.cursor = 4;
+            let x = editor_text_left(app) + app.editor_advance * 3.;
+
+            app.drag_editor(2, x, cx);
+
+            assert_eq!(app.editor.cursor, 4);
+            assert_eq!(app.editor.selection, None);
+        });
+    }
+
+    #[gpui::test]
+    fn shift_clicking_extends_the_selection_from_the_caret(cx: &mut TestAppContext) {
+        let (view, cx) = three_line_editor(cx);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, cx| {
+            app.editor.cursor = 2;
+            let x = editor_text_left(app) + app.editor_advance * 3.;
+
+            app.click_editor(2, x, true, cx);
+
+            assert_eq!(app.editor.selection, Some(2..21));
+        });
+    }
+
+    #[gpui::test]
+    fn each_surface_measures_the_character_advance_at_its_own_text_size(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        view.update(cx, |app, _| {
+            // A monospace advance scales with the text size, so the two surfaces' advances must
+            // differ by the ratio of their sizes. Sharing one measurement drifts the editor caret.
+            let ratio = f32::from(app.editor_advance) / f32::from(app.mono_advance);
+            let expected = EDITOR_TEXT_SIZE / RESULT_TEXT_SIZE;
+            assert!(
+                (ratio - expected).abs() < 0.02,
+                "editor advance {:?} is not measured at the editor text size: ratio {ratio}, expected {expected}",
+                app.editor_advance
+            );
+        });
+    }
+
+    #[test]
+    fn a_document_ending_in_a_newline_still_renders_its_empty_last_line() {
+        assert_eq!(editor_lines("SELECT 1\n").count(), 2);
+    }
+
+    #[test]
+    fn the_caret_line_is_always_one_of_the_rendered_lines() {
+        // Pressing Enter at the end of the document must not put the caret on a line that the
+        // renderer never emits, which is what `str::lines` would do.
+        for document in ["", "SELECT 1", "SELECT 1\n", "SELECT 1\n\n"] {
+            let caret = document_position(document, document.len());
+            assert!(
+                caret.line < editor_lines(document).count(),
+                "caret line {} is not rendered for {document:?}",
+                caret.line
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_within_one_line_paints_only_those_columns() {
+        assert_eq!(selected_columns(THREE_LINES, &(2..5), 0), Some(2..5));
+    }
+
+    #[test]
+    fn the_first_line_of_a_selection_paints_from_its_start_column_to_the_line_end() {
+        assert_eq!(selected_columns(THREE_LINES, &(4..20), 0), Some(4..10));
+    }
+
+    #[test]
+    fn a_line_fully_inside_a_selection_paints_end_to_end() {
+        assert_eq!(selected_columns(THREE_LINES, &(4..20), 1), Some(0..6));
+    }
+
+    #[test]
+    fn the_last_line_of_a_selection_stops_at_its_end_column() {
+        assert_eq!(selected_columns(THREE_LINES, &(4..20), 2), Some(0..2));
+    }
+
+    #[test]
+    fn a_line_outside_the_selection_paints_nothing() {
+        assert_eq!(selected_columns(THREE_LINES, &(2..5), 1), None);
+    }
+
+    #[test]
+    fn an_empty_selection_paints_nothing() {
+        assert_eq!(selected_columns(THREE_LINES, &(5..5), 0), None);
+    }
+
+    #[test]
+    fn a_painted_span_is_measured_in_characters_not_bytes() {
+        // "café" is bytes 3..8 but columns 3..7; painting by bytes would overhang by a character.
+        assert_eq!(
+            selected_columns("-- café\nSELECT 1", &(3..8), 0),
+            Some(3..7)
+        );
+    }
+
+    #[test]
+    fn an_offset_reports_the_line_and_column_it_sits_on() {
+        let document = "SELECT 1\nFROM t";
+
+        assert_eq!(
+            document_position(document, 11),
+            DocumentPosition { line: 1, column: 2 }
+        );
+    }
+
+    #[test]
+    fn the_start_of_a_line_is_column_zero() {
+        let document = "SELECT 1\nFROM t";
+
+        assert_eq!(
+            document_position(document, 9),
+            DocumentPosition { line: 1, column: 0 }
+        );
+    }
+
+    #[test]
+    fn a_column_is_counted_in_characters_not_bytes() {
+        // 'é' is two bytes, so a byte count would report column 3 for the offset after "café".
+        let document = "-- café\nSELECT 1";
+
+        assert_eq!(
+            document_position(document, 8).line,
+            0,
+            "the offset is the last byte of the first line"
+        );
+        assert_eq!(document_position(document, 8).column, 7);
+    }
+
+    #[test]
+    fn a_column_past_the_end_of_a_line_lands_on_its_last_character() {
+        let document = "SELECT 1\nFROM t";
+
+        assert_eq!(offset_of(document, 0, 40), 8);
+    }
+
+    #[test]
+    fn a_line_past_the_end_of_the_document_lands_on_the_last_line() {
+        let document = "SELECT 1\nFROM t";
+
+        assert_eq!(offset_of(document, 9, 0), 9);
+    }
+
+    #[test]
+    fn a_position_round_trips_through_an_offset_across_a_multibyte_line() {
+        let document = "-- café\nSELECT 1";
+        let position = DocumentPosition { line: 1, column: 6 };
+
+        let offset = offset_of(document, position.line, position.column);
+
+        assert_eq!(document_position(document, offset), position);
+    }
+
+    /// A document taller than the pane must be reachable. `min_h_full` on the surface caps its
+    /// minimum height at the viewport and lets the flex row shrink to fit, so the content never
+    /// overflows and neither the scrollbar nor the wheel has any range to work with.
+    #[gpui::test]
+    fn a_document_taller_than_the_pane_can_be_scrolled(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| app.editor.document = document);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let viewport = app.editor_scroll.handle.bounds().size.height;
+            let overflow = app.editor_scroll.handle.max_offset().height;
+            assert!(
+                overflow > px(0.),
+                "400 lines in a {viewport:?} pane should overflow, got {overflow:?}"
+            );
+            assert!(
+                ThumbMetrics::measure(viewport, overflow, px(0.)).is_some(),
+                "a vertical scrollbar should be warranted"
+            );
+        });
+    }
+
+    /// Virtualisation places lines arithmetically, so every rendered line must be exactly
+    /// `EDITOR_LINE_HEIGHT` tall. A minimum height instead of a fixed one lets a line grow, and
+    /// the window then drifts further from the pointer the further down the document you scroll.
+    #[gpui::test]
+    fn every_rendered_line_is_exactly_one_line_tall(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let count = 400;
+        let document = (0..count)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| app.editor.document = document);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let viewport = app.editor_scroll.handle.bounds().size.height;
+            let content = app.editor_scroll.handle.max_offset().height + viewport;
+            let expected = px(EDITOR_LINE_HEIGHT * count as f32);
+            let drift = f32::from(content) - f32::from(expected);
+            assert!(
+                drift.abs() < EDITOR_LINE_HEIGHT,
+                "{count} lines should measure {expected:?}, got {content:?}"
+            );
+        });
+    }
+
+    /// §19 "reasonable handling of large SQL documents": the pane builds a window of lines, so a
+    /// very large document stays responsive and still maps the pointer to the right place.
+    #[gpui::test]
+    fn a_very_large_document_stays_interactive(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let count = 20_000;
+        let document = (0..count)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| app.editor.document = document);
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // Jump most of the way down and click the top of the viewport.
+        let target = 15_000.;
+        view.update(cx, |app, cx| {
+            app.editor_scroll
+                .handle
+                .set_offset(point(px(0.), px(-EDITOR_LINE_HEIGHT * target)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let position = view.update(cx, |app, _| {
+            let bounds = app.editor_scroll.handle.bounds();
+            point(
+                editor_text_left(app) + app.editor_advance * 3.,
+                bounds.origin.y + px(EDITOR_LINE_HEIGHT * 0.5),
+            )
+        });
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let line = document_position(&app.editor.document, app.editor.cursor).line;
+            assert_eq!(line, target as usize);
+            let content = app.editor_scroll.handle.max_offset().height
+                + app.editor_scroll.handle.bounds().size.height;
+            let expected = px(EDITOR_LINE_HEIGHT * count as f32);
+            assert!(
+                (f32::from(content) - f32::from(expected)).abs() < EDITOR_LINE_HEIGHT,
+                "the spacers should preserve the full scroll height: {content:?} vs {expected:?}"
+            );
+        });
+    }
+
+    /// Windowing the render leaves only the visible lines to measure, so without help the
+    /// horizontal extent would grow and shrink as you scroll past longer lines. The font is
+    /// monospace, so the document's widest line can be measured arithmetically instead.
+    #[gpui::test]
+    fn horizontal_extent_covers_the_widest_line_even_when_it_is_scrolled_away(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = build_app_view(cx);
+        // One very long line at the top, then enough short lines to scroll it out of view.
+        let mut document = vec!["SELECT ".to_owned() + &"x".repeat(600)];
+        document.extend((0..400).map(|line| format!("SELECT {line};")));
+        view.update(cx, |app, _| app.editor.document = document.join("\n"));
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        let at_top = view.update(cx, |app, _| app.editor_scroll.handle.max_offset().width);
+        assert!(at_top > px(0.), "the long line should overflow sideways");
+
+        view.update(cx, |app, cx| {
+            app.editor_scroll
+                .handle
+                .set_offset(point(px(0.), px(-EDITOR_LINE_HEIGHT * 300.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let scrolled = view.update(cx, |app, _| app.editor_scroll.handle.max_offset().width);
+        assert_eq!(
+            scrolled, at_top,
+            "the horizontal extent should not change when the widest line scrolls out of view"
+        );
+    }
+
+    const ROW: Pixels = px(RESULT_LINE_HEIGHT);
+    const TEN_ROWS: Pixels = px(RESULT_LINE_HEIGHT * 10.);
+
+    #[test]
+    fn a_results_block_at_the_top_windows_from_its_first_row() {
+        let visible = visible_rows(0, 10_000, ROW, TEN_ROWS, px(0.), 2);
+
+        assert_eq!(visible.range.start, 0);
+        assert!(visible.range.len() < 40);
+        assert_eq!(visible.below, 10_000 - visible.range.end);
+    }
+
+    #[test]
+    fn a_results_block_scrolled_past_entirely_builds_no_rows() {
+        // The block occupies global rows 0..50 while the viewport is far below it.
+        let visible = visible_rows(0, 50, ROW, TEN_ROWS, px(-RESULT_LINE_HEIGHT * 5_000.), 2);
+
+        assert!(visible.range.is_empty());
+        assert_eq!(visible.above, 50, "the whole block sits above the viewport");
+        assert_eq!(visible.below, 0);
+    }
+
+    #[test]
+    fn a_later_block_windows_relative_to_the_rows_before_it() {
+        // 1000 rows precede this block, and the viewport sits at global row 1010.
+        let visible = visible_rows(
+            1_000,
+            500,
+            ROW,
+            TEN_ROWS,
+            px(-RESULT_LINE_HEIGHT * 1_010.),
+            2,
+        );
+
+        assert_eq!(
+            visible.range.start, 8,
+            "1010 - 2 slop, less the 1000 before it"
+        );
+        assert_eq!(visible.above, 8);
+    }
+
+    #[test]
+    fn a_block_not_yet_reached_builds_nothing_but_still_accounts_for_its_rows() {
+        let visible = visible_rows(5_000, 100, ROW, TEN_ROWS, px(0.), 2);
+
+        assert!(visible.range.is_empty());
+        assert_eq!(visible.above + visible.range.len() + visible.below, 100);
+    }
+
+    #[test]
+    fn every_result_row_is_either_built_or_spaced_over() {
+        for before in [0, 1, 900, 5_000] {
+            for offset in [0., -220., -22_000., -999_999.] {
+                let visible = visible_rows(before, 500, ROW, TEN_ROWS, px(offset), 2);
+
+                assert_eq!(
+                    visible.above + visible.range.len() + visible.below,
+                    500,
+                    "before {before} at offset {offset} did not add up"
+                );
+            }
+        }
+    }
+
+    /// Table rows are positioned arithmetically once the grid is windowed, so each must be exactly
+    /// `RESULT_ROW_HEIGHT` tall rather than whatever its padding happens to produce.
+    #[gpui::test]
+    fn every_table_row_is_exactly_one_row_tall(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let counts = [100usize, 200];
+        let mut heights = Vec::new();
+        for count in counts {
+            let owned: Vec<String> = (0..count).map(|row| format!("row {row}")).collect();
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            view.update(cx, |app, cx| {
+                app.editor.display = ResultDisplay::Table;
+                app.editor.results = vec![result_with_rows(&refs)];
+                app.active_result_tab = false;
+                cx.notify();
+            });
+            cx.simulate_resize(size(px(1280.), px(820.)));
+            cx.run_until_parked();
+            heights.push(view.update(cx, |app, _| {
+                app.results_scroll.handle.max_offset().height
+                    + app.results_scroll.handle.bounds().size.height
+            }));
+        }
+
+        let per_row =
+            (f32::from(heights[1]) - f32::from(heights[0])) / (counts[1] - counts[0]) as f32;
+        assert!(
+            (per_row - RESULT_ROW_HEIGHT).abs() < 0.01,
+            "each table row should measure {RESULT_ROW_HEIGHT}px, measured {per_row}px"
+        );
+    }
+
+    /// The row-limit control goes up to `MAX_ROW_LIMIT`, so the grid has to cope with result sets
+    /// far larger than the pane. Rows must stay addressable by their absolute position, or a click
+    /// deep in a scrolled result selects the wrong row.
+    #[gpui::test]
+    fn a_very_large_result_stays_interactive(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let count = 50_000usize;
+        let owned: Vec<String> = (0..count).map(|row| format!("row {row}")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Table;
+            app.editor.results = vec![result_with_rows(&refs)];
+            app.active_result_tab = false;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        let target = 40_000usize;
+        view.update(cx, |app, cx| {
+            app.results_scroll
+                .handle
+                .set_offset(point(px(0.), px(-RESULT_ROW_HEIGHT * target as f32)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let position = view.update(cx, |app, _| {
+            let bounds = app.results_scroll.handle.bounds();
+            point(
+                bounds.origin.x + px(RESULT_TEXT_INSET),
+                bounds.origin.y + px(RESULT_ROW_HEIGHT * 0.5),
+            )
+        });
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let selected = app
+                .result_selection
+                .expect("clicking a row should select it")
+                .ordered()
+                .0
+                .line;
+            let drift = selected.abs_diff(target);
+            assert!(
+                drift <= RESULT_CHROME_SLOP_ROWS,
+                "clicking at row {target} selected row {selected}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn closing_a_background_editor_removes_it(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1".into();
+            app.new_editor(cx);
+            app.editor.document = "SELECT 2".into();
+        });
+
+        view.update(cx, |app, cx| {
+            assert_eq!(app.background_editors.len(), 1);
+            app.close_editor(0, cx);
+
+            assert!(app.background_editors.is_empty());
+            assert_eq!(app.editor.document, "SELECT 2", "the active editor stays");
+        });
+    }
+
+    #[gpui::test]
+    fn closing_the_active_editor_falls_back_to_the_one_behind_it(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1".into();
+            app.new_editor(cx);
+            app.editor.document = "SELECT 2".into();
+        });
+
+        view.update(cx, |app, cx| {
+            app.close_active_editor(cx);
+
+            assert!(app.background_editors.is_empty());
+            assert_eq!(app.editor.document, "SELECT 1");
+        });
+    }
+
+    #[gpui::test]
+    fn the_last_editor_is_never_closed(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1".into();
+
+            app.close_active_editor(cx);
+
+            assert_eq!(
+                app.editor.document, "SELECT 1",
+                "closing the only editor would leave the workspace with nothing to type into"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_running_editor_is_not_closed_from_under_its_query(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1".into();
+            app.new_editor(cx);
+            app.editor.document = "SELECT 2".into();
+            app.editor.execution_status = ExecutionStatus::Running;
+
+            app.close_active_editor(cx);
+
+            assert_eq!(app.editor.document, "SELECT 2");
+            assert_eq!(app.background_editors.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn the_close_shortcut_resolves_to_a_stable_command_id(_cx: &mut TestAppContext) {
+        assert_eq!(
+            shortcut_command("w", true, false, false, false, false),
+            Some(command::CLOSE_EDITOR)
+        );
+        // Not while a query is in flight, matching what close_active_editor itself refuses.
+        assert_eq!(shortcut_command("w", true, false, false, true, true), None);
     }
 }

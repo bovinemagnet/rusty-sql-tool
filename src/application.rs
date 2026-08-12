@@ -15,6 +15,7 @@ pub mod command {
     pub const EXPLAIN: &str = "sql.explain";
     pub const CANCEL: &str = "sql.cancel";
     pub const NEW_EDITOR: &str = "sql.new_editor";
+    pub const CLOSE_EDITOR: &str = "sql.close_editor";
     pub const CONNECT: &str = "connection.connect";
     pub const DISCONNECT: &str = "connection.disconnect";
 }
