@@ -56,6 +56,30 @@ async fn connects_browses_and_executes_against_postgres() {
     assert_eq!(result.rows[0][0], CellValue::Integer(1));
     assert_eq!(result.rows[0][1], CellValue::Null);
 
+    // Notices are raised on the connection rather than returned as rows, so they only prove
+    // themselves against a real server (§40).
+    let raised = provider
+        .execute("DO $$ BEGIN RAISE NOTICE 'phase one notice'; END $$;")
+        .await
+        .expect("DO block should execute");
+    assert!(
+        raised
+            .notices
+            .iter()
+            .any(|notice| notice.contains("phase one notice")),
+        "the server notice should travel with the result: {:?}",
+        raised.notices
+    );
+    let quiet = provider
+        .execute("SELECT 1")
+        .await
+        .expect("query should execute");
+    assert!(
+        quiet.notices.is_empty(),
+        "notices must not carry over to the next statement: {:?}",
+        quiet.notices
+    );
+
     let service = CommandService::new(provider.clone());
     let mut editor = EditorState::new(profile.clone());
     editor.document = "SELECT generate_series(1, 100) AS number;".into();

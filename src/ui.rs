@@ -402,6 +402,9 @@ struct AppView {
     redo: Vec<(String, usize)>,
     connection_dialog: bool,
     connection_buffer: String,
+    /// Digits typed into the row-limit field, or `None` when it is not being edited. The ± steps
+    /// move by a factor of ten, so this is the only way to reach a value between them (§26).
+    limit_buffer: Option<String>,
     fonts: Fonts,
     /// The profile the single provider session is actually bound to. There is exactly one session,
     /// so this — not the active editor — is the truth about which database SQL will reach.
@@ -422,6 +425,9 @@ struct AppView {
     editor_advance: Pixels,
     result_pane_height: Pixels,
     pane_drag: Option<PaneDrag>,
+    /// The separate results window, kept so repeated runs refresh it instead of opening another
+    /// one. Dropped back to `None` once the user closes it (§32.3).
+    result_window: Option<gpui::WindowHandle<ResultWindow>>,
 }
 
 /// An in-progress splitter drag, anchored to where it began so the grip stays under the pointer.
@@ -538,6 +544,7 @@ impl AppView {
             redo: Vec::new(),
             connection_dialog: false,
             connection_buffer: String::new(),
+            limit_buffer: None,
             fonts,
             session_profile: None,
             configured,
@@ -550,6 +557,7 @@ impl AppView {
             editor_advance: measure_mono_advance(&fonts_for_advance, EDITOR_TEXT_SIZE, cx),
             result_pane_height: px(RESULT_PANE_HEIGHT),
             pane_drag: None,
+            result_window: None,
         }
     }
 
@@ -614,6 +622,11 @@ impl AppView {
 
     /// Places the caret under the pointer and arms a drag selection.
     fn click_editor(&mut self, line: usize, x: Pixels, extend: bool, cx: &mut Context<Self>) {
+        // Clicking into the document is a way out of the row-limit field, which otherwise holds
+        // every keystroke it sees.
+        if self.limit_buffer.is_some() {
+            self.cancel_limit_edit(cx);
+        }
         self.selecting_editor = true;
         let offset = offset_of(&self.editor.document, line, self.editor_column_at(x));
         self.place_cursor(offset, extend, cx);
@@ -1020,29 +1033,7 @@ impl AppView {
                                 ResultDestination::Tab => this.active_result_tab = true,
                                 ResultDestination::Window => {
                                     this.active_result_tab = false;
-                                    let results = this.editor.results.clone();
-                                    let display = this.editor.display;
-                                    let fonts = this.fonts.clone();
-                                    let bounds =
-                                        Bounds::centered(None, size(px(900.), px(600.)), cx);
-                                    let _ = cx.open_window(
-                                        WindowOptions {
-                                            window_bounds: Some(WindowBounds::Windowed(bounds)),
-                                            titlebar: Some(gpui::TitlebarOptions {
-                                                title: Some("SQL Results".into()),
-                                                ..Default::default()
-                                            }),
-                                            ..Default::default()
-                                        },
-                                        |_, cx| {
-                                            cx.new(|_| ResultWindow {
-                                                results,
-                                                display,
-                                                fonts,
-                                                scroll: ScrollState::default(),
-                                            })
-                                        },
-                                    );
+                                    this.show_results_in_window(cx);
                                 }
                             }
                         }
@@ -1143,6 +1134,30 @@ impl AppView {
                         && !character.chars().any(char::is_control)
                     {
                         self.connection_buffer.push_str(character);
+                        cx.notify();
+                    }
+                }
+            }
+            return;
+        }
+        // The row-limit field has no focus handle of its own, so while it is open the keys are held
+        // here rather than reaching the SQL document.
+        if let Some(buffer) = self.limit_buffer.as_mut() {
+            match key {
+                "escape" => self.cancel_limit_edit(cx),
+                "enter" => self.commit_limit_edit(cx),
+                "backspace" => {
+                    buffer.pop();
+                    cx.notify();
+                }
+                _ => {
+                    if let Some(character) = event.keystroke.key_char.as_deref()
+                        && character
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                        && !character.is_empty()
+                    {
+                        buffer.push_str(character);
                         cx.notify();
                     }
                 }
@@ -1399,6 +1414,48 @@ impl AppView {
         cx.notify();
     }
 
+    /// Puts the current results in the separate native window (§32.3). One window is kept and
+    /// refreshed in place; a run only opens another when the user has closed the last one, which
+    /// `update` reports by failing.
+    fn show_results_in_window(&mut self, cx: &mut Context<Self>) {
+        let results = self.editor.results.clone();
+        let display = self.editor.display;
+        let refreshed = self.result_window.is_some_and(|handle| {
+            handle
+                .update(cx, |window, _, cx| {
+                    window.results = results.clone();
+                    window.display = display;
+                    cx.notify();
+                })
+                .is_ok()
+        });
+        if refreshed {
+            return;
+        }
+        let fonts = self.fonts.clone();
+        let bounds = Bounds::centered(None, size(px(900.), px(600.)), cx);
+        self.result_window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("SQL Results".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    cx.new(|_| ResultWindow {
+                        results,
+                        display,
+                        fonts,
+                        scroll: ScrollState::default(),
+                    })
+                },
+            )
+            .ok();
+    }
+
     fn show_editor_tab(&mut self, cx: &mut Context<Self>) {
         self.active_result_tab = false;
         cx.notify();
@@ -1548,6 +1605,36 @@ impl AppView {
         if self.editor.set_row_limit(new).is_ok() {
             cx.notify();
         }
+    }
+
+    /// Opens the row-limit field for typing. The steps below only move by a factor of ten, so
+    /// values such as 20 or 50 are reachable this way alone (§26).
+    fn edit_limit(&mut self, cx: &mut Context<Self>) {
+        self.limit_buffer = Some(String::new());
+        self.status = format!("Row limit 1–{}; enter to apply", crate::MAX_ROW_LIMIT);
+        cx.notify();
+    }
+
+    fn cancel_limit_edit(&mut self, cx: &mut Context<Self>) {
+        self.limit_buffer = None;
+        self.status = format!("Row limit {}", self.editor.row_limit);
+        cx.notify();
+    }
+
+    /// Applies the typed digits. A value outside the permitted range leaves the field open with the
+    /// text still in it, so a mistyped limit can be corrected rather than retyped.
+    fn commit_limit_edit(&mut self, cx: &mut Context<Self>) {
+        let typed = self.limit_buffer.clone().unwrap_or_default();
+        match typed.parse::<u32>() {
+            Ok(limit) if self.editor.set_row_limit(limit).is_ok() => {
+                self.limit_buffer = None;
+                self.status = format!("Row limit {limit}");
+            }
+            _ => {
+                self.status = format!("Row limit must be between 1 and {}", crate::MAX_ROW_LIMIT);
+            }
+        }
+        cx.notify();
     }
 
     fn connection_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2339,27 +2426,114 @@ struct ResultWindow {
     scroll: ScrollState,
 }
 
+impl ResultWindow {
+    fn set_display(&mut self, display: ResultDisplay, cx: &mut Context<Self>) {
+        self.display = display;
+        cx.notify();
+    }
+
+    /// The window for one block of rows, given how many rows precede it. The separate window shows
+    /// the same result sets as the pane, so it has to window them the same way (§41).
+    fn visible_result_rows(&self, before: usize, count: usize, row_height: Pixels) -> VisibleLines {
+        let handle = &self.scroll.handle;
+        visible_rows(
+            before,
+            count,
+            row_height,
+            handle.bounds().size.height,
+            handle.offset().y,
+            RESULT_CHROME_SLOP_ROWS,
+        )
+    }
+
+    /// TABLE / TEXT, so the window is not stuck with whichever mode the editor was in when the
+    /// query ran (§32.4).
+    fn display_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        segmented()
+            .child(segment(
+                &self.fonts,
+                "window-display-table",
+                "TABLE",
+                self.display == ResultDisplay::Table,
+                true,
+                cx.listener(|this, _, _, cx| this.set_display(ResultDisplay::Table, cx)),
+            ))
+            .child(segment(
+                &self.fonts,
+                "window-display-text",
+                "TEXT",
+                self.display == ResultDisplay::Text,
+                true,
+                cx.listener(|this, _, _, cx| this.set_display(ResultDisplay::Text, cx)),
+            ))
+    }
+
+    fn windowed_table(&self, result: &QueryResult, row_index: &mut usize) -> impl IntoElement {
+        let has_header = usize::from(!result.columns.is_empty());
+        let visible = self.visible_result_rows(
+            *row_index,
+            has_header + result.rows.len(),
+            px(RESULT_ROW_HEIGHT),
+        );
+        let mut table = table_shell(&self.fonts).child(row_spacer(visible.above));
+        if has_header == 1 && visible.range.contains(&0) {
+            table = table.child(header_row(result));
+        }
+        for (offset, row) in result.rows.iter().enumerate() {
+            if visible.range.contains(&(offset + has_header)) {
+                table = table.child(data_row(row));
+            }
+        }
+        *row_index += has_header + result.rows.len();
+        table.child(row_spacer(visible.below))
+    }
+
+    fn windowed_text(&self, result: &QueryResult, row_index: &mut usize) -> impl IntoElement {
+        let text = result.as_text();
+        let total = text.lines().count();
+        let visible = self.visible_result_rows(*row_index, total, px(RESULT_LINE_HEIGHT));
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .px_5()
+            .py_3()
+            .min_w_full()
+            .font_family(self.fonts.mono.clone())
+            .text_size(px(RESULT_TEXT_SIZE))
+            .line_height(px(RESULT_LINE_HEIGHT))
+            .child(text_spacer(visible.above));
+        for line in text
+            .lines()
+            .skip(visible.range.start)
+            .take(visible.range.len())
+        {
+            block = block.child(
+                div()
+                    .flex_none()
+                    .h(px(RESULT_LINE_HEIGHT))
+                    .child(line.to_owned()),
+            );
+        }
+        *row_index += total;
+        block.child(text_spacer(visible.below))
+    }
+}
+
 impl Render for ResultWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = div().flex().flex_col().items_start().min_w_full().pt_4();
+        let mut row_index = 0;
         for (index, result) in self.results.iter().enumerate() {
             content = content.child(result_header(&self.fonts, index, result));
             content = match self.display {
-                ResultDisplay::Table => content.child(result_table(&self.fonts, result)),
-                ResultDisplay::Text => content.child(
-                    div()
-                        .px_5()
-                        .py_3()
-                        .font_family(self.fonts.mono.clone())
-                        .text_size(px(13.))
-                        .line_height(px(22.))
-                        .child(result.as_text()),
-                ),
+                ResultDisplay::Table => content.child(self.windowed_table(result, &mut row_index)),
+                ResultDisplay::Text => content.child(self.windowed_text(result, &mut row_index)),
             };
         }
         div()
             .size_full()
             .flex()
+            .flex_col()
             .bg(rgb(BACKGROUND))
             .text_color(rgb(TEXT))
             .font_family(self.fonts.body.clone())
@@ -2376,13 +2550,33 @@ impl Render for ResultWindow {
                     }
                 }),
             )
-            .child(scrollable(
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_3()
+                    .px_5()
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_family(self.fonts.mono.clone())
+                            .text_color(rgb(MUTED))
+                            .child("RESULTS"),
+                    )
+                    .child(div().flex_1())
+                    .child(self.display_segments(cx)),
+            )
+            .child(div().flex_1().min_h_0().flex().child(scrollable(
                 |view: &mut Self| &mut view.scroll,
                 &self.scroll,
                 "separate-results-scroll",
                 content,
                 cx,
-            ))
+            )))
     }
 }
 
@@ -2396,6 +2590,7 @@ impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.connection_state == ConnectionState::Connected;
         let running = self.is_running();
+        let editing_limit = self.limit_buffer.is_some();
         let pane_visible =
             self.editor.destination == ResultDestination::Pane && !self.active_result_tab;
         div()
@@ -2700,11 +2895,25 @@ impl Render for AppView {
                                             ))
                                             .child(
                                                 div()
-                                                    .min_w(px(44.))
+                                                    .id("limit-value")
+                                                    .min_w(px(56.))
                                                     .text_center()
                                                     .text_size(px(15.))
                                                     .font_family(self.fonts.mono.clone())
-                                                    .child(self.editor.row_limit.to_string()),
+                                                    .cursor_text()
+                                                    .when(editing_limit, |field| {
+                                                        field.text_color(rgb(ACCENT))
+                                                    })
+                                                    .hover(|style| style.text_color(rgb(ACCENT)))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.edit_limit(cx)
+                                                    }))
+                                                    .child(match self.limit_buffer.as_deref() {
+                                                        // A caret stands in for an empty field so
+                                                        // it does not read as a blank control.
+                                                        Some(typed) => format!("{typed}▏"),
+                                                        None => self.editor.row_limit.to_string(),
+                                                    }),
                                             )
                                             .child(icon_button(
                                                 "limit-up",
@@ -3043,6 +3252,26 @@ fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl Into
                 .automatic_limit
                 .map(|limit| metric_pill(fonts, format!("auto limit {limit}"), STRING)),
         )
+        // Notices are shown in full by the text view; the header only has to say one arrived, so a
+        // long one cannot push the metrics off the row (§40).
+        .children(notice_summary(&result.notices).map(|summary| metric_pill(fonts, summary, WARN)))
+}
+
+/// What the result header says about the notices a statement raised: the notice itself when there
+/// is one, a count when there are several.
+fn notice_summary(notices: &[String]) -> Option<String> {
+    match notices {
+        [] => None,
+        [only] => Some(truncated(only, 72)),
+        many => Some(format!("{} notices", many.len())),
+    }
+}
+
+fn truncated(text: &str, characters: usize) -> String {
+    match text.char_indices().nth(characters) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_owned(),
+    }
 }
 
 /// The grid shell. `flex_none` here and on the cells keeps the grid at its intrinsic width so it
@@ -3108,18 +3337,6 @@ fn data_row(values: &[CellValue]) -> gpui::Div {
         );
     }
     row
-}
-
-/// The read-only grid used by the separate results window.
-fn result_table(fonts: &Fonts, result: &QueryResult) -> impl IntoElement {
-    let mut table = table_shell(fonts);
-    if !result.columns.is_empty() {
-        table = table.child(header_row(result));
-    }
-    for row in &result.rows {
-        table = table.child(data_row(row));
-    }
-    table
 }
 
 fn completion_status(results: &[QueryResult]) -> String {
@@ -5216,5 +5433,198 @@ mod tests {
         );
         // Not while a query is in flight, matching what close_active_editor itself refuses.
         assert_eq!(shortcut_command("w", true, false, false, true, true), None);
+    }
+
+    /// Table mode shows no notice text of its own, so the header has to say one arrived — without
+    /// letting a long notice push the row counts off the row (§40).
+    #[test]
+    fn the_header_reports_notices_without_letting_them_run_away() {
+        assert_eq!(notice_summary(&[]), None);
+        assert_eq!(
+            notice_summary(&["NOTICE: nothing to do".to_owned()]),
+            Some("NOTICE: nothing to do".to_owned())
+        );
+        assert_eq!(
+            notice_summary(&["NOTICE: one".to_owned(), "WARNING: two".to_owned()]),
+            Some("2 notices".to_owned())
+        );
+
+        let long = notice_summary(&["NOTICE: ".to_owned() + &"x".repeat(200)])
+            .expect("a single notice should be summarised");
+        assert_eq!(long.chars().count(), 73, "72 characters and an ellipsis");
+    }
+
+    /// Multibyte notices must not be sliced through a character.
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        assert_eq!(truncated("ünïcödé", 3), "ünï…");
+        assert_eq!(truncated("short", 20), "short");
+    }
+
+    /// One window, refreshed. Opening a fresh native window per run leaves the user closing a
+    /// trail of stale result windows (§32.3).
+    #[gpui::test]
+    fn a_second_run_refreshes_the_open_result_window(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        let first = view.update(cx, |app, cx| {
+            app.editor.results = vec![result_with_rows(&["one"])];
+            app.show_results_in_window(cx);
+            app.result_window.expect("a result window should be open")
+        });
+        let second = view.update(cx, |app, cx| {
+            app.editor.results = vec![result_with_rows(&["one", "two"])];
+            app.editor.display = ResultDisplay::Text;
+            app.show_results_in_window(cx);
+            app.result_window
+                .expect("the result window should still be open")
+        });
+
+        assert_eq!(first, second, "the second run should reuse the same window");
+        let (rows, display) = view.update(cx, |_, cx| {
+            second
+                .update(cx, |window, _, _| {
+                    (window.results[0].rows.len(), window.display)
+                })
+                .expect("the window should still be readable")
+        });
+        assert_eq!(rows, 2, "the window should show the newest results");
+        assert_eq!(display, ResultDisplay::Text);
+    }
+
+    /// The separate window can be handed a result as large as the row limit allows, so it windows
+    /// its rows exactly as the pane does rather than building every one of them (§41).
+    #[gpui::test]
+    fn the_result_window_builds_only_a_window_of_a_large_grid(cx: &mut TestAppContext) {
+        let count = 50_000usize;
+        let owned: Vec<String> = (0..count).map(|row| format!("row {row}")).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let result = result_with_rows(&refs);
+        let (window, cx) = cx.add_window_view(|_, cx| ResultWindow {
+            results: vec![result],
+            display: ResultDisplay::Table,
+            fonts: Fonts::resolve(cx),
+            scroll: ScrollState::default(),
+        });
+        cx.simulate_resize(size(px(900.), px(600.)));
+        cx.run_until_parked();
+
+        window.update(cx, |window, _| {
+            let built = window
+                .visible_result_rows(0, count + 1, px(RESULT_ROW_HEIGHT))
+                .range
+                .len();
+            assert!(
+                built < 200,
+                "a 50 000 row grid should build a screenful, built {built}"
+            );
+            // The spacers still have to account for every row, or the scrollbar lies.
+            let content = window.scroll.handle.max_offset().height
+                + window.scroll.handle.bounds().size.height;
+            let expected = px(RESULT_ROW_HEIGHT * (count + 1) as f32);
+            assert!(
+                (f32::from(content) - f32::from(expected)).abs() < RESULT_ROW_HEIGHT * 4.,
+                "the spacers should preserve the full scroll height: {content:?} vs {expected:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_result_window_switches_between_table_and_text(cx: &mut TestAppContext) {
+        let (window, cx) = cx.add_window_view(|_, cx| ResultWindow {
+            results: vec![result_with_rows(&["one"])],
+            display: ResultDisplay::Table,
+            fonts: Fonts::resolve(cx),
+            scroll: ScrollState::default(),
+        });
+
+        window.update(cx, |window, cx| window.set_display(ResultDisplay::Text, cx));
+
+        window.update(cx, |window, _| {
+            assert_eq!(window.display, ResultDisplay::Text);
+        });
+    }
+
+    /// The ± steps move by a factor of ten, so 20 and 50 are only reachable by typing them (§26).
+    #[gpui::test]
+    fn a_typed_row_limit_reaches_a_value_the_steps_cannot(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| app.edit_limit(cx));
+
+        cx.simulate_input("20");
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.row_limit, 20);
+            assert!(app.limit_buffer.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn a_row_limit_outside_the_permitted_range_is_refused(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| app.edit_limit(cx));
+
+        cx.simulate_input("0");
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.row_limit, crate::DEFAULT_ROW_LIMIT);
+            // The edit stays open so the user can correct it rather than retype from scratch.
+            assert_eq!(app.limit_buffer.as_deref(), Some("0"));
+            assert!(app.status.contains("1"), "status should name the range");
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_into_the_document_leaves_the_row_limit_field(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1".into();
+            app.edit_limit(cx);
+            app.click_editor(0, px(0.), false, cx);
+        });
+
+        cx.simulate_input("x");
+
+        view.update(cx, |app, _| {
+            assert!(app.limit_buffer.is_none());
+            assert!(
+                app.editor.document.contains('x'),
+                "typing should reach the document again"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn abandoning_a_row_limit_edit_keeps_the_previous_value(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| app.edit_limit(cx));
+
+        cx.simulate_input("500");
+        cx.simulate_keystrokes("escape");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.row_limit, crate::DEFAULT_ROW_LIMIT);
+            assert!(app.limit_buffer.is_none());
+        });
+    }
+
+    /// The limit field has no focus handle of its own, so the key handler has to hold the keys
+    /// away from the SQL document while it is open.
+    #[gpui::test]
+    fn keys_typed_into_the_row_limit_never_reach_the_document(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| app.edit_limit(cx));
+
+        cx.simulate_input("7x5");
+        cx.simulate_keystrokes("backspace");
+        cx.simulate_keystrokes("enter");
+
+        view.update(cx, |app, _| {
+            assert!(app.editor.document.is_empty());
+            // The stray letter is dropped rather than ending the edit or being typed in.
+            assert_eq!(app.editor.row_limit, 7);
+        });
     }
 }

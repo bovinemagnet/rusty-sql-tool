@@ -110,6 +110,10 @@ impl QueryResult {
             output.push_str(tag);
             output.push('\n');
         }
+        for notice in &self.notices {
+            output.push_str(notice);
+            output.push('\n');
+        }
         let _ = write!(
             output,
             "\nStatus: {:?} · {} ms",
@@ -174,5 +178,30 @@ mod tests {
         };
 
         assert!(result.as_text().starts_with("value\nNULL\n\nNULL\n"));
+    }
+
+    /// `RAISE NOTICE` output is part of what the statement produced, so it travels with the result
+    /// rather than being dropped on the floor (§40).
+    #[test]
+    fn server_notices_are_rendered_with_the_result() {
+        let result = QueryResult {
+            notices: vec![
+                "NOTICE: relation \"customer\" already exists, skipping".into(),
+                "WARNING: nothing to do".into(),
+            ],
+            command_tag: Some("CREATE TABLE".into()),
+            ..Default::default()
+        };
+
+        let text = result.as_text();
+        assert!(
+            text.contains("NOTICE: relation \"customer\" already exists, skipping"),
+            "the notice should be readable in the text view: {text}"
+        );
+        assert!(text.contains("WARNING: nothing to do"));
+        // Still one status line, and the notices come above it rather than after the summary.
+        let notice_line = text.find("WARNING").expect("the notice should be present");
+        let status_line = text.find("Status:").expect("the status should be present");
+        assert!(notice_line < status_line);
     }
 }

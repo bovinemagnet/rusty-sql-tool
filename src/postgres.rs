@@ -9,7 +9,7 @@ use rustls::crypto::CryptoProvider;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode as DriverSslMode;
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
+use tokio_postgres::{AsyncMessage, Client, Config, NoTls, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::config::{ConnectionProfile, SslMode};
@@ -22,6 +22,9 @@ struct Session {
     client: Arc<Client>,
     connection_task: JoinHandle<()>,
     ssl_mode: SslMode,
+    /// Notices the server raised on this connection, filled by the connection task and drained by
+    /// the statement they belong to (§40).
+    notices: Arc<Mutex<Vec<String>>>,
 }
 
 /// PostgreSQL implementation. GPUI never receives any type from this module (59.2, 59.4).
@@ -87,12 +90,26 @@ impl PostgresProvider {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (client, connection) =
+        let (client, mut connection) =
             result.map_err(|error| safe_error(&error, "connection failed"))?;
+        let notices: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = notices.clone();
         let connection_task = tokio::spawn(async move {
+            // Driving the connection message by message rather than awaiting it whole is what makes
+            // notices reachable at all. Messages are handled in order, so a notice is recorded
+            // before the response that ends the statement it belongs to.
+            //
             // Connection errors change observable command results; they are intentionally not
             // logged here because driver messages can contain sensitive server information.
-            let _ = connection.await;
+            while let Some(Ok(message)) =
+                std::future::poll_fn(|context| connection.poll_message(context)).await
+            {
+                if let AsyncMessage::Notice(notice) = message {
+                    sink.lock()
+                        .await
+                        .push(notice_line(notice.severity(), notice.message()));
+                }
+            }
         });
         let row = client
             .query_one("SELECT current_database(), version()", &[])
@@ -106,6 +123,7 @@ impl PostgresProvider {
             client: Arc::new(client),
             connection_task,
             ssl_mode,
+            notices,
         });
         self.set_state(ConnectionState::Connected);
         Ok(info)
@@ -134,6 +152,21 @@ impl PostgresProvider {
         operation(&client)
             .await
             .map_err(|error| safe_error(&error, "PostgreSQL operation failed"))
+    }
+
+    /// Takes whatever the server has raised so far, leaving the buffer empty for the next
+    /// statement. Notices are not logged: they are query output, and §44 keeps that out of the log.
+    async fn take_notices(&self) -> Vec<String> {
+        let buffer = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.notices.clone());
+        match buffer {
+            Some(notices) => std::mem::take(&mut *notices.lock().await),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -223,6 +256,9 @@ impl DatabaseProvider for PostgresProvider {
     async fn execute(&self, sql: &str) -> Result<QueryResult, QueryError> {
         let started = Instant::now();
         tracing::debug!(statement = %crate::logging::statement(sql), "executing");
+        // Anything left over belongs to an earlier statement and must not be reported against
+        // this one.
+        let _ = self.take_notices().await;
         let outcome = self
             .with_client(async |client| {
                 let statement = client.prepare(sql).await?;
@@ -274,9 +310,11 @@ impl DatabaseProvider for PostgresProvider {
         match outcome {
             Ok(mut result) => {
                 result.execution_time = started.elapsed();
+                result.notices = self.take_notices().await;
                 tracing::info!(
                     rows = result.rows.len(),
                     affected_rows = ?result.affected_rows,
+                    notices = result.notices.len(),
                     elapsed_ms = result.execution_time.as_millis(),
                     "statement completed"
                 );
@@ -448,6 +486,12 @@ fn command_name(sql: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// A server notice as the result carries it: severity first, so `NOTICE` and `WARNING` are told
+/// apart in the text view without a second field.
+fn notice_line(severity: &str, message: &str) -> String {
+    format!("{severity}: {message}")
+}
+
 fn simple_error(message: &str) -> QueryError {
     QueryError {
         message: message.to_owned(),
@@ -479,6 +523,18 @@ fn safe_error(error: &tokio_postgres::Error, fallback: &str) -> QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_notice_keeps_its_severity_alongside_its_message() {
+        assert_eq!(
+            notice_line("NOTICE", "relation \"customer\" already exists, skipping"),
+            "NOTICE: relation \"customer\" already exists, skipping"
+        );
+        assert_eq!(
+            notice_line("WARNING", "nothing to do"),
+            "WARNING: nothing to do"
+        );
+    }
 
     #[test]
     fn maps_common_postgres_values_without_driver_types() {
