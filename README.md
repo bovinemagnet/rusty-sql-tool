@@ -69,6 +69,26 @@ required by section 51. Current bindings are:
 
 Normal editor copy, cut, paste, select-all, undo, and redo shortcuts are also supported.
 
+## Logging
+
+Logs are written to standard error (section 44). Verbosity is set with `RUSTY_SQL_LOG`, which
+accepts a level or a per-target filter and defaults to `info`:
+
+```bash
+RUSTY_SQL_LOG=debug cargo run
+RUSTY_SQL_LOG='rusty_sql_tool=trace,tokio_postgres=warn' cargo run
+```
+
+SQL statement text is **withheld by default**, because a statement can itself contain sensitive
+values. Log it in full only when you need to, with:
+
+```bash
+RUSTY_SQL_LOG=debug RUSTY_SQL_LOG_SQL=1 cargo run
+```
+
+Passwords, connection URLs containing passwords, and result rows are never logged at any level
+(FR-033, sections 43 and 44). Statements log counts and durations, not their contents.
+
 ## Verify
 
 ```bash

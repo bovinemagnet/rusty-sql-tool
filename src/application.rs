@@ -135,6 +135,13 @@ impl CommandService {
         let sql = relevant_sql(&editor.document, editor.selection.clone(), editor.cursor)
             .map_err(query_selection_error)?;
         let prepared = prepare_statement(sql, editor.row_limit).map_err(query_selection_error)?;
+        // The limit decision is invisible from the provider, and FR-018/FR-020 are exactly the
+        // rules a user will want to check when a result set surprises them.
+        tracing::debug!(
+            row_limit = editor.row_limit,
+            automatic_limit = ?prepared.automatic_limit,
+            "prepared statement"
+        );
         editor.execution_status = ExecutionStatus::Running;
         editor.error = None;
         match self.provider.execute(&prepared.sql).await {

@@ -6,6 +6,7 @@
 pub mod application;
 pub mod config;
 pub mod database;
+pub mod logging;
 pub mod postgres;
 pub mod result;
 pub mod sql;

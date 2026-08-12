@@ -153,6 +153,18 @@ impl DatabaseProvider for PostgresProvider {
     async fn connect(&self, profile: &ConnectionProfile) -> Result<ConnectionInfo, QueryError> {
         self.disconnect().await?;
         self.set_state(ConnectionState::Connecting);
+        let target = &profile.configuration;
+        // Host, port, database and user identify the attempt; the password is not logged and the
+        // URL that would carry it is never assembled (FR-033, §43).
+        tracing::info!(
+            connection = %profile.name,
+            host = %target.host,
+            port = target.port,
+            database = %target.database,
+            user = %target.username,
+            ssl_mode = ?target.ssl_mode,
+            "connecting"
+        );
         let config = Self::driver_config(profile);
         let result = match profile.configuration.ssl_mode {
             SslMode::Disable => {
@@ -174,8 +186,21 @@ impl DatabaseProvider for PostgresProvider {
                 .await
             }
         };
-        if result.is_err() {
-            self.set_state(ConnectionState::Failed);
+        match &result {
+            Ok(info) => tracing::info!(
+                database = %info.database,
+                server_version = %info.server_version,
+                "connected"
+            ),
+            Err(error) => {
+                self.set_state(ConnectionState::Failed);
+                tracing::warn!(
+                    connection = %profile.name,
+                    database = %target.database,
+                    error = %error,
+                    "connection failed"
+                );
+            }
         }
         result
     }
@@ -191,12 +216,14 @@ impl DatabaseProvider for PostgresProvider {
         *self.schemas_cache.write().await = None;
         self.objects_cache.write().await.clear();
         self.set_state(ConnectionState::Disconnected);
+        tracing::info!("disconnected");
         Ok(())
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult, QueryError> {
         let started = Instant::now();
-        let mut result = self
+        tracing::debug!(statement = %crate::logging::statement(sql), "executing");
+        let outcome = self
             .with_client(async |client| {
                 let statement = client.prepare(sql).await?;
                 if statement.columns().is_empty() {
@@ -241,12 +268,33 @@ impl DatabaseProvider for PostgresProvider {
                     ..QueryResult::default()
                 })
             })
-            .await?;
-        result.execution_time = started.elapsed();
-        Ok(result)
+            .await;
+        // Counts and timings only. Logging the rows themselves would put database content in the
+        // log, which §44 rules out.
+        match outcome {
+            Ok(mut result) => {
+                result.execution_time = started.elapsed();
+                tracing::info!(
+                    rows = result.rows.len(),
+                    affected_rows = ?result.affected_rows,
+                    elapsed_ms = result.execution_time.as_millis(),
+                    "statement completed"
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "statement failed"
+                );
+                Err(error)
+            }
+        }
     }
 
     async fn cancel(&self) -> Result<(), QueryError> {
+        tracing::info!("cancelling the running statement");
         let (token, ssl_mode) = self
             .session
             .lock()
@@ -286,6 +334,7 @@ impl DatabaseProvider for PostgresProvider {
                 Ok(rows.into_iter().map(|row| row.get(0)).collect())
             })
             .await?;
+        tracing::debug!(count = schemas.len(), refresh, "loaded schemas");
         *self.schemas_cache.write().await = Some(schemas.clone());
         Ok(schemas)
     }
@@ -341,6 +390,12 @@ impl DatabaseProvider for PostgresProvider {
                     .collect())
             })
             .await?;
+        tracing::debug!(
+            schema,
+            count = objects.len(),
+            refresh,
+            "loaded schema objects"
+        );
         self.objects_cache
             .write()
             .await
@@ -445,5 +500,107 @@ mod tests {
     fn installs_explicit_rustls_provider_when_multiple_backends_are_enabled() {
         assert!(ensure_rustls_crypto_provider());
         assert!(CryptoProvider::get_default().is_some());
+    }
+
+    /// Collects everything logged on this thread while `body` runs, so a test can assert on the
+    /// real subscriber output rather than on what the call sites were supposed to write.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_logs(body: impl FnOnce()) -> String {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let captured = logs.0.lock().unwrap().clone();
+        String::from_utf8(captured).expect("log output should be text")
+    }
+
+    fn unreachable_profile(password: &str) -> ConnectionProfile {
+        ConnectionProfile::manual(
+            "Test",
+            crate::config::PostgresConfiguration {
+                host: "127.0.0.1".into(),
+                // Nothing listens on port 1, so the attempt is refused immediately.
+                port: 1,
+                database: "example_db".into(),
+                username: "someone".into(),
+                password: crate::config::SecretString::new(password),
+                ssl_mode: SslMode::Disable,
+            },
+        )
+    }
+
+    /// §44: SQL may itself contain sensitive values, so the statement text is withheld unless it
+    /// has been explicitly enabled.
+    #[test]
+    fn a_statement_is_not_logged_verbatim_by_default() {
+        let logs = captured_logs(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the attempt");
+            let provider = PostgresProvider::new();
+            // Disconnected, so this fails at once — the statement is logged on the way in.
+            let _ = runtime.block_on(provider.execute("SELECT nhs_number FROM patient"));
+        });
+
+        assert!(
+            logs.contains("executing"),
+            "the statement should be logged at all, got:\n{logs}"
+        );
+        if !crate::logging::sql_logging_enabled() {
+            assert!(
+                !logs.contains("patient"),
+                "the statement text leaked with SQL logging disabled:\n{logs}"
+            );
+        }
+    }
+
+    /// FR-033 and §43: a failed connection is exactly where a driver error is most likely to carry
+    /// the connection string, so the failure must be logged without the password reaching the log.
+    #[test]
+    fn a_failed_connection_is_logged_without_the_password() {
+        let password = "hunter2-must-never-be-logged";
+        let profile = unreachable_profile(password);
+
+        let logs = captured_logs(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the attempt");
+            let provider = PostgresProvider::new();
+            let error = runtime
+                .block_on(provider.connect(&profile))
+                .expect_err("nothing is listening on port 1");
+            assert!(
+                !error.to_string().contains(password),
+                "the password reached the error message: {error}"
+            );
+        });
+
+        assert!(
+            logs.contains("example_db"),
+            "the failed connection should be logged with its safe context, got:\n{logs}"
+        );
+        assert!(
+            !logs.contains(password),
+            "the password appeared in the log output:\n{logs}"
+        );
     }
 }
