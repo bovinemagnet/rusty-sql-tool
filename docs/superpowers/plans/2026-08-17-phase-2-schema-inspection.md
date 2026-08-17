@@ -1246,9 +1246,9 @@ fn a_routine_renders_its_signature_and_body() {
         DefinitionSection::Rows {
             heading: "Signature".into(),
             lines: vec![
-                "Arguments    a integer, b integer".into(),
-                "Returns      integer".into(),
-                "Language     sql".into(),
+                "Arguments  a integer, b integer".into(),
+                "Returns    integer".into(),
+                "Language   sql".into(),
             ],
         }
     );
@@ -1271,7 +1271,7 @@ fn a_routine_renders_its_signature_and_body() {
     };
     assert_eq!(
         lines,
-        &vec!["Arguments".to_owned(), "Language     plpgsql".to_owned()]
+        &vec!["Arguments".to_owned(), "Language   plpgsql".to_owned()]
     );
 }
 ```
@@ -2376,9 +2376,10 @@ Add to `tests/postgres_smoke.rs`, following the existing `#[ignore]` convention:
 #[tokio::test]
 #[ignore = "requires RUSTY_SQL_TEST_DATABASE_URL and a live PostgreSQL server"]
 async fn inspects_a_table_definition_and_sees_a_new_column_after_refresh() {
-    let Some(profile) = test_profile() else {
-        return;
-    };
+    let database_url = std::env::var("RUSTY_SQL_TEST_DATABASE_URL")
+        .expect("RUSTY_SQL_TEST_DATABASE_URL must be set for the live smoke test");
+    let profile = ConnectionProfile::from_database_url(&database_url)
+        .expect("test database URL should be valid");
     let provider = PostgresProvider::new();
     provider.connect(&profile).await.expect("connect");
 
@@ -2441,7 +2442,7 @@ async fn inspects_a_table_definition_and_sees_a_new_column_after_refresh() {
 }
 ```
 
-Reuse whatever profile helper the existing tests in this file already use; if it is named differently from `test_profile`, use that name rather than adding a second helper.
+This matches the setup the two existing tests in this file already use — there is no shared profile helper, and this task must not add one. Extend the file's `use` list with `rusty_sql_tool::database::{DatabaseObject, ObjectKind}` and `rusty_sql_tool::definition::ObjectDefinition`.
 
 - [ ] **Step 2: Run test to verify it fails**
 

@@ -13,6 +13,9 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Scratch space for plan execution: ledgers, briefs and review packages.
+.superpowers/
+
 # Local database credentials. Keep the documented placeholder file tracked.
 .env
 .env.*
