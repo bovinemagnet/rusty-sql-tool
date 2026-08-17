@@ -345,9 +345,6 @@ mod tests {
             }])
         }
 
-        // `TableDefinition` currently has one field; the struct-update syntax stays ready for the
-        // constraint and index fields Tasks 4-5 add.
-        #[allow(clippy::needless_update)]
         async fn definition(
             &self,
             _object: &DatabaseObject,
