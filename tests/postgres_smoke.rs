@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use rusty_sql_tool::application::{CommandService, EditorState};
 use rusty_sql_tool::config::{ConnectionProfile, SecretString};
-use rusty_sql_tool::database::{ConnectionState, DatabaseProvider};
+use rusty_sql_tool::database::{ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind};
+use rusty_sql_tool::definition::ObjectDefinition;
 use rusty_sql_tool::postgres::PostgresProvider;
 use rusty_sql_tool::result::CellValue;
 
@@ -167,4 +168,78 @@ async fn connection_failure_is_safe_and_recoverable() {
         .await
         .expect("failed provider should disconnect cleanly");
     assert_eq!(provider.state(), ConnectionState::Disconnected);
+}
+
+/// The Phase 2 acceptance scenario (§14), against a real server. Ignored by default because it
+/// needs one; run with RUSTY_SQL_TEST_DATABASE_URL set.
+#[tokio::test]
+#[ignore = "requires RUSTY_SQL_TEST_DATABASE_URL and a live PostgreSQL server"]
+async fn inspects_a_table_definition_and_sees_a_new_column_after_refresh() {
+    let database_url = std::env::var("RUSTY_SQL_TEST_DATABASE_URL")
+        .expect("RUSTY_SQL_TEST_DATABASE_URL must be set for the live smoke test");
+    let profile = ConnectionProfile::from_database_url(&database_url)
+        .expect("test database URL should be valid");
+    let provider = PostgresProvider::new();
+    provider.connect(&profile).await.expect("connect");
+
+    provider
+        .execute("DROP TABLE IF EXISTS rusty_sql_definition_test")
+        .await
+        .expect("drop");
+    provider
+        .execute(
+            "CREATE TABLE rusty_sql_definition_test (\
+               id bigint PRIMARY KEY, \
+               email varchar(320) NOT NULL, \
+               active boolean NOT NULL DEFAULT true)",
+        )
+        .await
+        .expect("create");
+
+    let object = DatabaseObject {
+        schema: "public".into(),
+        name: "rusty_sql_definition_test".into(),
+        kind: ObjectKind::Table,
+    };
+
+    let ObjectDefinition::Table(table) = provider
+        .definition(&object, true)
+        .await
+        .expect("definition")
+    else {
+        panic!("expected a table definition");
+    };
+    assert_eq!(
+        table
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "email", "active"]
+    );
+    assert_eq!(table.columns[1].data_type, "character varying(320)");
+    assert!(!table.columns[1].nullable);
+    assert_eq!(table.columns[2].default.as_deref(), Some("true"));
+    assert!(table.primary_key.is_some());
+    assert!(!table.indexes.is_empty());
+
+    provider
+        .execute("ALTER TABLE rusty_sql_definition_test ADD COLUMN notes text")
+        .await
+        .expect("alter");
+
+    let ObjectDefinition::Table(refreshed) = provider
+        .definition(&object, true)
+        .await
+        .expect("refreshed definition")
+    else {
+        panic!("expected a table definition");
+    };
+    assert_eq!(refreshed.columns.last().unwrap().name, "notes");
+
+    provider
+        .execute("DROP TABLE rusty_sql_definition_test")
+        .await
+        .expect("cleanup");
+    provider.disconnect().await.expect("disconnect");
 }
