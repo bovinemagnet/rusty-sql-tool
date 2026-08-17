@@ -3,6 +3,7 @@ use std::fmt;
 use async_trait::async_trait;
 
 use crate::config::ConnectionProfile;
+use crate::definition::ObjectDefinition;
 use crate::result::{QueryError, QueryResult};
 
 #[repr(u8)]
@@ -64,5 +65,12 @@ pub trait DatabaseProvider: Send + Sync {
     async fn schemas(&self, refresh: bool) -> Result<Vec<String>, QueryError>;
     async fn objects(&self, schema: &str, refresh: bool)
     -> Result<Vec<DatabaseObject>, QueryError>;
+    /// The definition of one object (FR2-011). `refresh` bypasses the session cache, exactly as it
+    /// does for `schemas` and `objects`.
+    async fn definition(
+        &self,
+        object: &DatabaseObject,
+        refresh: bool,
+    ) -> Result<ObjectDefinition, QueryError>;
     fn state(&self) -> ConnectionState;
 }

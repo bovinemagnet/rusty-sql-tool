@@ -3780,6 +3780,7 @@ mod tests {
     use gpui::{Modifiers, TestAppContext};
 
     use crate::database::{ConnectionInfo, DatabaseProvider};
+    use crate::definition::ObjectDefinition;
     use crate::result::QueryError;
 
     #[derive(Default)]
@@ -3831,6 +3832,17 @@ mod tests {
 
         async fn objects(&self, _: &str, _: bool) -> Result<Vec<DatabaseObject>, QueryError> {
             Ok(Vec::new())
+        }
+
+        async fn definition(
+            &self,
+            object: &DatabaseObject,
+            _: bool,
+        ) -> Result<ObjectDefinition, QueryError> {
+            Ok(ObjectDefinition::Unsupported {
+                kind: object.kind,
+                reason: "not stubbed".into(),
+            })
         }
 
         fn state(&self) -> ConnectionState {

@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::config::ConnectionProfile;
 use crate::database::{ConnectionInfo, ConnectionState, DatabaseObject, DatabaseProvider};
+use crate::definition::ObjectDefinition;
 use crate::result::{ExecutionStatus, QueryError, QueryResult};
 use crate::sql::{SqlError, prepare_explain, prepare_statement, relevant_sql, split_statements};
 use crate::{DEFAULT_ROW_LIMIT, MAX_ROW_LIMIT};
@@ -132,6 +133,14 @@ impl CommandService {
         self.provider.objects(schema, refresh).await
     }
 
+    pub async fn definition(
+        &self,
+        object: &DatabaseObject,
+        refresh: bool,
+    ) -> Result<ObjectDefinition, QueryError> {
+        self.provider.definition(object, refresh).await
+    }
+
     pub async fn run(&self, editor: &mut EditorState) -> Result<QueryResult, QueryError> {
         let sql = relevant_sql(&editor.document, editor.selection.clone(), editor.cursor)
             .map_err(query_selection_error)?;
@@ -255,6 +264,7 @@ mod tests {
     use super::*;
     use crate::config::{PostgresConfiguration, SecretString, SslMode};
     use crate::database::ObjectKind;
+    use crate::definition::{ColumnDefinition, ObjectDefinition, TableDefinition};
 
     struct FakeProvider {
         statements: Mutex<Vec<String>>,
@@ -333,6 +343,26 @@ mod tests {
                 name: "customer".into(),
                 kind: ObjectKind::Table,
             }])
+        }
+
+        // `TableDefinition` currently has one field; the struct-update syntax stays ready for the
+        // constraint and index fields Tasks 4-5 add.
+        #[allow(clippy::needless_update)]
+        async fn definition(
+            &self,
+            _object: &DatabaseObject,
+            _refresh: bool,
+        ) -> Result<ObjectDefinition, QueryError> {
+            Ok(ObjectDefinition::Table(TableDefinition {
+                columns: vec![ColumnDefinition {
+                    position: 1,
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    nullable: false,
+                    default: None,
+                }],
+                ..TableDefinition::default()
+            }))
         }
 
         fn state(&self) -> ConnectionState {
@@ -560,5 +590,24 @@ mod tests {
             editor.set_row_limit(MAX_ROW_LIMIT + 1),
             Err(SqlError::InvalidLimit)
         );
+    }
+
+    /// FR2-011: definitions travel the same command path as every other metadata request.
+    #[tokio::test]
+    async fn definitions_are_retrieved_through_the_command_service() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider);
+        let object = DatabaseObject {
+            schema: "public".into(),
+            name: "customer".into(),
+            kind: ObjectKind::Table,
+        };
+
+        let definition = service.definition(&object, false).await.unwrap();
+
+        let ObjectDefinition::Table(table) = definition else {
+            panic!("expected a table definition");
+        };
+        assert_eq!(table.columns[0].name, "id");
     }
 }

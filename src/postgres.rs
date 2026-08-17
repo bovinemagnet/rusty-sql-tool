@@ -16,7 +16,29 @@ use crate::config::{ConnectionProfile, SslMode};
 use crate::database::{
     ConnectionInfo, ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind,
 };
+use crate::definition::{ObjectDefinition, TableDefinition};
 use crate::result::{CellValue, Column, ExecutionStatus, QueryError, QueryResult};
+
+mod catalogue;
+
+/// Identity of a cached definition. Kind is part of the key because a table and a function may
+/// share a name within one schema.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DefinitionKey {
+    schema: String,
+    name: String,
+    kind: ObjectKind,
+}
+
+impl DefinitionKey {
+    fn of(object: &DatabaseObject) -> Self {
+        Self {
+            schema: object.schema.clone(),
+            name: object.name.clone(),
+            kind: object.kind,
+        }
+    }
+}
 
 struct Session {
     client: Arc<Client>,
@@ -33,6 +55,7 @@ pub struct PostgresProvider {
     state: AtomicU8,
     schemas_cache: RwLock<Option<Vec<String>>>,
     objects_cache: RwLock<HashMap<String, Vec<DatabaseObject>>>,
+    definitions_cache: RwLock<HashMap<DefinitionKey, ObjectDefinition>>,
 }
 
 impl Default for PostgresProvider {
@@ -42,6 +65,7 @@ impl Default for PostgresProvider {
             state: AtomicU8::new(ConnectionState::Disconnected as u8),
             schemas_cache: RwLock::new(None),
             objects_cache: RwLock::new(HashMap::new()),
+            definitions_cache: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -168,6 +192,36 @@ impl PostgresProvider {
             None => Vec::new(),
         }
     }
+
+    /// Runs only the catalogue queries the object's kind requires. Later tasks add arms; anything
+    /// still unhandled reports itself rather than rendering blank (§5).
+    // `TableDefinition` currently has one field; the struct-update syntax stays ready for the
+    // constraint and index fields Tasks 4-5 add.
+    #[allow(clippy::needless_update)]
+    async fn load_definition(
+        &self,
+        object: &DatabaseObject,
+    ) -> Result<ObjectDefinition, QueryError> {
+        match object.kind {
+            ObjectKind::Table => {
+                let columns = self
+                    .with_client(async |client| {
+                        client
+                            .query(catalogue::COLUMNS, &[&object.schema, &object.name])
+                            .await
+                    })
+                    .await?;
+                Ok(ObjectDefinition::Table(TableDefinition {
+                    columns: catalogue::columns(&columns),
+                    ..TableDefinition::default()
+                }))
+            }
+            kind => Ok(ObjectDefinition::Unsupported {
+                kind,
+                reason: "PostgreSQL provides no definition for this object".into(),
+            }),
+        }
+    }
 }
 
 /// GPUI and the PostgreSQL TLS adapter enable different Rustls crypto backends.
@@ -248,6 +302,7 @@ impl DatabaseProvider for PostgresProvider {
         }
         *self.schemas_cache.write().await = None;
         self.objects_cache.write().await.clear();
+        self.definitions_cache.write().await.clear();
         self.set_state(ConnectionState::Disconnected);
         tracing::info!("disconnected");
         Ok(())
@@ -439,6 +494,31 @@ impl DatabaseProvider for PostgresProvider {
             .await
             .insert(schema.to_owned(), objects.clone());
         Ok(objects)
+    }
+
+    async fn definition(
+        &self,
+        object: &DatabaseObject,
+        refresh: bool,
+    ) -> Result<ObjectDefinition, QueryError> {
+        let key = DefinitionKey::of(object);
+        if !refresh && let Some(cached) = self.definitions_cache.read().await.get(&key).cloned() {
+            return Ok(cached);
+        }
+        let definition = self.load_definition(object).await?;
+        // Kind and counts only: an object's contents are database content, which §44 keeps out of
+        // the log.
+        tracing::debug!(
+            schema = %object.schema,
+            kind = ?object.kind,
+            refresh,
+            "loaded object definition"
+        );
+        self.definitions_cache
+            .write()
+            .await
+            .insert(key, definition.clone());
+        Ok(definition)
     }
 
     fn state(&self) -> ConnectionState {
