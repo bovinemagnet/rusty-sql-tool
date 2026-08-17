@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 
 use crate::application::{CommandService, EditorState, ResultDestination, ResultDisplay, command};
 use crate::config::{ConnectionProfile, local_profile};
-use crate::database::{ConnectionState, DatabaseObject, ObjectKind};
+use crate::database::{ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind};
 use crate::postgres::PostgresProvider;
 use crate::result::{CellValue, ExecutionStatus, QueryResult};
 use crate::sql::{Highlight, HighlightSpan, highlight_lines};
@@ -383,17 +383,51 @@ pub fn launch() {
     });
 }
 
-struct AppView {
+/// Everything that belongs to one connection rather than to the workspace: its provider session,
+/// what that session is doing, and the metadata it has loaded. There is one per profile the user
+/// has connected, so two editors can sit on two databases at once (§48, §49).
+struct ConnectionSession {
     service: Arc<CommandService>,
-    runtime: Arc<Runtime>,
-    profiles: Vec<ConnectionProfile>,
-    editor: EditorState,
-    background_editors: Vec<EditorState>,
-    connection_state: ConnectionState,
+    state: ConnectionState,
     server_version: Option<String>,
     schemas: Vec<String>,
     objects: HashMap<String, Vec<DatabaseObject>>,
     expanded_schema: Option<String>,
+}
+
+impl ConnectionSession {
+    fn new(provider: Arc<dyn DatabaseProvider>) -> Self {
+        Self {
+            service: Arc::new(CommandService::new(provider)),
+            state: ConnectionState::Disconnected,
+            server_version: None,
+            schemas: Vec::new(),
+            objects: HashMap::new(),
+            expanded_schema: None,
+        }
+    }
+
+    /// Forgets what the closed session knew. The metadata cache lives in the provider, but the
+    /// tree renders from here, so a reconnect must not repaint the old database's objects.
+    fn clear(&mut self) {
+        self.server_version = None;
+        self.schemas.clear();
+        self.objects.clear();
+        self.expanded_schema = None;
+    }
+}
+
+struct AppView {
+    /// One session per profile the user has connected to, keyed by profile. Built on demand, so a
+    /// profile that has never been used costs nothing.
+    sessions: HashMap<uuid::Uuid, ConnectionSession>,
+    /// How a session's provider is built. Production makes a `PostgresProvider`; the tests
+    /// substitute a fake, which they can no longer do by replacing a single service.
+    provider_factory: Arc<dyn Fn() -> Arc<dyn DatabaseProvider>>,
+    runtime: Arc<Runtime>,
+    profiles: Vec<ConnectionProfile>,
+    editor: EditorState,
+    background_editors: Vec<EditorState>,
     active_result_tab: bool,
     status: String,
     focus_handle: FocusHandle,
@@ -406,9 +440,8 @@ struct AppView {
     /// move by a factor of ten, so this is the only way to reach a value between them (§26).
     limit_buffer: Option<String>,
     fonts: Fonts,
-    /// The profile the single provider session is actually bound to. There is exactly one session,
-    /// so this — not the active editor — is the truth about which database SQL will reach.
-    session_profile: Option<ConnectionProfile>,
+    /// Whether the connection selector's list is open over the workspace.
+    connection_menu: bool,
     /// Whether the profile list came from real configuration rather than the built-in fallback.
     configured: bool,
     editor_scroll: ScrollState,
@@ -524,19 +557,13 @@ impl AppView {
             .first()
             .cloned()
             .expect("at least one connection profile should be available");
-        let provider = PostgresProvider::new();
-        let service = Arc::new(CommandService::new(provider));
         Self {
-            service,
+            sessions: HashMap::new(),
+            provider_factory: Arc::new(|| PostgresProvider::new()),
             runtime: Arc::new(Runtime::new().expect("could not start asynchronous runtime")),
             profiles,
             editor: EditorState::new(profile),
             background_editors: Vec::new(),
-            connection_state: ConnectionState::Disconnected,
-            server_version: None,
-            schemas: Vec::new(),
-            objects: HashMap::new(),
-            expanded_schema: None,
             active_result_tab: false,
             status: "Disconnected · Run a query to see results.".into(),
             focus_handle: cx.focus_handle(),
@@ -546,7 +573,7 @@ impl AppView {
             connection_buffer: String::new(),
             limit_buffer: None,
             fonts,
-            session_profile: None,
+            connection_menu: false,
             configured,
             editor_scroll: ScrollState::default(),
             results_scroll: ScrollState::default(),
@@ -623,9 +650,12 @@ impl AppView {
     /// Places the caret under the pointer and arms a drag selection.
     fn click_editor(&mut self, line: usize, x: Pixels, extend: bool, cx: &mut Context<Self>) {
         // Clicking into the document is a way out of the row-limit field, which otherwise holds
-        // every keystroke it sees.
+        // every keystroke it sees, and out of the connection list.
         if self.limit_buffer.is_some() {
             self.cancel_limit_edit(cx);
+        }
+        if self.connection_menu {
+            self.toggle_connection_menu(cx);
         }
         self.selecting_editor = true;
         let offset = offset_of(&self.editor.document, line, self.editor_column_at(x));
@@ -774,12 +804,10 @@ impl AppView {
             && (self.active_result_tab || self.result_selection.is_some())
     }
 
-    /// The connection SQL will actually run against: the live session when there is one, otherwise
-    /// the target the editor is pointed at.
+    /// The connection SQL will actually run against. Each editor carries its own, so this is the
+    /// active editor's and nothing else's (§49).
     fn target_profile(&self) -> &ConnectionProfile {
-        self.session_profile
-            .as_ref()
-            .unwrap_or(&self.editor.connection)
+        &self.editor.connection
     }
 
     fn target_identity(&self) -> String {
@@ -790,29 +818,71 @@ impl AppView {
         is_busy(self.editor.execution_status)
     }
 
-    /// Binds every editor to the profile the session actually opened, so switching tabs can never
-    /// surface a stale target while one connection is live.
-    fn adopt_session_profile(&mut self, profile: ConnectionProfile) {
-        self.editor.connection = profile.clone();
-        for editor in &mut self.background_editors {
-            editor.connection = profile.clone();
+    /// The session behind a profile, created on first use so an untouched profile never builds a
+    /// provider.
+    fn session_for(&mut self, profile_id: uuid::Uuid) -> &mut ConnectionSession {
+        let factory = self.provider_factory.clone();
+        self.sessions
+            .entry(profile_id)
+            .or_insert_with(|| ConnectionSession::new(factory()))
+    }
+
+    /// The active editor's session, once it has one.
+    fn session(&self) -> Option<&ConnectionSession> {
+        self.sessions.get(&self.editor.connection.id)
+    }
+
+    fn active_session(&mut self) -> &mut ConnectionSession {
+        self.session_for(self.editor.connection.id)
+    }
+
+    fn state_of(&self, profile_id: uuid::Uuid) -> ConnectionState {
+        self.sessions
+            .get(&profile_id)
+            .map_or(ConnectionState::Disconnected, |session| session.state)
+    }
+
+    /// The state of the connection the active editor is pointed at.
+    fn connection_state(&self) -> ConnectionState {
+        self.state_of(self.editor.connection.id)
+    }
+
+    /// The server behind the active editor's connection, blank until it reports one.
+    fn server_version(&self) -> String {
+        self.session()
+            .and_then(|session| session.server_version.clone())
+            .unwrap_or_default()
+    }
+
+    /// Points every editor already targeting this profile at what the session actually opened, so
+    /// no tab can name a database its own session is not using (§49, §50). Editors targeting other
+    /// connections are left alone.
+    fn adopt_connected_profile(&mut self, profile: ConnectionProfile) {
+        for editor in std::iter::once(&mut self.editor).chain(&mut self.background_editors) {
+            if editor.connection.id == profile.id {
+                editor.connection = profile.clone();
+            }
         }
-        self.session_profile = Some(profile);
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
+        self.connect_profile(self.editor.connection.clone(), cx);
+    }
+
+    fn connect_profile(&mut self, profile: ConnectionProfile, cx: &mut Context<Self>) {
+        let profile_id = profile.id;
         if matches!(
-            self.connection_state,
+            self.state_of(profile_id),
             ConnectionState::Connecting | ConnectionState::Connected
         ) {
             return;
         }
-        self.connection_state = ConnectionState::Connecting;
-        self.status = "Connecting…".into();
-        let service = self.service.clone();
+        let session = self.session_for(profile_id);
+        session.state = ConnectionState::Connecting;
+        let service = session.service.clone();
+        self.status = format!("Connecting to {}…", profile.name);
         let runtime = self.runtime.clone();
-        let profile = self.editor.connection.clone();
-        let connected_profile = profile.clone();
+        let connecting_profile = profile.clone();
         cx.spawn(async move |view, cx| {
             let joined = runtime
                 .spawn(async move {
@@ -824,20 +894,21 @@ impl AppView {
             let _ = view.update(cx, |this, cx| {
                 match joined {
                     Ok(Ok((info, schemas))) => {
-                        this.connection_state = ConnectionState::Connected;
-                        this.server_version = Some(info.server_version);
-                        this.schemas = schemas;
-                        // Record what the session is bound to, and point every editor at it so no
-                        // tab can display a target the session is not using (§49, §50).
-                        this.adopt_session_profile(connected_profile);
-                        this.status = format!("Connected: {}", this.target_identity());
+                        let session = this.session_for(profile_id);
+                        session.state = ConnectionState::Connected;
+                        session.server_version = Some(info.server_version);
+                        session.schemas = schemas;
+                        let mut connected = connecting_profile;
+                        connected.configuration.database = info.database;
+                        this.status = format!("Connected: {}", connected.display_identity());
+                        this.adopt_connected_profile(connected);
                     }
                     Ok(Err(error)) => {
-                        this.connection_state = ConnectionState::Failed;
+                        this.session_for(profile_id).state = ConnectionState::Failed;
                         this.status = format!("Connection failed: {error}");
                     }
                     Err(_) => {
-                        this.connection_state = ConnectionState::Failed;
+                        this.session_for(profile_id).state = ConnectionState::Failed;
                         this.status = "Connection task failed".into();
                     }
                 }
@@ -849,33 +920,36 @@ impl AppView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.disconnect_profile(self.editor.connection.id, cx);
+    }
+
+    fn disconnect_profile(&mut self, profile_id: uuid::Uuid, cx: &mut Context<Self>) {
         // Closing the session cancels whatever is in flight and loses its results, so the running
         // query has to finish or be stopped first — the same rule the connection rows enforce.
-        if self.is_running() {
+        if self.is_running() && self.editor.connection.id == profile_id {
             self.status = "Wait for the active query before disconnecting".into();
             cx.notify();
             return;
         }
-        self.connection_state = ConnectionState::Disconnecting;
+        let session = self.session_for(profile_id);
+        session.state = ConnectionState::Disconnecting;
+        let service = session.service.clone();
         self.status = "Disconnecting…".into();
-        let service = self.service.clone();
         let runtime = self.runtime.clone();
         cx.spawn(async move |view, cx| {
             let result = runtime
                 .spawn(async move { service.disconnect().await })
                 .await;
             let _ = view.update(cx, |this, cx| {
+                let session = this.session_for(profile_id);
                 match result {
                     Ok(Ok(())) => {
-                        this.connection_state = ConnectionState::Disconnected;
-                        this.session_profile = None;
-                        this.schemas.clear();
-                        this.objects.clear();
-                        this.expanded_schema = None;
+                        session.state = ConnectionState::Disconnected;
+                        session.clear();
                         this.status = "Disconnected · SQL and results preserved".into();
                     }
                     _ => {
-                        this.connection_state = ConnectionState::Failed;
+                        session.state = ConnectionState::Failed;
                         this.status = "Disconnect failed".into();
                     }
                 }
@@ -886,15 +960,22 @@ impl AppView {
         cx.notify();
     }
 
-    fn load_schema(&mut self, schema: String, refresh: bool, cx: &mut Context<Self>) {
-        if self.expanded_schema.as_deref() == Some(&schema) && !refresh {
-            self.expanded_schema = None;
+    fn load_schema(
+        &mut self,
+        profile_id: uuid::Uuid,
+        schema: String,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.session_for(profile_id);
+        if session.expanded_schema.as_deref() == Some(&schema) && !refresh {
+            session.expanded_schema = None;
             cx.notify();
             return;
         }
-        self.expanded_schema = Some(schema.clone());
+        session.expanded_schema = Some(schema.clone());
+        let service = session.service.clone();
         self.status = format!("Loading {schema}…");
-        let service = self.service.clone();
         let runtime = self.runtime.clone();
         cx.spawn(async move |view, cx| {
             let schema_for_query = schema.clone();
@@ -904,7 +985,9 @@ impl AppView {
             let _ = view.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(objects)) => {
-                        this.objects.insert(schema.clone(), objects);
+                        this.session_for(profile_id)
+                            .objects
+                            .insert(schema.clone(), objects);
                         this.status = format!("Loaded schema {schema}");
                     }
                     Ok(Err(error)) => this.status = format!("Metadata failed: {error}"),
@@ -917,12 +1000,17 @@ impl AppView {
         cx.notify();
     }
 
+    /// Refreshes the metadata of the connection the active editor is using (§17).
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
-        if let Some(schema) = self.expanded_schema.clone() {
-            self.load_schema(schema, true, cx);
+        let profile_id = self.editor.connection.id;
+        if let Some(schema) = self
+            .session()
+            .and_then(|session| session.expanded_schema.clone())
+        {
+            self.load_schema(profile_id, schema, true, cx);
             return;
         }
-        let service = self.service.clone();
+        let service = self.active_session().service.clone();
         let runtime = self.runtime.clone();
         self.status = "Refreshing schemas…".into();
         cx.spawn(async move |view, cx| {
@@ -932,8 +1020,9 @@ impl AppView {
             let _ = view.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(schemas)) => {
-                        this.schemas = schemas;
-                        this.objects.clear();
+                        let session = this.session_for(profile_id);
+                        session.schemas = schemas;
+                        session.objects.clear();
                         this.status = "Metadata refreshed".into();
                     }
                     Ok(Err(error)) => this.status = format!("Refresh failed: {error}"),
@@ -947,13 +1036,18 @@ impl AppView {
     }
 
     fn run(&mut self, mode: RunMode, cx: &mut Context<Self>) {
-        if self.connection_state != ConnectionState::Connected {
-            self.status = "Connect before executing SQL".into();
+        if self.connection_state() != ConnectionState::Connected {
+            self.status = format!(
+                "Connect {} before executing SQL",
+                self.editor.connection.name
+            );
             cx.notify();
             return;
         }
-        // One session means one statement at a time. Guarding here covers every route in — the
-        // toolbar, the shortcuts, and anything added later.
+        // One session means one statement at a time, and a running editor cannot be sent to the
+        // background, so the active editor is the only one that can have a query in flight.
+        // Guarding here covers every route in — the toolbar, the shortcuts, and anything added
+        // later.
         if self.is_running() {
             self.status = "A query is already running".into();
             cx.notify();
@@ -966,7 +1060,7 @@ impl AppView {
             RunMode::Explain => "Explaining statement…",
         }
         .into();
-        let service = self.service.clone();
+        let service = self.active_session().service.clone();
         let runtime = self.runtime.clone();
         let mut editor = self.editor.clone();
         cx.spawn(async move |view, cx| {
@@ -1057,7 +1151,7 @@ impl AppView {
         }
         self.editor.execution_status = ExecutionStatus::Cancelling;
         self.status = "Cancelling…".into();
-        let service = self.service.clone();
+        let service = self.active_session().service.clone();
         let runtime = self.runtime.clone();
         let mut editor = self.editor.clone();
         cx.spawn(async move |view, cx| {
@@ -1140,6 +1234,10 @@ impl AppView {
             }
             return;
         }
+        if self.connection_menu && key == "escape" {
+            self.toggle_connection_menu(cx);
+            return;
+        }
         // The row-limit field has no focus handle of its own, so while it is open the keys are held
         // here rather than reaching the SQL document.
         if let Some(buffer) = self.limit_buffer.as_mut() {
@@ -1170,7 +1268,7 @@ impl AppView {
             modifiers.shift,
             modifiers.alt,
             self.editor.execution_status == ExecutionStatus::Running,
-            self.connection_state == ConnectionState::Connected,
+            self.connection_state() == ConnectionState::Connected,
         ) {
             self.dispatch_command(command_id, cx);
             return;
@@ -1256,8 +1354,15 @@ impl AppView {
         }
     }
 
+    fn toggle_connection_menu(&mut self, cx: &mut Context<Self>) {
+        self.connection_menu = !self.connection_menu;
+        cx.notify();
+    }
+
+    /// Adding a connection is independent of the ones already open — it only retargets the editor
+    /// in front, so a running query is the one thing that blocks it.
     fn configure_connection(&mut self, cx: &mut Context<Self>) {
-        if self.connection_state != ConnectionState::Disconnected {
+        if self.is_running() {
             return;
         }
         self.connection_buffer.clear();
@@ -1529,14 +1634,13 @@ impl AppView {
         }
     }
 
+    /// Points the active editor at a connection (§49). Only this editor moves: the others keep
+    /// their own targets, and no session is opened or closed by the choice itself.
     fn select_connection(&mut self, profile_id: uuid::Uuid, cx: &mut Context<Self>) {
-        if !matches!(
-            self.connection_state,
-            ConnectionState::Disconnected | ConnectionState::Failed
-        ) || matches!(
-            self.editor.execution_status,
-            ExecutionStatus::Running | ExecutionStatus::Cancelling
-        ) {
+        self.connection_menu = false;
+        if self.is_running() {
+            self.status = "Wait for the active query before changing connection".into();
+            cx.notify();
             return;
         }
         if let Some(profile) = self
@@ -1546,48 +1650,48 @@ impl AppView {
             .cloned()
         {
             self.editor.connection = profile;
-            self.schemas.clear();
-            self.objects.clear();
-            self.expanded_schema = None;
             self.status = format!("Target: {}", self.editor.connection_identity());
             cx.notify();
         }
     }
 
-    /// Left-click selects and connects a profile; Alt-click disconnects the active profile
-    /// (FR-004, FR-005). Switching targets while connected remains an explicit operation.
+    /// Left-click points the active editor at a profile and connects it; Alt-click disconnects it
+    /// (FR-004, FR-005). Connections are independent, so this never touches another one.
     fn handle_connection_click(
         &mut self,
         profile_id: uuid::Uuid,
         alt: bool,
         cx: &mut Context<Self>,
     ) {
-        let active = self.editor.connection.id == profile_id;
-        match self.connection_state {
-            ConnectionState::Disconnected | ConnectionState::Failed if !alt => {
-                if matches!(
-                    self.editor.execution_status,
-                    ExecutionStatus::Running | ExecutionStatus::Cancelling
-                ) {
+        match self.state_of(profile_id) {
+            _ if alt => match self.state_of(profile_id) {
+                ConnectionState::Connected | ConnectionState::Failed => {
+                    self.disconnect_profile(profile_id, cx)
+                }
+                _ => {
+                    self.status = "Connection is already disconnected".into();
+                    cx.notify();
+                }
+            },
+            ConnectionState::Disconnected | ConnectionState::Failed => {
+                if self.is_running() {
                     self.status = "Wait for the active query before changing connection".into();
                     cx.notify();
                     return;
                 }
                 self.select_connection(profile_id, cx);
-                self.connect(cx);
-            }
-            ConnectionState::Connected if alt && active => self.disconnect(cx),
-            ConnectionState::Connected if !active => {
-                self.status = "Disconnect the active connection before selecting another".into();
-                cx.notify();
+                if let Some(profile) = self
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+                    .cloned()
+                {
+                    self.connect_profile(profile, cx);
+                }
             }
             ConnectionState::Connected => {
-                self.status = format!("Connected: {}", self.editor.connection_identity());
-                cx.notify();
-            }
-            ConnectionState::Disconnected | ConnectionState::Failed => {
-                self.status = "Connection is already disconnected".into();
-                cx.notify();
+                // Already live: the click just retargets the editor at it.
+                self.select_connection(profile_id, cx);
             }
             ConnectionState::Connecting | ConnectionState::Disconnecting => {
                 self.status = "Connection change already in progress".into();
@@ -1641,15 +1745,12 @@ impl AppView {
         let mut tree = div().flex().flex_col().gap(px(3.));
         for (profile_index, profile) in self.profiles.iter().enumerate() {
             let profile_id = profile.id;
-            // "Connected" is a property of the one session, not of whichever editor is in front.
-            let live = self
-                .session_profile
-                .as_ref()
-                .is_some_and(|session| session.id == profile_id)
-                && self.connection_state == ConnectionState::Connected;
-            let active =
-                live || (self.session_profile.is_none() && profile_id == self.editor.connection.id);
-            let indicator_colour = connection_indicator_colour(active, self.connection_state);
+            // Each profile reports its own session, so several rows can be live at once (§48).
+            let state = self.state_of(profile_id);
+            let live = state == ConnectionState::Connected;
+            // The row the active editor will execute against is the one worth pointing out.
+            let targeted = profile_id == self.editor.connection.id;
+            let indicator_colour = connection_indicator_colour(live || targeted, state);
             tree = tree.child(
                 div()
                     .id(SharedString::from(format!("connection-{profile_id}")))
@@ -1660,7 +1761,7 @@ impl AppView {
                     .px_3()
                     .py(px(11.))
                     .rounded(px(CONTROL_RADIUS))
-                    .when(live, |row| row.bg(rgb(ACCENT_SOFT)))
+                    .when(live || targeted, |row| row.bg(rgb(ACCENT_SOFT)))
                     .text_color(if live { rgb(ACCENT) } else { rgb(MUTED) })
                     .font_family(self.fonts.body.clone())
                     .hover(|style| style.bg(rgb(PANEL)))
@@ -1686,16 +1787,17 @@ impl AppView {
                         profile.configuration.port
                     )),
             );
-            if live {
-                if self.schemas.is_empty() {
+            let session = self.sessions.get(&profile_id);
+            if live && let Some(session) = session {
+                if session.schemas.is_empty() {
                     tree = tree.child(self.tree_caption("No user schemas"));
                 }
-                for schema in &self.schemas {
-                    let selected = self.expanded_schema.as_deref() == Some(schema);
+                for schema in &session.schemas {
+                    let selected = session.expanded_schema.as_deref() == Some(schema);
                     let schema_for_click = schema.clone();
                     tree = tree.child(
                         div()
-                            .id(SharedString::from(format!("schema-{schema}")))
+                            .id(SharedString::from(format!("schema-{profile_id}-{schema}")))
                             .flex()
                             .items_center()
                             .gap_2()
@@ -1708,7 +1810,7 @@ impl AppView {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(PANEL)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.load_schema(schema_for_click.clone(), false, cx)
+                                this.load_schema(profile_id, schema_for_click.clone(), false, cx)
                             }))
                             .child(
                                 div()
@@ -1718,7 +1820,7 @@ impl AppView {
                             .child(schema.clone()),
                     );
                     if selected {
-                        if let Some(objects) = self.objects.get(schema) {
+                        if let Some(objects) = session.objects.get(schema) {
                             for kind in [
                                 ObjectKind::Table,
                                 ObjectKind::View,
@@ -1773,7 +1875,7 @@ impl AppView {
 
     /// The identity card pinned to the foot of the side nav.
     fn server_card(&self, connected: bool) -> impl IntoElement {
-        let version = self.server_version.clone().unwrap_or_default();
+        let version = self.server_version();
         let (headline, detail) = match version.split_once(" on ") {
             Some((product, platform)) => (product.to_owned(), platform.to_owned()),
             None if connected => (version, String::from("Connected")),
@@ -1874,6 +1976,97 @@ impl AppView {
             true,
             cx.listener(|this, _, _, cx| this.dispatch_command(command::NEW_EDITOR, cx)),
         ))
+    }
+
+    /// The editor's connection, and the control that changes it (§49). It sits under the editor
+    /// title where the identity was already displayed, so the target stays visible whether or not
+    /// the list is open.
+    fn connection_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.connection_state();
+        div()
+            .id("connection-selector")
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(13.))
+            .text_color(rgb(MUTED))
+            .cursor_pointer()
+            .hover(|style| style.text_color(rgb(TEXT)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_connection_menu(cx)))
+            .child(
+                div()
+                    .size(px(9.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(rgb(connection_indicator_colour(true, state))),
+            )
+            .child(format!("Connection: {}", self.target_identity()))
+            .child(div().text_color(rgb(FAINT)).child(if self.connection_menu {
+                "▴"
+            } else {
+                "▾"
+            }))
+    }
+
+    /// The list the selector opens: every profile, its state, and which one this editor is on.
+    fn connection_menu_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut card = div()
+            .absolute()
+            .top(px(TITLEBAR_HEIGHT + 74.))
+            .left(px(SIDEBAR_WIDTH + 30.))
+            .w(px(360.))
+            .p(px(8.))
+            .rounded(px(CARD_RADIUS))
+            .bg(rgb(PANEL))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(2.));
+        for profile in &self.profiles {
+            let profile_id = profile.id;
+            let state = self.state_of(profile_id);
+            let chosen = profile_id == self.editor.connection.id;
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!("choose-{profile_id}")))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py(px(10.))
+                    .rounded(px(CONTROL_RADIUS))
+                    .when(chosen, |row| row.bg(rgb(ACCENT_SOFT)))
+                    .text_color(if chosen { rgb(ACCENT) } else { rgb(MUTED) })
+                    .font_family(self.fonts.body.clone())
+                    .text_size(px(13.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(PANEL_LIGHT)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_connection(profile_id, cx)),
+                    )
+                    .child(div().size(px(9.)).flex_none().rounded_full().bg(rgb(
+                        connection_indicator_colour(state == ConnectionState::Connected, state),
+                    )))
+                    .child(div().flex_1().child(profile.display_identity()))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .font_family(self.fonts.mono.clone())
+                            .text_color(rgb(FAINT))
+                            .child(format!("{state:?}").to_uppercase()),
+                    ),
+            );
+        }
+        card.child(
+            div()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_size(px(10.5))
+                .font_family(self.fonts.mono.clone())
+                .text_color(rgb(FAINT))
+                .child("CHOOSING A CONNECTION MOVES THIS EDITOR ONLY"),
+        )
     }
 
     fn display_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2588,7 +2781,7 @@ impl Focusable for AppView {
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let connected = self.connection_state == ConnectionState::Connected;
+        let connected = self.connection_state() == ConnectionState::Connected;
         let running = self.is_running();
         let editing_limit = self.limit_buffer.is_some();
         let pane_visible =
@@ -2668,9 +2861,9 @@ impl Render for AppView {
                             .font_family(self.fonts.mono.clone())
                             .text_color(rgb(MUTED))
                             .child(div().size(px(9.)).rounded_full().bg(rgb(
-                                connection_indicator_colour(true, self.connection_state),
+                                connection_indicator_colour(true, self.connection_state()),
                             )))
-                            .child(format!("{:?}", self.connection_state).to_uppercase()),
+                            .child(format!("{:?}", self.connection_state()).to_uppercase()),
                     ),
             )
             .child(
@@ -2706,7 +2899,7 @@ impl Render for AppView {
                                     .child(icon_button(
                                         "configure-connection",
                                         "＋",
-                                        self.connection_state == ConnectionState::Disconnected,
+                                        !running,
                                         false,
                                         cx.listener(|this, _, _, cx| this.configure_connection(cx)),
                                     ))
@@ -2783,12 +2976,7 @@ impl Render for AppView {
                                             )
                                             // The target connection stays on screen so destructive
                                             // SQL can be checked before it runs (§49, §50).
-                                            .child(
-                                                div()
-                                                    .text_size(px(13.))
-                                                    .text_color(rgb(MUTED))
-                                                    .child(self.target_identity()),
-                                            ),
+                                            .child(self.connection_selector(cx)),
                                     )
                                     .child(div().flex_1())
                                     .child(self.editor_tabs(cx))
@@ -3044,21 +3232,21 @@ impl Render for AppView {
                     .font_family(self.fonts.mono.clone())
                     .text_color(rgb(MUTED))
                     .child(div().size(px(9.)).rounded_full().flex_none().bg(rgb(
-                        connection_indicator_colour(true, self.connection_state),
+                        connection_indicator_colour(true, self.connection_state()),
                     )))
                     .child(self.status.to_uppercase())
                     .child(div().flex_1())
                     .child(
-                        div().text_color(rgb(FAINT)).child(
-                            self.server_version
-                                .clone()
-                                .unwrap_or_default()
-                                .to_uppercase(),
-                        ),
+                        div()
+                            .text_color(rgb(FAINT))
+                            .child(self.server_version().to_uppercase()),
                     ),
             )
             .when(self.connection_dialog, |root| {
                 root.child(self.connection_dialog_card())
+            })
+            .when(self.connection_menu, |root| {
+                root.child(self.connection_menu_card(cx))
             })
     }
 }
@@ -3658,6 +3846,14 @@ mod tests {
         }
     }
 
+    /// Hands every session the same fake provider, which is how a test stands in for PostgreSQL
+    /// now that sessions build their own.
+    fn provider_factory(
+        provider: Arc<UiTestProvider>,
+    ) -> Arc<dyn Fn() -> Arc<dyn DatabaseProvider>> {
+        Arc::new(move || provider.clone() as Arc<dyn DatabaseProvider>)
+    }
+
     fn build_app_view(
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
@@ -3677,12 +3873,12 @@ mod tests {
     ) {
         for _ in 0..1_000 {
             cx.run_until_parked();
-            if view.update(cx, |app, _| app.connection_state) == expected {
+            if view.update(cx, |app, _| app.connection_state()) == expected {
                 return;
             }
             std::thread::yield_now();
         }
-        view.update(cx, |app, _| assert_eq!(app.connection_state, expected));
+        view.update(cx, |app, _| assert_eq!(app.connection_state(), expected));
     }
 
     #[test]
@@ -4312,7 +4508,7 @@ mod tests {
         let provider = Arc::new(UiTestProvider::default());
         let (view, cx) = build_app_view(cx);
         view.update(cx, |app, _| {
-            app.service = Arc::new(CommandService::new(provider.clone()));
+            app.provider_factory = provider_factory(provider.clone());
         });
 
         let connection_row = cx
@@ -4324,7 +4520,7 @@ mod tests {
         assert_eq!(provider.connect_calls.load(Ordering::SeqCst), 1);
         view.update(cx, |app, _| {
             assert_eq!(
-                connection_indicator_colour(true, app.connection_state),
+                connection_indicator_colour(true, app.connection_state()),
                 ACCENT
             );
         });
@@ -4386,33 +4582,177 @@ mod tests {
         profile
     }
 
-    /// There is one session. Every editor must name the database that session opened, or a tab can
-    /// claim to target one database while its SQL reaches another (§49, §50).
+    /// An editor must name the database its own session opened, or a tab can claim to target one
+    /// database while its SQL reaches another. Editors on a different connection keep theirs
+    /// (§49, §50).
     #[gpui::test]
-    fn every_editor_reports_the_database_the_session_actually_opened(cx: &mut TestAppContext) {
+    fn an_editor_reports_the_database_its_own_session_opened(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
-        let production = profile_named("Production", "production");
+        let mut production = profile_named("Production", "production");
+        let local = profile_named("Local", "local");
 
         view.update(cx, |app, _| {
             app.profiles.push(production.clone());
-            app.background_editors
-                .push(EditorState::new(profile_named("Local", "local")));
-            app.editor.connection = profile_named("Local", "local");
+            app.profiles.push(local.clone());
+            app.background_editors.push(EditorState::new(local.clone()));
+            app.editor.connection = production.clone();
 
-            app.adopt_session_profile(production.clone());
+            // The session reports the database it really opened, which need not be the one the
+            // profile named.
+            production.configuration.database = "production_replica".into();
+            app.adopt_connected_profile(production.clone());
         });
 
         view.update(cx, |app, _| {
-            assert_eq!(app.target_identity(), "Production / production");
-            assert_eq!(app.editor.connection.id, production.id);
-            assert_eq!(app.background_editors[0].connection.id, production.id);
+            assert_eq!(app.target_identity(), "Production / production_replica");
+            assert_eq!(
+                app.background_editors[0].connection.configuration.database, "local",
+                "the editor on the other connection should be untouched"
+            );
         });
 
-        // Switching to the other tab must not resurrect the stale target.
+        // Switching to the other tab surfaces that tab's own target.
         view.update(cx, |app, cx| app.switch_editor(0, cx));
         view.update(cx, |app, _| {
+            assert_eq!(app.target_identity(), "Local / local");
+            assert_eq!(app.editor.connection.id, local.id);
+        });
+    }
+
+    fn wait_for_profile_state(
+        view: &gpui::Entity<AppView>,
+        cx: &mut gpui::VisualTestContext,
+        profile_id: uuid::Uuid,
+        expected: ConnectionState,
+    ) {
+        for _ in 0..1_000 {
+            cx.run_until_parked();
+            if view.update(cx, |app, _| app.state_of(profile_id)) == expected {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        view.update(cx, |app, _| assert_eq!(app.state_of(profile_id), expected));
+    }
+
+    /// Two connections, two editors, both live at once — the point of a per-editor selector
+    /// (§48, §49).
+    #[gpui::test]
+    fn two_editors_can_target_two_connections_at_once(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        let local = profile_named("Local", "local");
+        let production = profile_named("Production", "production");
+        view.update(cx, |app, cx| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.profiles = vec![local.clone(), production.clone()];
+            app.editor.connection = local.clone();
+            app.connect(cx);
+        });
+        wait_for_profile_state(&view, cx, local.id, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| {
+            app.new_editor(cx);
+            app.select_connection(production.id, cx);
+            app.connect(cx);
+        });
+        wait_for_profile_state(&view, cx, production.id, ConnectionState::Connected);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.state_of(local.id), ConnectionState::Connected);
             assert_eq!(app.target_identity(), "Production / production");
+            assert_eq!(
+                app.background_editors[0].connection.id, local.id,
+                "the first editor should still be pointed at its own connection"
+            );
+        });
+        assert_eq!(provider.connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Disconnecting is per connection too: the other session stays live, and only the closed one
+    /// forgets its metadata.
+    #[gpui::test]
+    fn disconnecting_one_connection_leaves_the_other_live(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        let local = profile_named("Local", "local");
+        let production = profile_named("Production", "production");
+        view.update(cx, |app, cx| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.profiles = vec![local.clone(), production.clone()];
+            app.editor.connection = local.clone();
+            app.connect(cx);
+            app.connect_profile(production.clone(), cx);
+        });
+        wait_for_profile_state(&view, cx, local.id, ConnectionState::Connected);
+        wait_for_profile_state(&view, cx, production.id, ConnectionState::Connected);
+        view.update(cx, |app, _| {
+            app.session_for(local.id).schemas = vec!["public".into()];
+            app.session_for(production.id).schemas = vec!["audit".into()];
+        });
+
+        view.update(cx, |app, cx| app.disconnect_profile(local.id, cx));
+        wait_for_profile_state(&view, cx, local.id, ConnectionState::Disconnected);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.state_of(production.id), ConnectionState::Connected);
+            assert!(app.session_for(local.id).schemas.is_empty());
+            assert_eq!(app.session_for(production.id).schemas, ["audit"]);
+        });
+    }
+
+    /// Choosing from the selector moves this editor and closes the list. It opens no session of
+    /// its own: the connection is a target until the user connects it.
+    #[gpui::test]
+    fn the_selector_moves_only_the_editor_in_front(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let local = profile_named("Local", "local");
+        let production = profile_named("Production", "production");
+
+        view.update(cx, |app, cx| {
+            app.profiles = vec![local.clone(), production.clone()];
+            app.editor.connection = local.clone();
+            app.new_editor(cx);
+            app.toggle_connection_menu(cx);
+            app.select_connection(production.id, cx);
+        });
+
+        view.update(cx, |app, cx| {
+            // Clicking into the document is the other way out of the list.
+            app.toggle_connection_menu(cx);
+            app.click_editor(0, px(0.), false, cx);
+            assert!(!app.connection_menu, "clicking away should close the list");
+        });
+
+        view.update(cx, |app, _| {
+            assert!(!app.connection_menu, "choosing should close the list");
             assert_eq!(app.editor.connection.id, production.id);
+            assert_eq!(app.background_editors[0].connection.id, local.id);
+            assert_eq!(app.state_of(production.id), ConnectionState::Disconnected);
+            assert_eq!(app.status, "Target: Production / production");
+        });
+    }
+
+    /// Retargeting an editor mid-query would send the result somewhere else, so it waits.
+    #[gpui::test]
+    fn an_editor_cannot_be_retargeted_while_its_query_runs(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let local = profile_named("Local", "local");
+        let production = profile_named("Production", "production");
+
+        view.update(cx, |app, cx| {
+            app.profiles = vec![local.clone(), production.clone()];
+            app.editor.connection = local.clone();
+            app.editor.execution_status = ExecutionStatus::Running;
+            app.select_connection(production.id, cx);
+        });
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.connection.id, local.id);
+            assert_eq!(
+                app.status,
+                "Wait for the active query before changing connection"
+            );
         });
     }
 
@@ -4423,7 +4763,7 @@ mod tests {
         let provider = Arc::new(UiTestProvider::default());
         let (view, cx) = build_app_view(cx);
         view.update(cx, |app, _| {
-            app.service = Arc::new(CommandService::new(provider.clone()));
+            app.provider_factory = provider_factory(provider.clone());
         });
 
         provider.blocked.store(true, Ordering::SeqCst);
