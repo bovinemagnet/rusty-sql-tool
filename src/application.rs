@@ -22,7 +22,7 @@ pub mod command {
     /// FR2-006: show an object's definition. The object comes from the caller, so this identifier
     /// exists for the tree and the context menu rather than for a key binding.
     pub const OPEN_DEFINITION: &str = "definition.open";
-    /// FR2-011: refetch the definition in front, bypassing the session cache.
+    /// FR2-009: refetch the definition in front, bypassing the session cache.
     pub const REFRESH_DEFINITION: &str = "definition.refresh";
     pub const CLOSE_DEFINITION: &str = "definition.close";
 }

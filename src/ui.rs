@@ -1061,18 +1061,23 @@ impl AppView {
             state: DefinitionState::Loading,
         });
         self.focus = Focus::Definition(id);
-        self.load_definition(id, object, false, cx);
+        self.load_definition(id, profile_id, object, false, cx);
     }
 
     /// Metadata work follows the Phase 1 path: off the render thread, applied back on it (§10).
+    ///
+    /// The session is resolved from the tab's own `profile_id`, never from the editor in front: a
+    /// definition is keyed to a connection (§8), and the editor may have been switched to another
+    /// one since the tab was opened.
     fn load_definition(
         &mut self,
         id: uuid::Uuid,
+        profile_id: uuid::Uuid,
         object: DatabaseObject,
         refresh: bool,
         cx: &mut Context<Self>,
     ) {
-        let service = self.active_session().service.clone();
+        let service = self.session_for(profile_id).service.clone();
         let runtime = self.runtime.clone();
         cx.spawn(async move |view, cx| {
             let outcome = runtime
@@ -1101,14 +1106,16 @@ impl AppView {
         cx.notify();
     }
 
-    /// Refetches a definition, bypassing the session cache (FR2-011).
+    /// Refetches a definition, bypassing the session cache (FR2-009). It goes back to the
+    /// connection the tab was opened against, whatever the editor in front is now pointed at.
     fn refresh_definition(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
         let Some(tab) = self.definitions.iter_mut().find(|tab| tab.id == id) else {
             return;
         };
+        let profile_id = tab.profile_id;
         let object = tab.object.clone();
         tab.state = DefinitionState::Loading;
-        self.load_definition(id, object, true, cx);
+        self.load_definition(id, profile_id, object, true, cx);
     }
 
     /// Unlike editors, the workspace need not keep one: closing the last is allowed and focus
@@ -4144,6 +4151,22 @@ mod tests {
         Arc::new(move || provider.clone() as Arc<dyn DatabaseProvider>)
     }
 
+    /// Hands each session a provider of its own, in the order the sessions are created, so a test
+    /// can tell which connection a request actually reached.
+    fn provider_factory_per_session(
+        providers: Vec<Arc<UiTestProvider>>,
+    ) -> Arc<dyn Fn() -> Arc<dyn DatabaseProvider>> {
+        let next = Arc::new(AtomicUsize::new(0));
+        Arc::new(move || {
+            let index = next.fetch_add(1, Ordering::SeqCst);
+            providers
+                .get(index)
+                .cloned()
+                .expect("a test should supply one provider per session it opens")
+                as Arc<dyn DatabaseProvider>
+        })
+    }
+
     fn build_app_view(
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
@@ -4282,7 +4305,7 @@ mod tests {
         });
     }
 
-    /// §5: a definition belongs to a connection, so editors may come and go beneath it.
+    /// §8: a definition belongs to a connection, so editors may come and go beneath it.
     #[gpui::test]
     fn a_definition_survives_opening_another_editor(cx: &mut TestAppContext) {
         let provider = Arc::new(UiTestProvider::default());
@@ -4298,6 +4321,61 @@ mod tests {
         view.update(cx, |app, cx| app.dispatch_command(command::NEW_EDITOR, cx));
 
         view.update(cx, |app, _| assert_eq!(app.definitions.len(), 1));
+    }
+
+    /// FR2-009, §8: a refresh goes back to the connection the tab was opened against. The editor
+    /// in front can be switched to another database in between, and a refresh that followed it
+    /// would repopulate the tab from the wrong server.
+    #[gpui::test]
+    fn refreshing_a_definition_goes_back_to_its_own_connection(cx: &mut TestAppContext) {
+        let first = Arc::new(UiTestProvider::default());
+        let second = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        let local = profile_named("Local", "local");
+        let production = profile_named("Production", "production");
+        view.update(cx, |app, cx| {
+            app.provider_factory =
+                provider_factory_per_session(vec![first.clone(), second.clone()]);
+            app.profiles = vec![local.clone(), production.clone()];
+            app.editor.connection = local.clone();
+            app.connect(cx);
+        });
+        wait_for_profile_state(&view, cx, local.id, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+        let tab = view.update(cx, |app, _| {
+            assert_eq!(app.definitions[0].profile_id, local.id);
+            app.definitions[0].id
+        });
+
+        // The editor moves to the other connection; the definition tab stays where it was.
+        view.update(cx, |app, cx| {
+            app.select_connection(production.id, cx);
+            app.connect(cx);
+        });
+        wait_for_profile_state(&view, cx, production.id, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.refresh_definition(tab, cx));
+        wait_for_definitions(&view, cx, 1);
+
+        assert_eq!(
+            first.definition_calls.load(Ordering::SeqCst),
+            2,
+            "the refresh should have gone back to the connection the tab was opened against"
+        );
+        assert_eq!(
+            second.definition_calls.load(Ordering::SeqCst),
+            0,
+            "the connection the editor was switched to should never have been asked"
+        );
+        view.update(cx, |app, _| {
+            assert_eq!(app.definitions[0].profile_id, local.id);
+            assert!(matches!(
+                app.definitions[0].state,
+                DefinitionState::Loaded(_)
+            ));
+        });
     }
 
     #[test]
