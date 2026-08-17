@@ -16,7 +16,7 @@ use crate::config::{ConnectionProfile, SslMode};
 use crate::database::{
     ConnectionInfo, ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind,
 };
-use crate::definition::{ObjectDefinition, TableDefinition, ViewDefinition};
+use crate::definition::{ObjectDefinition, RoutineDefinition, TableDefinition, ViewDefinition};
 use crate::result::{CellValue, Column, ExecutionStatus, QueryError, QueryResult};
 
 mod catalogue;
@@ -246,6 +246,32 @@ impl PostgresProvider {
                     columns: catalogue::columns(&columns),
                     definition_sql: row.get(0),
                     materialised: row.get(1),
+                }))
+            }
+            ObjectKind::Function | ObjectKind::Procedure => {
+                let rows = self
+                    .with_client(async |client| {
+                        client
+                            .query(
+                                catalogue::ROUTINE_DEFINITION,
+                                &[&object.schema, &object.name],
+                            )
+                            .await
+                    })
+                    .await?;
+                // No row means an aggregate or window function, which `pg_get_functiondef` cannot
+                // describe — §5 wants that said, not an empty panel.
+                let Some(row) = rows.first() else {
+                    return Ok(ObjectDefinition::Unsupported {
+                        kind: object.kind,
+                        reason: "PostgreSQL provides no definition for this routine".into(),
+                    });
+                };
+                Ok(ObjectDefinition::Routine(RoutineDefinition {
+                    arguments: row.get(0),
+                    return_type: row.get(1),
+                    language: row.get(2),
+                    definition_sql: row.get(3),
                 }))
             }
             kind => Ok(ObjectDefinition::Unsupported {

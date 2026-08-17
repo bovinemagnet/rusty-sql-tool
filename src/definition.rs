@@ -69,6 +69,18 @@ pub struct ViewDefinition {
     pub materialised: bool,
 }
 
+/// A function or a procedure. §5 asks for arguments, return type and language beside the body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineDefinition {
+    /// As `pg_get_function_arguments` renders it.
+    pub arguments: String,
+    /// `None` for a procedure, which returns nothing.
+    pub return_type: Option<String>,
+    pub language: String,
+    /// Exactly as `pg_get_functiondef` returns it; never reformatted (§7).
+    pub definition_sql: String,
+}
+
 /// The definition of one database object. An enum rather than a struct of optional sections, so
 /// states such as a sequence carrying foreign keys cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +92,7 @@ pub enum ObjectDefinition {
     },
     Table(TableDefinition),
     View(ViewDefinition),
+    Routine(RoutineDefinition),
 }
 
 /// One block of a rendered definition. `Rows` is pre-aligned monospace text; `Sql` is handed to
@@ -141,6 +154,17 @@ impl ObjectDefinition {
                 let mut sections = Vec::new();
                 push_rows(&mut sections, "Columns", column_lines(&view.columns));
                 push_sql(&mut sections, "Definition", view.definition_sql.clone());
+                sections
+            }
+            Self::Routine(routine) => {
+                let mut rows = vec![vec!["Arguments".to_owned(), routine.arguments.clone()]];
+                if let Some(returns) = &routine.return_type {
+                    rows.push(vec!["Returns".to_owned(), returns.clone()]);
+                }
+                rows.push(vec!["Language".to_owned(), routine.language.clone()]);
+                let mut sections = Vec::new();
+                push_rows(&mut sections, "Signature", aligned(&rows));
+                push_sql(&mut sections, "Definition", routine.definition_sql.clone());
                 sections
             }
             Self::Unsupported { reason, .. } => vec![DefinitionSection::Note {
@@ -453,6 +477,54 @@ mod tests {
                     sql: " SELECT customer.id\n   FROM customer;".into(),
                 },
             ]
+        );
+    }
+
+    /// FR2-005. A procedure has no return type, so that row is absent rather than blank.
+    #[test]
+    fn a_routine_renders_its_signature_and_body() {
+        let function = ObjectDefinition::Routine(RoutineDefinition {
+            arguments: "a integer, b integer".into(),
+            return_type: Some("integer".into()),
+            language: "sql".into(),
+            definition_sql: "CREATE OR REPLACE FUNCTION public.add(a integer, b integer)\n\
+                             RETURNS integer\nAS $$SELECT a + b$$"
+                .into(),
+        });
+
+        let sections = function.sections(&object("add", ObjectKind::Function));
+
+        assert_eq!(
+            sections[0],
+            DefinitionSection::Rows {
+                heading: "Signature".into(),
+                lines: vec![
+                    "Arguments  a integer, b integer".into(),
+                    "Returns    integer".into(),
+                    "Language   sql".into(),
+                ],
+            }
+        );
+        assert!(matches!(
+            &sections[1],
+            DefinitionSection::Sql { heading, .. } if heading == "Definition"
+        ));
+
+        let procedure = ObjectDefinition::Routine(RoutineDefinition {
+            arguments: "".into(),
+            return_type: None,
+            language: "plpgsql".into(),
+            definition_sql: "CREATE OR REPLACE PROCEDURE public.tidy()\nAS $$BEGIN END$$".into(),
+        });
+
+        let DefinitionSection::Rows { lines, .. } =
+            &procedure.sections(&object("tidy", ObjectKind::Procedure))[0]
+        else {
+            panic!("expected a rows section");
+        };
+        assert_eq!(
+            lines,
+            &vec!["Arguments".to_owned(), "Language   plpgsql".to_owned()]
         );
     }
 

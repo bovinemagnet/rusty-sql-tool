@@ -125,3 +125,16 @@ pub const VIEW_DEFINITION: &str = "SELECT pg_catalog.pg_get_viewdef(c.oid, true)
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('v','m')";
+
+/// The Phase 1 tree lists routines by name alone, so an overloaded name cannot be told apart.
+/// This takes the lowest `oid`; distinguishing overloads needs tree changes beyond Phase 2.
+/// `prokind` is restricted because `pg_get_functiondef` errors on aggregate and window functions.
+pub const ROUTINE_DEFINITION: &str = "SELECT pg_catalog.pg_get_function_arguments(p.oid), \
+     CASE WHEN p.prokind = 'p' THEN NULL \
+          ELSE pg_catalog.pg_get_function_result(p.oid) END, \
+     l.lanname, pg_catalog.pg_get_functiondef(p.oid) \
+     FROM pg_catalog.pg_proc p \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+     JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+     WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind IN ('f','p') \
+     ORDER BY p.oid LIMIT 1";
