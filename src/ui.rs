@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle, SharedString, Window, WindowBounds,
-    WindowOptions, div, point, prelude::*, px, rgb, size,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, Window,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, size,
 };
 use tokio::runtime::Runtime;
 
@@ -485,6 +485,9 @@ struct AppView {
     connection_menu: bool,
     /// The object tree's context menu, open over one object (§8).
     object_menu: Option<ObjectMenu>,
+    /// Where `object_menu_card` anchors itself, set from the right click that opened the menu so
+    /// it appears beside the row that was acted on rather than at a fixed point on the workspace.
+    object_menu_position: Point<Pixels>,
     /// Whether the profile list came from real configuration rather than the built-in fallback.
     configured: bool,
     editor_scroll: ScrollState,
@@ -622,6 +625,7 @@ impl AppView {
             fonts,
             connection_menu: false,
             object_menu: None,
+            object_menu_position: point(px(SIDEBAR_WIDTH + 30.), px(TITLEBAR_HEIGHT + 74.)),
             configured,
             editor_scroll: ScrollState::default(),
             results_scroll: ScrollState::default(),
@@ -706,6 +710,7 @@ impl AppView {
         if self.connection_menu {
             self.toggle_connection_menu(cx);
         }
+        self.object_menu = None;
         self.selecting_editor = true;
         let offset = offset_of(&self.editor.document, line, self.editor_column_at(x));
         self.place_cursor(offset, extend, cx);
@@ -1381,6 +1386,11 @@ impl AppView {
             self.toggle_connection_menu(cx);
             return;
         }
+        if self.object_menu.is_some() && key == "escape" {
+            self.object_menu = None;
+            cx.notify();
+            return;
+        }
         // The row-limit field has no focus handle of its own, so while it is open the keys are held
         // here rather than reaching the SQL document.
         if let Some(buffer) = self.limit_buffer.as_mut() {
@@ -2012,12 +2022,14 @@ impl AppView {
                                     self.tree_caption(format!("{kind} · {}", matching.len())),
                                 );
                                 for object in matching {
+                                    let object_row_id = format!(
+                                        "object-{profile_id}-{schema}-{kind}-{}",
+                                        object.name
+                                    );
                                     tree = tree.child(
                                         div()
-                                            .id(SharedString::from(format!(
-                                                "object-{profile_id}-{schema}-{kind}-{}",
-                                                object.name
-                                            )))
+                                            .id(SharedString::from(object_row_id.clone()))
+                                            .debug_selector(move || object_row_id.clone())
                                             .pl(px(22.))
                                             .pr_3()
                                             .py(px(6.))
@@ -2051,7 +2063,11 @@ impl AppView {
                                                     ))
                                                     .on_mouse_down(
                                                         gpui::MouseButton::Right,
-                                                        cx.listener(move |this, _, _, cx| {
+                                                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                            // Anchors the menu at the row that was
+                                                            // right-clicked, rather than a fixed
+                                                            // point on the workspace.
+                                                            this.object_menu_position = event.position;
                                                             this.toggle_object_menu(
                                                                 right_click_target.clone(),
                                                                 cx,
@@ -2306,6 +2322,8 @@ impl AppView {
     fn object_menu_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut card = div()
             .absolute()
+            .top(self.object_menu_position.y)
+            .left(self.object_menu_position.x)
             .flex()
             .flex_col()
             .p_1()
@@ -4136,11 +4154,12 @@ fn next_boundary(text: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use super::*;
     use async_trait::async_trait;
-    use gpui::{Modifiers, TestAppContext};
+    use gpui::{Modifiers, MouseUpEvent, TestAppContext};
 
     use crate::database::{ConnectionInfo, DatabaseProvider};
     use crate::definition::{ColumnDefinition, TableDefinition};
@@ -4156,6 +4175,10 @@ mod tests {
         /// and nowhere else.
         definition_fails: AtomicBool,
         definition_calls: AtomicUsize,
+        /// Schemas and objects handed back by `schemas`/`objects`, so a test can populate the tree
+        /// and drive a real click on a rendered object row.
+        schemas_response: Mutex<Vec<String>>,
+        objects_response: Mutex<HashMap<String, Vec<DatabaseObject>>>,
     }
 
     impl UiTestProvider {
@@ -4193,11 +4216,17 @@ mod tests {
         }
 
         async fn schemas(&self, _: bool) -> Result<Vec<String>, QueryError> {
-            Ok(Vec::new())
+            Ok(self.schemas_response.lock().unwrap().clone())
         }
 
-        async fn objects(&self, _: &str, _: bool) -> Result<Vec<DatabaseObject>, QueryError> {
-            Ok(Vec::new())
+        async fn objects(&self, schema: &str, _: bool) -> Result<Vec<DatabaseObject>, QueryError> {
+            Ok(self
+                .objects_response
+                .lock()
+                .unwrap()
+                .get(schema)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn definition(
@@ -4466,6 +4495,112 @@ mod tests {
 
         view.update(cx, |app, cx| app.choose_open_definition(cx));
         wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| assert!(app.object_menu.is_none()));
+    }
+
+    /// The handlers above are reached through the rendered tree row, not called directly, so this
+    /// would catch a regression that loosens the `>= 2` double-click threshold back to a single
+    /// click (§8, FR2-006) — the exact behaviour Task 9's stopgap handler had, and Task 10 exists
+    /// to remove.
+    #[gpui::test]
+    fn a_single_click_on_a_tree_object_leaves_it_unopened_and_a_double_click_opens_it(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = Arc::new(UiTestProvider::default());
+        provider
+            .schemas_response
+            .lock()
+            .unwrap()
+            .push("public".into());
+        provider
+            .objects_response
+            .lock()
+            .unwrap()
+            .insert("public".into(), vec![customer()]);
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        let profile_id = view.update(cx, |app, _| app.editor.connection.id);
+        view.update(cx, |app, cx| {
+            app.load_schema(profile_id, "public".into(), false, cx)
+        });
+        for _ in 0..1_000 {
+            cx.run_until_parked();
+            let loaded = view.update(cx, |app, _| {
+                app.session_for(profile_id).objects.contains_key("public")
+            });
+            if loaded {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        // `debug_bounds` wants a `'static` selector; the row id is only known once the profile
+        // connects, so it is leaked for the lifetime of the test process — a standard trick for
+        // driving real, rendered UI in a test rather than calling the handler directly.
+        let row_id: &'static str =
+            Box::leak(format!("object-{profile_id}-public-Tables-customer").into_boxed_str());
+        let row = cx
+            .debug_bounds(row_id)
+            .expect("the object row should be rendered once its schema is expanded");
+
+        // A single click must not open the definition (§8): it only clears any open menu.
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert!(
+                app.definitions.is_empty(),
+                "a single click must not open a definition"
+            );
+        });
+
+        // A double click opens exactly one tab. `simulate_click` always stamps `click_count: 1`,
+        // so the down/up pair is built by hand with `click_count: 2` — the field `ClickEvent`
+        // reads to decide whether this was a double-click — and driven through the same
+        // `simulate_event` primitive `simulate_click` itself uses underneath.
+        cx.simulate_event(MouseDownEvent {
+            position: row.center(),
+            click_count: 2,
+            ..Default::default()
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: row.center(),
+            click_count: 2,
+            ..Default::default()
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.definitions[0].object.name, "customer");
+        });
+    }
+
+    /// Mirrors the connection menu's own escape handling (`src/ui.rs` around `handle_key`): a
+    /// stray context menu must not survive the key the user pressed to get out of it.
+    #[gpui::test]
+    fn escape_closes_the_object_menu(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+        view.update(cx, |app, _| assert!(app.object_menu.is_some()));
+
+        view.update(cx, |app, cx| app.handle_key(&key_event("escape"), cx));
+
+        view.update(cx, |app, _| assert!(app.object_menu.is_none()));
+    }
+
+    /// Mirrors the connection menu's own click-away handling in `click_editor`: clicking into the
+    /// document is the other way out of a menu left open over the tree.
+    #[gpui::test]
+    fn clicking_the_editor_closes_the_object_menu(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+
+        view.update(cx, |app, cx| app.click_editor(0, px(0.), false, cx));
 
         view.update(cx, |app, _| assert!(app.object_menu.is_none()));
     }
