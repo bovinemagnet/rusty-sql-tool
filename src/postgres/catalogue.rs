@@ -7,6 +7,7 @@ use tokio_postgres::Row;
 
 use crate::definition::{
     CheckConstraint, ColumnDefinition, ForeignKey, IndexDefinition, KeyConstraint,
+    SequenceDefinition,
 };
 
 /// Columns in physical order (§6). `attnum > 0` excludes system columns; `attisdropped` excludes
@@ -138,3 +139,31 @@ pub const ROUTINE_DEFINITION: &str = "SELECT pg_catalog.pg_get_function_argument
      JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
      WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind IN ('f','p') \
      ORDER BY p.oid LIMIT 1";
+
+/// `pg_sequence` holds the parameters; the owning column comes from an auto dependency, which is
+/// what `ALTER SEQUENCE … OWNED BY` and `serial` both record.
+pub const SEQUENCE_DEFINITION: &str = "SELECT pg_catalog.format_type(s.seqtypid, NULL), \
+     s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcycle, \
+     (SELECT dn.nspname || '.' || dc.relname || '.' || da.attname \
+        FROM pg_catalog.pg_depend d \
+        JOIN pg_catalog.pg_class dc ON dc.oid = d.refobjid \
+        JOIN pg_catalog.pg_namespace dn ON dn.oid = dc.relnamespace \
+        JOIN pg_catalog.pg_attribute da \
+          ON da.attrelid = d.refobjid AND da.attnum = d.refobjsubid \
+       WHERE d.objid = c.oid AND d.deptype = 'a' LIMIT 1) \
+     FROM pg_catalog.pg_sequence s \
+     JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2";
+
+pub fn sequence(row: &Row) -> SequenceDefinition {
+    SequenceDefinition {
+        data_type: row.get(0),
+        start: row.get(1),
+        increment: row.get(2),
+        minimum: row.get(3),
+        maximum: row.get(4),
+        cycles: row.get(5),
+        owned_by: row.get(6),
+    }
+}

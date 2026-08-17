@@ -274,6 +274,24 @@ impl PostgresProvider {
                     definition_sql: row.get(3),
                 }))
             }
+            ObjectKind::Sequence => {
+                let rows = self
+                    .with_client(async |client| {
+                        client
+                            .query(
+                                catalogue::SEQUENCE_DEFINITION,
+                                &[&object.schema, &object.name],
+                            )
+                            .await
+                    })
+                    .await?;
+                // The object was in the tree a moment ago; if it is gone now, say so rather than
+                // rendering an empty panel (§12).
+                let Some(row) = rows.first() else {
+                    return Err(simple_error("the object no longer exists"));
+                };
+                Ok(ObjectDefinition::Sequence(catalogue::sequence(row)))
+            }
             kind => Ok(ObjectDefinition::Unsupported {
                 kind,
                 reason: "PostgreSQL provides no definition for this object".into(),

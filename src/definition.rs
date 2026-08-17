@@ -93,6 +93,20 @@ pub enum ObjectDefinition {
     Table(TableDefinition),
     View(ViewDefinition),
     Routine(RoutineDefinition),
+    Sequence(SequenceDefinition),
+}
+
+/// §5 gives a sequence its generation parameters and, when one exists, the column it backs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceDefinition {
+    pub data_type: String,
+    pub start: i64,
+    pub increment: i64,
+    pub minimum: i64,
+    pub maximum: i64,
+    pub cycles: bool,
+    /// The column the sequence backs, as `schema.table.column`, when it is owned by one.
+    pub owned_by: Option<String>,
 }
 
 /// One block of a rendered definition. `Rows` is pre-aligned monospace text; `Sql` is handed to
@@ -165,6 +179,25 @@ impl ObjectDefinition {
                 let mut sections = Vec::new();
                 push_rows(&mut sections, "Signature", aligned(&rows));
                 push_sql(&mut sections, "Definition", routine.definition_sql.clone());
+                sections
+            }
+            Self::Sequence(sequence) => {
+                let mut rows = vec![
+                    vec!["Type".to_owned(), sequence.data_type.clone()],
+                    vec!["Start".to_owned(), sequence.start.to_string()],
+                    vec!["Increment".to_owned(), sequence.increment.to_string()],
+                    vec!["Minimum".to_owned(), sequence.minimum.to_string()],
+                    vec!["Maximum".to_owned(), sequence.maximum.to_string()],
+                    vec![
+                        "Cycles".to_owned(),
+                        if sequence.cycles { "yes" } else { "no" }.to_owned(),
+                    ],
+                ];
+                if let Some(owner) = &sequence.owned_by {
+                    rows.push(vec!["Owned by".to_owned(), owner.clone()]);
+                }
+                let mut sections = Vec::new();
+                push_rows(&mut sections, "Sequence", aligned(&rows));
                 sections
             }
             Self::Unsupported { reason, .. } => vec![DefinitionSection::Note {
@@ -564,6 +597,38 @@ mod tests {
                       CREATE INDEX customer_email_idx ON public.customer USING btree (email);"
                     .into(),
             })
+        );
+    }
+
+    /// FR2-008. An unowned sequence omits the row rather than printing "none".
+    #[test]
+    fn a_sequence_renders_its_properties() {
+        let definition = ObjectDefinition::Sequence(SequenceDefinition {
+            data_type: "bigint".into(),
+            start: 1,
+            increment: 1,
+            minimum: 1,
+            maximum: 9_223_372_036_854_775_807,
+            cycles: false,
+            owned_by: Some("public.customer.id".into()),
+        });
+
+        let sections = definition.sections(&object("customer_id_seq", ObjectKind::Sequence));
+
+        assert_eq!(
+            sections,
+            vec![DefinitionSection::Rows {
+                heading: "Sequence".into(),
+                lines: vec![
+                    "Type       bigint".into(),
+                    "Start      1".into(),
+                    "Increment  1".into(),
+                    "Minimum    1".into(),
+                    "Maximum    9223372036854775807".into(),
+                    "Cycles     no".into(),
+                    "Owned by   public.customer.id".into(),
+                ],
+            }]
         );
     }
 }
