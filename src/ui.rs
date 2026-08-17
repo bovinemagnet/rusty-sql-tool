@@ -435,6 +435,18 @@ enum DefinitionState {
     Failed(QueryError),
 }
 
+/// The tree's context menu, open over one object. §8 admits one entry and forbids anything that
+/// modifies the database.
+struct ObjectMenu {
+    object: DatabaseObject,
+}
+
+impl ObjectMenu {
+    fn entries(&self) -> Vec<&'static str> {
+        vec!["Open Definition"]
+    }
+}
+
 /// Which surface the workspace is showing. Replaces the earlier `active_result_tab` flag, which
 /// could not express a third destination.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -471,6 +483,8 @@ struct AppView {
     fonts: Fonts,
     /// Whether the connection selector's list is open over the workspace.
     connection_menu: bool,
+    /// The object tree's context menu, open over one object (§8).
+    object_menu: Option<ObjectMenu>,
     /// Whether the profile list came from real configuration rather than the built-in fallback.
     configured: bool,
     editor_scroll: ScrollState,
@@ -607,6 +621,7 @@ impl AppView {
             limit_buffer: None,
             fonts,
             connection_menu: false,
+            object_menu: None,
             configured,
             editor_scroll: ScrollState::default(),
             results_scroll: ScrollState::default(),
@@ -1500,6 +1515,25 @@ impl AppView {
         cx.notify();
     }
 
+    /// Opens the context menu over an object, or closes it if it is already open over that same
+    /// object (§8). Opening it over a different object replaces whatever was open before, so the
+    /// menu never lingers over the tree pointing at something stale.
+    fn toggle_object_menu(&mut self, object: DatabaseObject, cx: &mut Context<Self>) {
+        self.object_menu = match &self.object_menu {
+            Some(menu) if menu.object == object => None,
+            _ => Some(ObjectMenu { object }),
+        };
+        cx.notify();
+    }
+
+    /// FR2-012, §8: the menu's one entry opens the definition and dismisses the menu.
+    fn choose_open_definition(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.object_menu.take() else {
+            return;
+        };
+        self.open_definition(menu.object, cx);
+    }
+
     /// Adding a connection is independent of the ones already open — it only retargets the editor
     /// in front, so a running query is the one thing that blocks it.
     fn configure_connection(&mut self, cx: &mut Context<Self>) {
@@ -1978,7 +2012,6 @@ impl AppView {
                                     self.tree_caption(format!("{kind} · {}", matching.len())),
                                 );
                                 for object in matching {
-                                    let target = object.clone();
                                     tree = tree.child(
                                         div()
                                             .id(SharedString::from(format!(
@@ -1992,16 +2025,39 @@ impl AppView {
                                             .text_size(px(12.5))
                                             .font_family(self.fonts.mono.clone())
                                             .text_color(rgb(MUTED))
-                                            // Clicking an object shows what it is (FR2-006). Only
-                                            // the active editor's own connection responds, because
-                                            // a definition is fetched from that session and would
+                                            // A double-click opens the definition, and a right
+                                            // click opens the context menu (FR2-006, §8). Only the
+                                            // active editor's own connection responds, because a
+                                            // definition is fetched from that session and would
                                             // otherwise describe the wrong database.
                                             .when(profile_id == self.editor.connection.id, |row| {
+                                                let double_click_target = object.clone();
+                                                let right_click_target = object.clone();
                                                 row.cursor_pointer()
                                                     .hover(|style| style.bg(rgb(PANEL)))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.open_definition(target.clone(), cx)
-                                                    }))
+                                                    .on_click(cx.listener(
+                                                        move |this, event: &gpui::ClickEvent, _, cx| {
+                                                            if event.click_count() >= 2 {
+                                                                this.object_menu = None;
+                                                                this.open_definition(
+                                                                    double_click_target.clone(),
+                                                                    cx,
+                                                                );
+                                                            } else {
+                                                                this.object_menu = None;
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    ))
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Right,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.toggle_object_menu(
+                                                                right_click_target.clone(),
+                                                                cx,
+                                                            )
+                                                        }),
+                                                    )
                                             })
                                             .child(object.name.clone()),
                                     );
@@ -2244,6 +2300,45 @@ impl AppView {
                 .text_color(rgb(FAINT))
                 .child("CHOOSING A CONNECTION MOVES THIS EDITOR ONLY"),
         )
+    }
+
+    /// §8 admits exactly one entry. Modification actions must never appear here.
+    fn object_menu_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut card = div()
+            .absolute()
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgb(PANEL))
+            .child(
+                self.tree_caption(
+                    self.object_menu
+                        .as_ref()
+                        .map_or_else(String::new, |menu| menu.object.name.clone()),
+                ),
+            );
+        for entry in self
+            .object_menu
+            .as_ref()
+            .map(ObjectMenu::entries)
+            .unwrap_or_default()
+        {
+            card = card.child(
+                div()
+                    .id(SharedString::from(entry))
+                    .px_3()
+                    .py(px(7.))
+                    .rounded_lg()
+                    .text_size(px(12.5))
+                    .font_family(self.fonts.display.clone())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(PANEL_LIGHT)))
+                    .on_click(cx.listener(|this, _, _, cx| this.choose_open_definition(cx)))
+                    .child(entry),
+            );
+        }
+        card
     }
 
     fn display_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3513,6 +3608,9 @@ impl Render for AppView {
             .when(self.connection_menu, |root| {
                 root.child(self.connection_menu_card(cx))
             })
+            .when(self.object_menu.is_some(), |root| {
+                root.child(self.object_menu_card(cx))
+            })
     }
 }
 
@@ -4321,6 +4419,55 @@ mod tests {
         view.update(cx, |app, cx| app.dispatch_command(command::NEW_EDITOR, cx));
 
         view.update(cx, |app, _| assert_eq!(app.definitions.len(), 1));
+    }
+
+    /// FR2-012, §8: the menu offers Open Definition and nothing that modifies the database.
+    #[gpui::test]
+    fn the_object_menu_offers_only_open_definition(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.object_menu.as_ref().map(|menu| menu.entries()),
+                Some(vec!["Open Definition"])
+            );
+        });
+
+        view.update(cx, |app, cx| {
+            let object = app.object_menu.as_ref().unwrap().object.clone();
+            app.open_definition(object, cx);
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.definitions[0].object.name, "customer")
+        });
+    }
+
+    /// The menu is dismissed by choosing from it, so it cannot linger over the tree.
+    #[gpui::test]
+    fn choosing_from_the_object_menu_closes_it(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+
+        view.update(cx, |app, cx| app.choose_open_definition(cx));
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| assert!(app.object_menu.is_none()));
     }
 
     /// FR2-009, §8: a refresh goes back to the connection the tab was opened against. The editor
