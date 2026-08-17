@@ -13,8 +13,9 @@ use tokio::runtime::Runtime;
 use crate::application::{CommandService, EditorState, ResultDestination, ResultDisplay, command};
 use crate::config::{ConnectionProfile, local_profile};
 use crate::database::{ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind};
+use crate::definition::{DefinitionSection, ObjectDefinition};
 use crate::postgres::PostgresProvider;
-use crate::result::{CellValue, ExecutionStatus, QueryResult};
+use crate::result::{CellValue, ExecutionStatus, QueryError, QueryResult};
 use crate::sql::{Highlight, HighlightSpan, highlight_lines};
 
 // RepFoundry desktop — Kinetic Green.
@@ -417,6 +418,32 @@ impl ConnectionSession {
     }
 }
 
+/// One open definition. Keyed to a profile rather than an editor, so editors may be switched or
+/// closed beneath it (§8).
+struct DefinitionTab {
+    id: uuid::Uuid,
+    profile_id: uuid::Uuid,
+    object: DatabaseObject,
+    state: DefinitionState,
+}
+
+enum DefinitionState {
+    Loading,
+    Loaded(ObjectDefinition),
+    /// A failed load or refresh replaces the body, so stale content is never shown as current
+    /// (§11, FR2-010).
+    Failed(QueryError),
+}
+
+/// Which surface the workspace is showing. Replaces the earlier `active_result_tab` flag, which
+/// could not express a third destination.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Editor,
+    Result,
+    Definition(uuid::Uuid),
+}
+
 struct AppView {
     /// One session per profile the user has connected to, keyed by profile. Built on demand, so a
     /// profile that has never been used costs nothing.
@@ -428,7 +455,9 @@ struct AppView {
     profiles: Vec<ConnectionProfile>,
     editor: EditorState,
     background_editors: Vec<EditorState>,
-    active_result_tab: bool,
+    /// Definitions open beside the editors, in the order they were opened (FR2-006).
+    definitions: Vec<DefinitionTab>,
+    focus: Focus,
     status: String,
     focus_handle: FocusHandle,
     /// Document snapshots paired with the caret they were taken at.
@@ -446,6 +475,9 @@ struct AppView {
     configured: bool,
     editor_scroll: ScrollState,
     results_scroll: ScrollState,
+    /// The definition surface has its own, so reading a long definition does not move the SQL
+    /// document out from under the caret.
+    definition_scroll: ScrollState,
     /// Selected text in the results, and whether a drag is extending it.
     result_selection: Option<ResultSelection>,
     selecting_results: bool,
@@ -564,7 +596,8 @@ impl AppView {
             profiles,
             editor: EditorState::new(profile),
             background_editors: Vec::new(),
-            active_result_tab: false,
+            definitions: Vec::new(),
+            focus: Focus::Editor,
             status: "Disconnected · Run a query to see results.".into(),
             focus_handle: cx.focus_handle(),
             undo: Vec::new(),
@@ -577,6 +610,7 @@ impl AppView {
             configured,
             editor_scroll: ScrollState::default(),
             results_scroll: ScrollState::default(),
+            definition_scroll: ScrollState::default(),
             result_selection: None,
             selecting_results: false,
             selecting_editor: false,
@@ -801,7 +835,7 @@ impl AppView {
     /// select-all: the result tab is in front, or lines are already selected.
     fn results_have_focus(&self) -> bool {
         !self.editor.results.is_empty()
-            && (self.active_result_tab || self.result_selection.is_some())
+            && (self.focus == Focus::Result || self.result_selection.is_some())
     }
 
     /// The connection SQL will actually run against. Each editor carries its own, so this is the
@@ -1000,6 +1034,93 @@ impl AppView {
         cx.notify();
     }
 
+    /// Opens an object's definition beside the editors (FR2-006). The object's connection must be
+    /// live: a definition cannot be fetched from a closed session, and a tab that can only show an
+    /// error is worse than a message.
+    fn open_definition(&mut self, object: DatabaseObject, cx: &mut Context<Self>) {
+        let profile_id = self.editor.connection.id;
+        if self.state_of(profile_id) != ConnectionState::Connected {
+            self.status = "Connect before opening a definition".into();
+            cx.notify();
+            return;
+        }
+        if let Some(existing) = self
+            .definitions
+            .iter()
+            .find(|tab| tab.profile_id == profile_id && tab.object == object)
+        {
+            self.focus = Focus::Definition(existing.id);
+            cx.notify();
+            return;
+        }
+        let id = uuid::Uuid::new_v4();
+        self.definitions.push(DefinitionTab {
+            id,
+            profile_id,
+            object: object.clone(),
+            state: DefinitionState::Loading,
+        });
+        self.focus = Focus::Definition(id);
+        self.load_definition(id, object, false, cx);
+    }
+
+    /// Metadata work follows the Phase 1 path: off the render thread, applied back on it (§10).
+    fn load_definition(
+        &mut self,
+        id: uuid::Uuid,
+        object: DatabaseObject,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let service = self.active_session().service.clone();
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |view, cx| {
+            let outcome = runtime
+                .spawn(async move { service.definition(&object, refresh).await })
+                .await;
+            let _ = view.update(cx, |app, cx| {
+                let Some(tab) = app.definitions.iter_mut().find(|tab| tab.id == id) else {
+                    return;
+                };
+                tab.state = match outcome {
+                    Ok(Ok(definition)) => DefinitionState::Loaded(definition),
+                    Ok(Err(error)) => DefinitionState::Failed(error),
+                    Err(error) => DefinitionState::Failed(QueryError {
+                        message: error.to_string(),
+                        severity: None,
+                        code: None,
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    }),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Refetches a definition, bypassing the session cache (FR2-011).
+    fn refresh_definition(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        let Some(tab) = self.definitions.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let object = tab.object.clone();
+        tab.state = DefinitionState::Loading;
+        self.load_definition(id, object, true, cx);
+    }
+
+    /// Unlike editors, the workspace need not keep one: closing the last is allowed and focus
+    /// falls back to the editor in front.
+    fn close_definition(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.definitions.retain(|tab| tab.id != id);
+        if self.focus == Focus::Definition(id) {
+            self.focus = Focus::Editor;
+        }
+        cx.notify();
+    }
+
     /// Refreshes the metadata of the connection the active editor is using (§17).
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
         let profile_id = self.editor.connection.id;
@@ -1123,10 +1244,10 @@ impl AppView {
                         this.result_selection = None;
                         if result.is_ok() {
                             match this.editor.destination {
-                                ResultDestination::Pane => this.active_result_tab = false,
-                                ResultDestination::Tab => this.active_result_tab = true,
+                                ResultDestination::Pane => this.focus = Focus::Editor,
+                                ResultDestination::Tab => this.focus = Focus::Result,
                                 ResultDestination::Window => {
-                                    this.active_result_tab = false;
+                                    this.focus = Focus::Editor;
                                     this.show_results_in_window(cx);
                                 }
                             }
@@ -1350,6 +1471,19 @@ impl AppView {
             command::CLOSE_EDITOR => self.close_active_editor(cx),
             command::CONNECT => self.connect(cx),
             command::DISCONNECT => self.disconnect(cx),
+            // Opening a definition needs the object to open, which only the tree and its context
+            // menu can supply, so they call `open_definition` directly.
+            command::OPEN_DEFINITION => {}
+            command::REFRESH_DEFINITION => {
+                if let Focus::Definition(id) = self.focus {
+                    self.refresh_definition(id, cx);
+                }
+            }
+            command::CLOSE_DEFINITION => {
+                if let Focus::Definition(id) = self.focus {
+                    self.close_definition(id, cx);
+                }
+            }
             _ => {}
         }
     }
@@ -1562,12 +1696,12 @@ impl AppView {
     }
 
     fn show_editor_tab(&mut self, cx: &mut Context<Self>) {
-        self.active_result_tab = false;
+        self.focus = Focus::Editor;
         cx.notify();
     }
 
     fn show_result_tab(&mut self, cx: &mut Context<Self>) {
-        self.active_result_tab = true;
+        self.focus = Focus::Result;
         cx.notify();
     }
 
@@ -1582,7 +1716,7 @@ impl AppView {
         editor.title = format!("query-{}.sql", self.background_editors.len() + 2);
         self.background_editors
             .push(std::mem::replace(&mut self.editor, editor));
-        self.active_result_tab = false;
+        self.focus = Focus::Editor;
         self.status = "New SQL editor".into();
         cx.notify();
     }
@@ -1613,7 +1747,7 @@ impl AppView {
             .pop()
             .expect("a background editor exists");
         let closed = std::mem::replace(&mut self.editor, promoted);
-        self.active_result_tab = false;
+        self.focus = Focus::Editor;
         self.result_selection = None;
         self.status = format!("Closed {}", closed.title);
         cx.notify();
@@ -1628,7 +1762,7 @@ impl AppView {
         }
         if let Some(editor) = self.background_editors.get_mut(index) {
             std::mem::swap(&mut self.editor, editor);
-            self.active_result_tab = false;
+            self.focus = Focus::Editor;
             self.status = format!("Editor: {}", self.editor.connection_identity());
             cx.notify();
         }
@@ -1837,8 +1971,13 @@ impl AppView {
                                     self.tree_caption(format!("{kind} · {}", matching.len())),
                                 );
                                 for object in matching {
+                                    let target = object.clone();
                                     tree = tree.child(
                                         div()
+                                            .id(SharedString::from(format!(
+                                                "object-{profile_id}-{schema}-{kind}-{}",
+                                                object.name
+                                            )))
                                             .pl(px(22.))
                                             .pr_3()
                                             .py(px(6.))
@@ -1846,6 +1985,17 @@ impl AppView {
                                             .text_size(px(12.5))
                                             .font_family(self.fonts.mono.clone())
                                             .text_color(rgb(MUTED))
+                                            // Clicking an object shows what it is (FR2-006). Only
+                                            // the active editor's own connection responds, because
+                                            // a definition is fetched from that session and would
+                                            // otherwise describe the wrong database.
+                                            .when(profile_id == self.editor.connection.id, |row| {
+                                                row.cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(PANEL)))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.open_definition(target.clone(), cx)
+                                                    }))
+                                            })
                                             .child(object.name.clone()),
                                     );
                                 }
@@ -1948,7 +2098,7 @@ impl AppView {
             &self.fonts,
             "editor-tab",
             self.editor.title.clone(),
-            !self.active_result_tab,
+            self.focus == Focus::Editor,
             true,
             cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                 if event.modifiers().alt {
@@ -1963,9 +2113,29 @@ impl AppView {
                 &self.fonts,
                 "result-tab",
                 format!("Result: {}", self.editor.title),
-                self.active_result_tab,
+                self.focus == Focus::Result,
                 true,
                 cx.listener(|this, _, _, cx| this.show_result_tab(cx)),
+            ));
+        }
+        // A definition tab belongs to a connection, so it outlives the editors it sits beside
+        // (§8). Alt-click closes it, like every other tab here.
+        for tab in &self.definitions {
+            let id = tab.id;
+            tabs = tabs.child(segment(
+                &self.fonts,
+                SharedString::from(format!("definition-tab-{id}")),
+                format!("{} [Definition]", tab.object.name),
+                self.focus == Focus::Definition(id),
+                true,
+                cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    if event.modifiers().alt {
+                        this.close_definition(id, cx);
+                    } else {
+                        this.focus = Focus::Definition(id);
+                        cx.notify();
+                    }
+                }),
             ));
         }
         tabs.child(segment(
@@ -2210,6 +2380,78 @@ impl AppView {
                     .text_color(rgb(MUTED))
                     .child("ENTER TO APPLY · ESCAPE TO CANCEL · PASTE SUPPORTED"),
             )
+    }
+
+    /// A definition, read-only by construction: no caret, no key handling, no editing path
+    /// (FR2-007). `Rows` blocks are already aligned by the model; `Sql` blocks go through the
+    /// editor's own highlighter (§7).
+    fn definition_surface(&self, tab: &DefinitionTab) -> impl IntoElement {
+        let mut body = div().flex().flex_col().gap_4().p_4().min_w_0();
+        match &tab.state {
+            DefinitionState::Loading => {
+                body = body.child(self.tree_caption("Loading…"));
+            }
+            DefinitionState::Failed(error) => {
+                body = body.child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_family(self.fonts.mono.clone())
+                        .text_color(rgb(RED))
+                        .child(error.message.clone()),
+                );
+                for extra in [error.detail.clone(), error.hint.clone()]
+                    .into_iter()
+                    .flatten()
+                {
+                    body = body.child(
+                        div()
+                            .text_size(px(12.))
+                            .font_family(self.fonts.mono.clone())
+                            .text_color(rgb(MUTED))
+                            .child(extra),
+                    );
+                }
+            }
+            DefinitionState::Loaded(definition) => {
+                for section in definition.sections(&tab.object) {
+                    match section {
+                        DefinitionSection::Rows { heading, lines } => {
+                            body = body.child(self.tree_caption(heading));
+                            for line in lines {
+                                body = body.child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_family(self.fonts.mono.clone())
+                                        .text_color(rgb(TEXT))
+                                        .child(line),
+                                );
+                            }
+                        }
+                        DefinitionSection::Sql { heading, sql } => {
+                            body = body.child(self.tree_caption(heading));
+                            let spans = highlight_lines(&sql);
+                            for (index, line) in sql.lines().enumerate() {
+                                body = body.child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_family(self.fonts.mono.clone())
+                                        .child(highlight_line(
+                                            line,
+                                            spans.get(index).map_or(&[][..], Vec::as_slice),
+                                        )),
+                                );
+                            }
+                        }
+                        DefinitionSection::Note { text } => {
+                            body = body.child(
+                                div().text_size(px(12.5)).text_color(rgb(MUTED)).child(text),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        body
     }
 
     /// The SQL document, with the caret drawn where the cursor actually is and the selection
@@ -2785,7 +3027,7 @@ impl Render for AppView {
         let running = self.is_running();
         let editing_limit = self.limit_buffer.is_some();
         let pane_visible =
-            self.editor.destination == ResultDestination::Pane && !self.active_result_tab;
+            self.editor.destination == ResultDestination::Pane && self.focus == Focus::Editor;
         div()
             .track_focus(&self.focus_handle)
             .key_context("SqlEditor")
@@ -2795,6 +3037,7 @@ impl Render for AppView {
                 let viewport_height = window.viewport_size().height;
                 if this.editor_scroll.drag(event)
                     | this.results_scroll.drag(event)
+                    | this.definition_scroll.drag(event)
                     | this.drag_pane(event.position.y, viewport_height)
                 {
                     cx.notify();
@@ -2805,6 +3048,7 @@ impl Render for AppView {
                 cx.listener(|this, _, _, cx| {
                     let was_dragging = this.editor_scroll.drag.take().is_some()
                         | this.results_scroll.drag.take().is_some()
+                        | this.definition_scroll.drag.take().is_some()
                         | this.pane_drag.take().is_some()
                         | this.selecting_results
                         | this.selecting_editor;
@@ -3128,26 +3372,40 @@ impl Render for AppView {
                                             window.focus(&this.focus_handle(cx));
                                         }),
                                     )
-                                    // The result tab shares this surface with the editor, so it
-                                    // scrolls against whichever handle is currently showing.
-                                    .child(if self.active_result_tab {
-                                        scrollable(
+                                    // The result and definition tabs share this surface with the
+                                    // editor, so it scrolls against whichever handle is showing.
+                                    .child(match self.focus {
+                                        Focus::Result => scrollable(
                                             |view: &mut Self| &mut view.results_scroll,
                                             &self.results_scroll,
                                             "editor-scroll",
                                             self.results_surface(cx),
                                             cx,
                                         )
-                                        .into_any_element()
-                                    } else {
-                                        scrollable(
+                                        .into_any_element(),
+                                        Focus::Definition(id) => {
+                                            let surface = self
+                                                .definitions
+                                                .iter()
+                                                .find(|tab| tab.id == id)
+                                                .map(|tab| self.definition_surface(tab));
+                                            scrollable(
+                                                |view: &mut Self| &mut view.definition_scroll,
+                                                &self.definition_scroll,
+                                                "definition-scroll",
+                                                div().children(surface),
+                                                cx,
+                                            )
+                                            .into_any_element()
+                                        }
+                                        Focus::Editor => scrollable(
                                             |view: &mut Self| &mut view.editor_scroll,
                                             &self.editor_scroll,
                                             "editor-scroll",
                                             self.editor_surface(cx),
                                             cx,
                                         )
-                                        .into_any_element()
+                                        .into_any_element(),
                                     }),
                             )
                             .when(pane_visible, |column| {
@@ -3780,8 +4038,7 @@ mod tests {
     use gpui::{Modifiers, TestAppContext};
 
     use crate::database::{ConnectionInfo, DatabaseProvider};
-    use crate::definition::ObjectDefinition;
-    use crate::result::QueryError;
+    use crate::definition::{ColumnDefinition, TableDefinition};
 
     #[derive(Default)]
     struct UiTestProvider {
@@ -3790,6 +4047,10 @@ mod tests {
         disconnect_calls: AtomicUsize,
         /// Holds `execute` open so a test can act while a query is genuinely in flight.
         blocked: AtomicBool,
+        /// Fails the next definition request, so a test can assert the failure lands in the tab
+        /// and nowhere else.
+        definition_fails: AtomicBool,
+        definition_calls: AtomicUsize,
     }
 
     impl UiTestProvider {
@@ -3837,12 +4098,29 @@ mod tests {
         async fn definition(
             &self,
             object: &DatabaseObject,
-            _: bool,
+            _refresh: bool,
         ) -> Result<ObjectDefinition, QueryError> {
-            Ok(ObjectDefinition::Unsupported {
-                kind: object.kind,
-                reason: "not stubbed".into(),
-            })
+            self.definition_calls.fetch_add(1, Ordering::SeqCst);
+            if self.definition_fails.load(Ordering::SeqCst) {
+                return Err(QueryError {
+                    message: "permission denied for table customer".into(),
+                    severity: None,
+                    code: Some("42501".into()),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                });
+            }
+            Ok(ObjectDefinition::Table(TableDefinition {
+                columns: vec![ColumnDefinition {
+                    position: 1,
+                    name: format!("{}_id", object.name),
+                    data_type: "bigint".into(),
+                    nullable: false,
+                    default: None,
+                }],
+                ..TableDefinition::default()
+            }))
         }
 
         fn state(&self) -> ConnectionState {
@@ -3891,6 +4169,135 @@ mod tests {
             std::thread::yield_now();
         }
         view.update(cx, |app, _| assert_eq!(app.connection_state(), expected));
+    }
+
+    fn customer() -> DatabaseObject {
+        DatabaseObject {
+            schema: "public".into(),
+            name: "customer".into(),
+            kind: ObjectKind::Table,
+        }
+    }
+
+    /// Waits for the expected number of definition tabs, and for every one of them to have
+    /// settled. A tab appears synchronously, so waiting on the count alone would race the load.
+    fn wait_for_definitions(
+        view: &gpui::Entity<AppView>,
+        cx: &mut gpui::VisualTestContext,
+        expected: usize,
+    ) {
+        for _ in 0..1_000 {
+            cx.run_until_parked();
+            let settled = view.update(cx, |app, _| {
+                app.definitions.len() == expected
+                    && !app
+                        .definitions
+                        .iter()
+                        .any(|tab| matches!(tab.state, DefinitionState::Loading))
+            });
+            if settled {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        view.update(cx, |app, _| assert_eq!(app.definitions.len(), expected));
+        panic!("definitions were still loading after {expected} tabs appeared");
+    }
+
+    /// FR2-006, §8: the definition arrives beside the editor, which keeps its contents.
+    #[gpui::test]
+    fn opening_a_definition_leaves_the_editor_untouched(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.editor.document = "SELECT 1;".into();
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "SELECT 1;");
+            assert_eq!(app.definitions[0].object.name, "customer");
+            assert!(matches!(
+                app.definitions[0].state,
+                DefinitionState::Loaded(_)
+            ));
+            assert!(matches!(app.focus, Focus::Definition(_)));
+        });
+    }
+
+    /// §16: the same object focuses the tab it already has rather than opening a second one.
+    #[gpui::test]
+    fn opening_the_same_object_twice_focuses_the_existing_tab(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+        view.update(cx, |app, cx| {
+            app.focus = Focus::Editor;
+            app.open_definition(customer(), cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.definitions.len(), 1);
+            assert!(matches!(app.focus, Focus::Definition(_)));
+        });
+        assert_eq!(provider.definition_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// FR2-010, §12: a failure is confined to its own tab.
+    #[gpui::test]
+    fn a_definition_failure_stays_inside_its_tab(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        provider.definition_fails.store(true, Ordering::SeqCst);
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.editor.document = "SELECT 1;".into();
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            let DefinitionState::Failed(error) = &app.definitions[0].state else {
+                panic!("expected a failed definition");
+            };
+            assert_eq!(error.message, "permission denied for table customer");
+            assert_eq!(app.editor.document, "SELECT 1;");
+            assert_eq!(app.connection_state(), ConnectionState::Connected);
+        });
+    }
+
+    /// §5: a definition belongs to a connection, so editors may come and go beneath it.
+    #[gpui::test]
+    fn a_definition_survives_opening_another_editor(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, cx| app.dispatch_command(command::NEW_EDITOR, cx));
+
+        view.update(cx, |app, _| assert_eq!(app.definitions.len(), 1));
     }
 
     #[test]
@@ -4274,7 +4681,7 @@ mod tests {
                 ..QueryResult::default()
             }];
             app.editor.destination = ResultDestination::Pane;
-            app.active_result_tab = false;
+            app.focus = Focus::Editor;
         });
         // Force a layout pass so the scroll handle has measured geometry.
         cx.simulate_resize(size(px(1280.), px(820.)));
@@ -4416,7 +4823,7 @@ mod tests {
 
         // Editor in front: select-all targets the document.
         view.update(cx, |app, cx| {
-            app.active_result_tab = false;
+            app.focus = Focus::Editor;
             assert!(!app.results_have_focus());
             app.handle_key(&command_key("a"), cx);
             assert_eq!(app.editor.selection, Some(0..app.editor.document.len()));
@@ -4424,7 +4831,7 @@ mod tests {
 
         // Result tab in front: select-all targets the result lines instead.
         view.update(cx, |app, cx| {
-            app.active_result_tab = true;
+            app.focus = Focus::Result;
             app.editor.selection = None;
             assert!(app.results_have_focus());
             app.handle_key(&command_key("a"), cx);
@@ -5641,7 +6048,7 @@ mod tests {
             view.update(cx, |app, cx| {
                 app.editor.display = ResultDisplay::Table;
                 app.editor.results = vec![result_with_rows(&refs)];
-                app.active_result_tab = false;
+                app.focus = Focus::Editor;
                 cx.notify();
             });
             cx.simulate_resize(size(px(1280.), px(820.)));
@@ -5672,7 +6079,7 @@ mod tests {
         view.update(cx, |app, _| {
             app.editor.display = ResultDisplay::Table;
             app.editor.results = vec![result_with_rows(&refs)];
-            app.active_result_tab = false;
+            app.focus = Focus::Editor;
         });
         cx.simulate_resize(size(px(1280.), px(820.)));
         cx.run_until_parked();
