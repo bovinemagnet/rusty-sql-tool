@@ -202,16 +202,19 @@ impl PostgresProvider {
             .retain(|key, _| key.schema != schema);
     }
 
-    /// Runs only the catalogue queries the object's kind requires. Later tasks add arms; anything
-    /// still unhandled reports itself rather than rendering blank (§5).
+    /// Runs only the catalogue queries the object's kind requires. A kind with no arm reports
+    /// itself rather than rendering blank (§5).
     async fn load_definition(
         &self,
         object: &DatabaseObject,
     ) -> Result<ObjectDefinition, QueryError> {
         match object.kind {
             ObjectKind::Table => {
-                let (columns, constraints, indexes) = self
+                let (exists, columns, constraints, indexes) = self
                     .with_client(async |client| {
+                        let exists = client
+                            .query(catalogue::RELATION_EXISTS, &[&object.schema, &object.name])
+                            .await?;
                         let columns = client
                             .query(catalogue::COLUMNS, &[&object.schema, &object.name])
                             .await?;
@@ -221,9 +224,15 @@ impl PostgresProvider {
                         let indexes = client
                             .query(catalogue::INDEXES, &[&object.schema, &object.name])
                             .await?;
-                        Ok((columns, constraints, indexes))
+                        Ok((exists, columns, constraints, indexes))
                     })
                     .await?;
+                // The object was in the tree a moment ago; if it is gone now, say so rather than
+                // rendering a table with no columns, which the three queries above cannot tell
+                // apart from a table that was dropped (§12).
+                if exists.is_empty() {
+                    return Err(simple_error("the object no longer exists"));
+                }
                 let constraints = catalogue::constraints(&constraints);
                 Ok(ObjectDefinition::Table(TableDefinition {
                     columns: catalogue::columns(&columns),
@@ -594,8 +603,8 @@ impl DatabaseProvider for PostgresProvider {
             return Ok(cached);
         }
         let definition = self.load_definition(object).await?;
-        // Kind and counts only: an object's contents are database content, which §44 keeps out of
-        // the log.
+        // Schema and kind only: an object's name and contents are database content, which §44
+        // keeps out of the log.
         tracing::debug!(
             schema = %object.schema,
             kind = ?object.kind,

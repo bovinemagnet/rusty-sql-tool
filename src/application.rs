@@ -270,7 +270,9 @@ mod tests {
     use super::*;
     use crate::config::{PostgresConfiguration, SecretString, SslMode};
     use crate::database::ObjectKind;
-    use crate::definition::{ColumnDefinition, ObjectDefinition, TableDefinition};
+    use crate::definition::{
+        ColumnDefinition, ColumnGeneration, ObjectDefinition, TableDefinition,
+    };
 
     struct FakeProvider {
         statements: Mutex<Vec<String>>,
@@ -363,6 +365,7 @@ mod tests {
                     data_type: "bigint".into(),
                     nullable: false,
                     default: None,
+                    generation: ColumnGeneration::None,
                 }],
                 ..TableDefinition::default()
             }))

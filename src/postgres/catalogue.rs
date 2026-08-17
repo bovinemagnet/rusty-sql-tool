@@ -6,16 +6,21 @@
 use tokio_postgres::Row;
 
 use crate::definition::{
-    CheckConstraint, ColumnDefinition, ForeignKey, IndexDefinition, KeyConstraint,
-    SequenceDefinition,
+    CheckConstraint, ColumnDefinition, ColumnGeneration, ForeignKey, IndexDefinition,
+    KeyConstraint, SequenceDefinition,
 };
 
 /// Columns in physical order (§6). `attnum > 0` excludes system columns; `attisdropped` excludes
 /// the tombstones a dropped column leaves behind.
+///
+/// `attidentity` and `attgenerated` come back alongside `pg_attrdef`, because that table alone
+/// cannot tell a default from a generation expression, and holds nothing at all for an identity
+/// column (FR2-001).
 pub const COLUMNS: &str = "SELECT a.attnum, a.attname, \
      pg_catalog.format_type(a.atttypid, a.atttypmod), \
      a.attnotnull, \
-     pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+     pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
+     a.attidentity, a.attgenerated \
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -28,16 +33,37 @@ pub fn columns(rows: &[Row]) -> Vec<ColumnDefinition> {
         .map(|row| {
             // attnum is int2, so it arrives as i16 and widens rather than truncates.
             let position: i16 = row.get(0);
+            // attidentity and attgenerated are PostgreSQL's `"char"`, like contype above: one byte
+            // the driver hands over as i8, empty-string-equivalent `\0` when the column is plain.
+            let identity: i8 = row.get(5);
+            let generated: i8 = row.get(6);
             ColumnDefinition {
                 position: i32::from(position),
                 name: row.get(1),
                 data_type: row.get(2),
                 nullable: !row.get::<_, bool>(3),
                 default: row.get(4),
+                generation: generation(identity as u8, generated as u8),
             }
         })
         .collect()
 }
+
+fn generation(identity: u8, generated: u8) -> ColumnGeneration {
+    match (identity, generated) {
+        (b'a', _) => ColumnGeneration::IdentityAlways,
+        (b'd', _) => ColumnGeneration::IdentityByDefault,
+        (_, b's') => ColumnGeneration::Stored,
+        _ => ColumnGeneration::None,
+    }
+}
+
+/// §12: an object can be dropped between the tree listing it and this request. The per-section
+/// queries below all return nothing in that case, which would otherwise render as a table with no
+/// columns rather than as the error it is.
+pub const RELATION_EXISTS: &str = "SELECT true FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p')";
 
 /// Constraints of one table. `WITH ORDINALITY` preserves the declared column order, which matters
 /// for composite keys — ordering by `attnum` would silently reorder them.
@@ -140,8 +166,14 @@ pub const ROUTINE_DEFINITION: &str = "SELECT pg_catalog.pg_get_function_argument
      WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind IN ('f','p') \
      ORDER BY p.oid LIMIT 1";
 
-/// `pg_sequence` holds the parameters; the owning column comes from an auto dependency, which is
-/// what `ALTER SEQUENCE … OWNED BY` and `serial` both record.
+/// `pg_sequence` holds the parameters; the owning column comes from a dependency, which is what
+/// `ALTER SEQUENCE … OWNED BY`, `serial` and `GENERATED … AS IDENTITY` all record.
+///
+/// `deptype` admits both `'a'` and `'i'`: `serial` records an auto dependency, identity an
+/// internal one. Restricting `'a'` alone would leave an identity sequence — the form PostgreSQL
+/// has recommended since version 10 — looking unowned. The `classid`/`refclassid` restrictions are
+/// the ones psql's own sequence query carries, so a dependency on some other kind of object
+/// sharing the oid cannot be picked up as a column.
 pub const SEQUENCE_DEFINITION: &str = "SELECT pg_catalog.format_type(s.seqtypid, NULL), \
      s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcycle, \
      (SELECT dn.nspname || '.' || dc.relname || '.' || da.attname \
@@ -150,7 +182,9 @@ pub const SEQUENCE_DEFINITION: &str = "SELECT pg_catalog.format_type(s.seqtypid,
         JOIN pg_catalog.pg_namespace dn ON dn.oid = dc.relnamespace \
         JOIN pg_catalog.pg_attribute da \
           ON da.attrelid = d.refobjid AND da.attnum = d.refobjsubid \
-       WHERE d.objid = c.oid AND d.deptype = 'a' LIMIT 1) \
+       WHERE d.objid = c.oid AND d.deptype IN ('a','i') \
+         AND d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass \
+       LIMIT 1) \
      FROM pg_catalog.pg_sequence s \
      JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \

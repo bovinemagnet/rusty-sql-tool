@@ -429,7 +429,9 @@ struct DefinitionTab {
 
 enum DefinitionState {
     Loading,
-    Loaded(ObjectDefinition),
+    /// The laid-out sections rather than the definition itself: the layout is settled once, when
+    /// the load lands, rather than rebuilt on every frame the tab is on screen.
+    Loaded(Vec<DefinitionSection>),
     /// A failed load or refresh replaces the body, so stale content is never shown as current
     /// (§11, FR2-010).
     Failed(QueryError),
@@ -437,7 +439,12 @@ enum DefinitionState {
 
 /// The tree's context menu, open over one object. §8 admits one entry and forbids anything that
 /// modifies the database.
+///
+/// The connection is captured here, not read when the entry is chosen: the menu outlives the tree
+/// row's own gate, and the editor can be pointed at another connection while it is open. Nothing
+/// may reach across from one connection to another (§48, §49).
 struct ObjectMenu {
+    profile_id: uuid::Uuid,
     object: DatabaseObject,
 }
 
@@ -449,7 +456,7 @@ impl ObjectMenu {
 
 /// Which surface the workspace is showing. Replaces the earlier `active_result_tab` flag, which
 /// could not express a third destination.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Editor,
     Result,
@@ -1054,11 +1061,18 @@ impl AppView {
         cx.notify();
     }
 
-    /// Opens an object's definition beside the editors (FR2-006). The object's connection must be
-    /// live: a definition cannot be fetched from a closed session, and a tab that can only show an
-    /// error is worse than a message.
-    fn open_definition(&mut self, object: DatabaseObject, cx: &mut Context<Self>) {
-        let profile_id = self.editor.connection.id;
+    /// Opens an object's definition beside the editors (FR2-006). The connection is passed in by
+    /// whatever offered the object, never read from the editor in front, so a menu left open
+    /// across a connection change cannot fetch from the wrong database (§48, §49).
+    ///
+    /// That connection must be live: a definition cannot be fetched from a closed session, and a
+    /// tab that can only show an error is worse than a message.
+    fn open_definition(
+        &mut self,
+        profile_id: uuid::Uuid,
+        object: DatabaseObject,
+        cx: &mut Context<Self>,
+    ) {
         if self.state_of(profile_id) != ConnectionState::Connected {
             self.status = "Connect before opening a definition".into();
             cx.notify();
@@ -1066,7 +1080,7 @@ impl AppView {
         }
         // A definition tab shows no result grid, so a selection left over from the result surface
         // must not survive underneath it — otherwise Ctrl+C would copy lines visible nowhere on
-        // screen (Task 9 review).
+        // screen (§9).
         self.result_selection = None;
         if let Some(existing) = self
             .definitions
@@ -1112,7 +1126,9 @@ impl AppView {
                     return;
                 };
                 tab.state = match outcome {
-                    Ok(Ok(definition)) => DefinitionState::Loaded(definition),
+                    Ok(Ok(definition)) => {
+                        DefinitionState::Loaded(display_sections(&definition, &tab.object))
+                    }
                     Ok(Err(error)) => DefinitionState::Failed(error),
                     Err(error) => DefinitionState::Failed(QueryError {
                         message: error.to_string(),
@@ -1156,17 +1172,17 @@ impl AppView {
     /// copying a definition; this is what the Copy action places on the clipboard.
     fn definition_text(&self, id: uuid::Uuid) -> Option<String> {
         let tab = self.definitions.iter().find(|tab| tab.id == id)?;
-        let DefinitionState::Loaded(definition) = &tab.state else {
+        let DefinitionState::Loaded(sections) = &tab.state else {
             return None;
         };
         let mut blocks = Vec::new();
-        for section in definition.sections(&tab.object) {
+        for section in sections {
             match section {
                 DefinitionSection::Rows { heading, lines } => {
                     blocks.push(format!("{heading}\n{}", lines.join("\n")))
                 }
                 DefinitionSection::Sql { heading, sql } => blocks.push(format!("{heading}\n{sql}")),
-                DefinitionSection::Note { text } => blocks.push(text),
+                DefinitionSection::Note { text } => blocks.push(text.clone()),
             }
         }
         Some(blocks.join("\n\n"))
@@ -1456,7 +1472,16 @@ impl AppView {
             self.editor.execution_status == ExecutionStatus::Running,
             self.connection_state() == ConnectionState::Connected,
         ) {
-            self.dispatch_command(command_id, cx);
+            // Run, Run All and Explain act on the SQL document, which a definition tab has
+            // replaced on screen. A shortcut must not execute a document the user cannot see
+            // (FR2-007); cancel and the window commands stay available wherever focus is.
+            let executes_the_document = matches!(
+                command_id,
+                command::RUN | command::RUN_ALL | command::EXPLAIN
+            );
+            if !executes_the_document || !matches!(self.focus, Focus::Definition(_)) {
+                self.dispatch_command(command_id, cx);
+            }
             return;
         }
         if command {
@@ -1464,15 +1489,19 @@ impl AppView {
                 // Copy and select-all address the results when those are what the user is looking
                 // at, and the SQL document otherwise.
                 "a" if self.results_have_focus() => self.select_all_results(cx),
+                // A definition tab in front takes Ctrl+C before the results check: a stale result
+                // selection must never win over the tab actually on screen (§9).
+                "c" if let Focus::Definition(id) = self.focus => self.copy_definition(id, cx),
+                "c" if self.results_have_focus() => self.copy_results(cx),
+                // Everything below reads or rewrites the SQL document, so it belongs to the editor
+                // tab alone. A definition is read-only (FR2-007), and neither it nor the result
+                // tab may pass a keystroke down to a document that is not on screen.
+                _ if self.focus != Focus::Editor => {}
                 "a" => {
                     self.editor.selection = Some(0..self.editor.document.len());
                     self.editor.cursor = self.editor.document.len();
                     cx.notify();
                 }
-                // A definition tab in front takes Ctrl+C before the results check: a stale result
-                // selection must never win over the tab actually on screen (Task 9 review).
-                "c" if let Focus::Definition(id) = self.focus => self.copy_definition(id, cx),
-                "c" if self.results_have_focus() => self.copy_results(cx),
                 "c" => {
                     if let Some(range) = self.editor.selection.clone()
                         && !range.is_empty()
@@ -1505,6 +1534,11 @@ impl AppView {
                 "z" => self.undo(cx),
                 _ => {}
             }
+            return;
+        }
+        // The same guard as the editing arms above: caret movement, typing and deletion all act on
+        // the SQL document, which only the editor tab is showing.
+        if self.focus != Focus::Editor {
             return;
         }
         match key {
@@ -1564,20 +1598,29 @@ impl AppView {
     /// Opens the context menu over an object, or closes it if it is already open over that same
     /// object (§8). Opening it over a different object replaces whatever was open before, so the
     /// menu never lingers over the tree pointing at something stale.
-    fn toggle_object_menu(&mut self, object: DatabaseObject, cx: &mut Context<Self>) {
+    ///
+    /// The connection the row belongs to is recorded with the object, because the entry may be
+    /// chosen after the editor has been pointed somewhere else (§48).
+    fn toggle_object_menu(
+        &mut self,
+        profile_id: uuid::Uuid,
+        object: DatabaseObject,
+        cx: &mut Context<Self>,
+    ) {
         self.object_menu = match &self.object_menu {
-            Some(menu) if menu.object == object => None,
-            _ => Some(ObjectMenu { object }),
+            Some(menu) if menu.profile_id == profile_id && menu.object == object => None,
+            _ => Some(ObjectMenu { profile_id, object }),
         };
         cx.notify();
     }
 
-    /// FR2-012, §8: the menu's one entry opens the definition and dismisses the menu.
+    /// FR2-012, §8: the menu's one entry opens the definition and dismisses the menu. It opens
+    /// against the connection the menu was raised over, not whichever one the editor is on now.
     fn choose_open_definition(&mut self, cx: &mut Context<Self>) {
         let Some(menu) = self.object_menu.take() else {
             return;
         };
-        self.open_definition(menu.object, cx);
+        self.open_definition(menu.profile_id, menu.object, cx);
     }
 
     /// Adding a connection is independent of the ones already open — it only retargets the editor
@@ -2088,6 +2131,7 @@ impl AppView {
                                                             if event.click_count() >= 2 {
                                                                 this.object_menu = None;
                                                                 this.open_definition(
+                                                                    profile_id,
                                                                     double_click_target.clone(),
                                                                     cx,
                                                                 );
@@ -2105,6 +2149,7 @@ impl AppView {
                                                             // point on the workspace.
                                                             this.object_menu_position = event.position;
                                                             this.toggle_object_menu(
+                                                                profile_id,
                                                                 right_click_target.clone(),
                                                                 cx,
                                                             )
@@ -2599,24 +2644,26 @@ impl AppView {
                     );
                 }
             }
-            DefinitionState::Loaded(definition) => {
-                for section in definition.sections(&tab.object) {
+            // Laid out when the definition landed, not here: rebuilding the aligned text on every
+            // frame would put the whole of a long `pg_get_functiondef` body on the render thread.
+            DefinitionState::Loaded(sections) => {
+                for section in sections {
                     match section {
                         DefinitionSection::Rows { heading, lines } => {
-                            body = body.child(self.tree_caption(heading));
+                            body = body.child(self.tree_caption(heading.clone()));
                             for line in lines {
                                 body = body.child(
                                     div()
                                         .text_size(px(12.5))
                                         .font_family(self.fonts.mono.clone())
                                         .text_color(rgb(TEXT))
-                                        .child(line),
+                                        .child(line.clone()),
                                 );
                             }
                         }
                         DefinitionSection::Sql { heading, sql } => {
-                            body = body.child(self.tree_caption(heading));
-                            let spans = highlight_lines(&sql);
+                            body = body.child(self.tree_caption(heading.clone()));
+                            let spans = highlight_lines(sql);
                             for (index, line) in sql.lines().enumerate() {
                                 body = body.child(
                                     div()
@@ -2631,14 +2678,26 @@ impl AppView {
                         }
                         DefinitionSection::Note { text } => {
                             body = body.child(
-                                div().text_size(px(12.5)).text_color(rgb(MUTED)).child(text),
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(MUTED))
+                                    .child(text.clone()),
                             );
                         }
                     }
                 }
             }
         }
-        div().flex().flex_col().min_w_0().child(header).child(body)
+        // `items_start` for the same reason the editor and result surfaces set it: without it a
+        // long definition line is stretched to the viewport and wraps, where it should run past
+        // the edge and scroll.
+        div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .min_w_0()
+            .child(header)
+            .child(body)
     }
 
     /// The SQL document, with the caret drawn where the cursor actually is and the selection
@@ -3796,7 +3855,7 @@ fn segmented() -> gpui::Div {
 
 fn segment(
     fonts: &Fonts,
-    id: impl Into<gpui::ElementId>,
+    id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     selected: bool,
     accented: bool,
@@ -3807,8 +3866,13 @@ fn segment(
         (true, false) => (PANEL_HIGH, TEXT),
         (false, _) => (PANEL_LIGHT, MUTED),
     };
+    // The element id doubles as the debug selector, so a tab can be clicked in a test the way the
+    // object tree's rows already are, rather than by calling the handler behind it.
+    let id = id.into();
+    let selector = id.clone();
     div()
         .id(id)
+        .debug_selector(move || selector.to_string())
         .px(px(14.))
         .py_2()
         .rounded_lg()
@@ -3982,6 +4046,23 @@ fn completion_status(results: &[QueryResult]) -> String {
         .sum();
     let rows: usize = results.iter().map(|result| result.rows.len()).sum();
     format!("Completed in {elapsed} ms · {rows} rows")
+}
+
+/// A definition laid out for display, guaranteed to have something in it. `sections` omits an
+/// empty section rather than rendering a bare heading, so a definition whose sections are all
+/// empty would otherwise leave the tab showing a header over nothing at all — §5 wants an absence
+/// stated, never a blank panel.
+fn display_sections(
+    definition: &ObjectDefinition,
+    object: &DatabaseObject,
+) -> Vec<DefinitionSection> {
+    let sections = definition.sections(object);
+    if sections.is_empty() {
+        return vec![DefinitionSection::Note {
+            text: "PostgreSQL reports no definition for this object".into(),
+        }];
+    }
+    sections
 }
 
 fn shortcut_command(
@@ -4229,7 +4310,7 @@ mod tests {
     use gpui::{Modifiers, MouseUpEvent, TestAppContext};
 
     use crate::database::{ConnectionInfo, DatabaseProvider};
-    use crate::definition::{ColumnDefinition, TableDefinition};
+    use crate::definition::{ColumnDefinition, ColumnGeneration, TableDefinition};
 
     #[derive(Default)]
     struct UiTestProvider {
@@ -4241,6 +4322,9 @@ mod tests {
         /// Fails the next definition request, so a test can assert the failure lands in the tab
         /// and nowhere else.
         definition_fails: AtomicBool,
+        /// Answers with a definition that lays out to no sections at all, standing in for any
+        /// future arm that returns less than it meant to.
+        definition_empty: AtomicBool,
         definition_calls: AtomicUsize,
         /// Schemas and objects handed back by `schemas`/`objects`, so a test can populate the tree
         /// and drive a real click on a rendered object row.
@@ -4312,6 +4396,9 @@ mod tests {
                     position: None,
                 });
             }
+            if self.definition_empty.load(Ordering::SeqCst) {
+                return Ok(ObjectDefinition::Table(TableDefinition::default()));
+            }
             Ok(ObjectDefinition::Table(TableDefinition {
                 columns: vec![ColumnDefinition {
                     position: 1,
@@ -4319,6 +4406,7 @@ mod tests {
                     data_type: "bigint".into(),
                     nullable: false,
                     default: None,
+                    generation: ColumnGeneration::None,
                 }],
                 ..TableDefinition::default()
             }))
@@ -4457,7 +4545,9 @@ mod tests {
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
 
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
 
         view.update(cx, |app, _| {
@@ -4482,11 +4572,13 @@ mod tests {
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
 
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
         view.update(cx, |app, cx| {
             app.focus = Focus::Editor;
-            app.open_definition(customer(), cx);
+            app.open_definition(app.editor.connection.id, customer(), cx);
         });
         cx.run_until_parked();
 
@@ -4510,7 +4602,9 @@ mod tests {
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
 
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
 
         view.update(cx, |app, _| {
@@ -4533,7 +4627,9 @@ mod tests {
         });
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
 
         view.update(cx, |app, cx| app.dispatch_command(command::NEW_EDITOR, cx));
@@ -4552,7 +4648,9 @@ mod tests {
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
 
-        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.toggle_object_menu(app.editor.connection.id, customer(), cx)
+        });
 
         view.update(cx, |app, _| {
             assert_eq!(
@@ -4562,8 +4660,9 @@ mod tests {
         });
 
         view.update(cx, |app, cx| {
-            let object = app.object_menu.as_ref().unwrap().object.clone();
-            app.open_definition(object, cx);
+            let menu = app.object_menu.as_ref().expect("the menu should be open");
+            let (profile_id, object) = (menu.profile_id, menu.object.clone());
+            app.open_definition(profile_id, object, cx);
         });
         wait_for_definitions(&view, cx, 1);
 
@@ -4582,7 +4681,9 @@ mod tests {
         });
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
-        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.toggle_object_menu(app.editor.connection.id, customer(), cx)
+        });
 
         view.update(cx, |app, cx| app.choose_open_definition(cx));
         wait_for_definitions(&view, cx, 1);
@@ -4592,8 +4693,7 @@ mod tests {
 
     /// The handlers above are reached through the rendered tree row, not called directly, so this
     /// would catch a regression that loosens the `>= 2` double-click threshold back to a single
-    /// click (§8, FR2-006) — the exact behaviour Task 9's stopgap handler had, and Task 10 exists
-    /// to remove.
+    /// click (§8, FR2-006). §8 opens a definition on a double click; a single click selects.
     #[gpui::test]
     fn a_single_click_on_a_tree_object_leaves_it_unopened_and_a_double_click_opens_it(
         cx: &mut TestAppContext,
@@ -4671,7 +4771,9 @@ mod tests {
     #[gpui::test]
     fn escape_closes_the_object_menu(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
-        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.toggle_object_menu(app.editor.connection.id, customer(), cx)
+        });
         view.update(cx, |app, _| assert!(app.object_menu.is_some()));
 
         view.update(cx, |app, cx| app.handle_key(&key_event("escape"), cx));
@@ -4684,7 +4786,9 @@ mod tests {
     #[gpui::test]
     fn clicking_the_editor_closes_the_object_menu(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
-        view.update(cx, |app, cx| app.toggle_object_menu(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.toggle_object_menu(app.editor.connection.id, customer(), cx)
+        });
 
         view.update(cx, |app, cx| app.click_editor(0, px(0.), false, cx));
 
@@ -4710,7 +4814,9 @@ mod tests {
         });
         wait_for_profile_state(&view, cx, local.id, ConnectionState::Connected);
 
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
         let tab = view.update(cx, |app, _| {
             assert_eq!(app.definitions[0].profile_id, local.id);
@@ -4756,7 +4862,9 @@ mod tests {
         });
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
 
         let id = view.update(cx, |app, _| app.definitions[0].id);
@@ -4780,7 +4888,9 @@ mod tests {
         });
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
 
         provider.definition_fails.store(true, Ordering::SeqCst);
@@ -4808,7 +4918,9 @@ mod tests {
         });
         view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
         wait_for_connection_state(&view, cx, ConnectionState::Connected);
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
 
         let text = view.update(cx, |app, _| app.definition_text(app.definitions[0].id));
@@ -4819,7 +4931,7 @@ mod tests {
         );
     }
 
-    /// The Task 9 review ruling: opening a definition must clear any stale result selection, and
+    /// §9: opening a definition must clear any stale result selection, and
     /// Ctrl+C under a definition tab must copy that definition rather than result-grid lines that
     /// are visible nowhere on screen.
     #[gpui::test]
@@ -4841,7 +4953,9 @@ mod tests {
         view.update(cx, |app, cx| app.select_all_results(cx));
         assert!(view.update(cx, |app, _| app.result_selection.is_some()));
 
-        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
         wait_for_definitions(&view, cx, 1);
         assert!(view.update(cx, |app, _| app.result_selection.is_none()));
 
@@ -4852,6 +4966,289 @@ mod tests {
             clipboard.as_deref(),
             Some("Columns\ncustomer_id  bigint  NOT NULL")
         );
+    }
+
+    /// §5, §12: a definition that lays out to nothing must still say something. `sections` omits
+    /// empty sections, so without this the tab would be a header over a blank panel — and the
+    /// blank would be cached, so reopening it would not help either.
+    #[gpui::test]
+    fn a_definition_with_no_sections_renders_a_note_rather_than_a_blank_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = Arc::new(UiTestProvider::default());
+        provider.definition_empty.store(true, Ordering::SeqCst);
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            let DefinitionState::Loaded(sections) = &app.definitions[0].state else {
+                panic!("expected a loaded definition");
+            };
+            assert_eq!(
+                sections,
+                &vec![DefinitionSection::Note {
+                    text: "PostgreSQL reports no definition for this object".into(),
+                }]
+            );
+        });
+    }
+
+    /// §48, §49: the context menu outlives the tree row that opened it, and the editor can be
+    /// pointed at another connection while it is open. Choosing the entry must still fetch from
+    /// the connection the menu was raised over, never from whichever one is in front now.
+    #[gpui::test]
+    fn the_object_menu_opens_against_the_connection_it_was_raised_over(cx: &mut TestAppContext) {
+        let first = Arc::new(UiTestProvider::default());
+        let second = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        let local = profile_named("Local", "local");
+        let production = profile_named("Production", "production");
+        view.update(cx, |app, cx| {
+            app.provider_factory =
+                provider_factory_per_session(vec![first.clone(), second.clone()]);
+            app.profiles = vec![local.clone(), production.clone()];
+            app.editor.connection = local.clone();
+            app.connect(cx);
+        });
+        wait_for_profile_state(&view, cx, local.id, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| {
+            app.toggle_object_menu(local.id, customer(), cx)
+        });
+
+        // The editor moves to the other connection with the menu still open over the tree.
+        view.update(cx, |app, cx| {
+            app.select_connection(production.id, cx);
+            app.connect(cx);
+        });
+        wait_for_profile_state(&view, cx, production.id, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.choose_open_definition(cx));
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.definitions[0].profile_id, local.id,
+                "the tab must belong to the connection the menu was raised over"
+            );
+        });
+        assert_eq!(first.definition_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second.definition_calls.load(Ordering::SeqCst),
+            0,
+            "the connection the editor was switched to must never have been asked"
+        );
+    }
+
+    /// FR2-007: a definition is read-only, and the SQL document it hides is not on screen. No
+    /// keystroke may reach that document while a definition tab is in front.
+    #[gpui::test]
+    fn typing_under_a_definition_tab_leaves_the_hidden_document_untouched(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 9;
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        cx.simulate_input("DROP TABLE customer");
+        cx.simulate_keystrokes("enter tab backspace delete");
+        cx.simulate_keystrokes("ctrl-a ctrl-v ctrl-z");
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "SELECT 1;");
+            assert_eq!(app.editor.cursor, 9);
+            assert!(app.editor.selection.is_none());
+            assert!(matches!(app.focus, Focus::Definition(_)));
+        });
+    }
+
+    /// The cut half of the same guard: Ctrl+X under a definition tab must not remove text from a
+    /// document the user cannot see (FR2-007).
+    #[gpui::test]
+    fn ctrl_x_under_a_definition_tab_does_not_cut_from_the_hidden_document(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        let (view, cx) = (view, cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.editor.document = "SELECT 1;".into();
+            // A selection left behind by editing before the definition was opened.
+            app.editor.selection = Some(0..6);
+            app.editor.cursor = 6;
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, cx| app.handle_key(&command_key("x"), cx));
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "SELECT 1;");
+            assert_eq!(app.editor.selection, Some(0..6));
+        });
+    }
+
+    /// FR2-007: Run, Run All and Explain act on the SQL document, so a shortcut must not execute
+    /// what the user is not looking at.
+    #[gpui::test]
+    fn the_run_shortcut_does_nothing_under_a_definition_tab(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.editor.document = "SELECT 1;".into();
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        cx.simulate_keystrokes("ctrl-enter");
+
+        // `run` marks the editor Running before it dispatches anything, so this settles the
+        // question without waiting on the round trip that would have followed.
+        view.update(cx, |app, _| {
+            assert_ne!(app.editor.execution_status, ExecutionStatus::Running);
+            assert!(app.editor.results.is_empty());
+            assert!(matches!(app.focus, Focus::Definition(_)));
+        });
+
+        // The same keystroke under the editor tab still runs, so the guard is a focus check and
+        // not a disabled shortcut.
+        view.update(cx, |app, cx| app.show_editor_tab(cx));
+        cx.simulate_keystrokes("ctrl-enter");
+        wait_until(cx, |cx| {
+            view.update(cx, |app, _| !app.editor.results.is_empty())
+        });
+        view.update(cx, |app, _| assert_eq!(app.editor.results.len(), 1));
+    }
+
+    /// Alt-clicking a definition tab closes it and focus falls back to the editor, which is the
+    /// only surface guaranteed to be there (§8).
+    #[gpui::test]
+    fn alt_clicking_a_definition_tab_closes_it_and_focus_falls_back_to_the_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        let id = view.update(cx, |app, _| app.definitions[0].id);
+        let tab_id: &'static str = Box::leak(format!("definition-tab-{id}").into_boxed_str());
+        let tab = cx
+            .debug_bounds(tab_id)
+            .expect("the definition tab should be rendered");
+        cx.simulate_click(
+            tab.center(),
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+        );
+
+        view.update(cx, |app, _| {
+            assert!(app.definitions.is_empty());
+            assert_eq!(app.focus, Focus::Editor);
+        });
+    }
+
+    /// Closing a tab that is not the one in front leaves focus where it was, so the user is not
+    /// thrown out of the definition they were reading (§8).
+    #[gpui::test]
+    fn closing_a_background_definition_leaves_the_focused_one_in_front(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+        view.update(cx, |app, cx| {
+            let object = DatabaseObject {
+                schema: "public".into(),
+                name: "invoice".into(),
+                kind: ObjectKind::Table,
+            };
+            app.open_definition(app.editor.connection.id, object, cx);
+        });
+        wait_for_definitions(&view, cx, 2);
+
+        let (first, second) = view.update(cx, |app, _| (app.definitions[0].id, app.focus));
+        view.update(cx, |app, cx| app.close_definition(first, cx));
+
+        view.update(cx, |app, _| {
+            assert_eq!(app.definitions.len(), 1);
+            assert_eq!(app.definitions[0].object.name, "invoice");
+            assert_eq!(app.focus, second);
+        });
+    }
+
+    /// The command path onto the same fallback: Close Definition acts on the tab in front, and
+    /// closing the last one is allowed rather than leaving an empty tab behind (§8).
+    #[gpui::test]
+    fn the_close_definition_command_closes_the_tab_in_front(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.open_definition(app.editor.connection.id, customer(), cx)
+        });
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, cx| {
+            app.dispatch_command(command::CLOSE_DEFINITION, cx)
+        });
+
+        view.update(cx, |app, _| {
+            assert!(app.definitions.is_empty());
+            assert_eq!(app.focus, Focus::Editor);
+        });
+
+        // With no definition in front the command is inert rather than closing something else.
+        view.update(cx, |app, cx| {
+            app.dispatch_command(command::CLOSE_DEFINITION, cx)
+        });
+        view.update(cx, |app, _| assert_eq!(app.focus, Focus::Editor));
     }
 
     #[test]
