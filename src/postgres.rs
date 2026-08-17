@@ -195,8 +195,7 @@ impl PostgresProvider {
 
     /// Runs only the catalogue queries the object's kind requires. Later tasks add arms; anything
     /// still unhandled reports itself rather than rendering blank (§5).
-    // `TableDefinition` currently has one field; the struct-update syntax stays ready for the
-    // constraint and index fields Tasks 4-5 add.
+    // TableDefinition gains `indexes` in the next task; ..default() stays load-bearing.
     #[allow(clippy::needless_update)]
     async fn load_definition(
         &self,
@@ -204,15 +203,24 @@ impl PostgresProvider {
     ) -> Result<ObjectDefinition, QueryError> {
         match object.kind {
             ObjectKind::Table => {
-                let columns = self
+                let (columns, constraints) = self
                     .with_client(async |client| {
-                        client
+                        let columns = client
                             .query(catalogue::COLUMNS, &[&object.schema, &object.name])
-                            .await
+                            .await?;
+                        let constraints = client
+                            .query(catalogue::CONSTRAINTS, &[&object.schema, &object.name])
+                            .await?;
+                        Ok((columns, constraints))
                     })
                     .await?;
+                let constraints = catalogue::constraints(&constraints);
                 Ok(ObjectDefinition::Table(TableDefinition {
                     columns: catalogue::columns(&columns),
+                    primary_key: constraints.primary_key,
+                    foreign_keys: constraints.foreign_keys,
+                    unique_constraints: constraints.unique_constraints,
+                    check_constraints: constraints.check_constraints,
                     ..TableDefinition::default()
                 }))
             }

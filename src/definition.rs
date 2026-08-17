@@ -21,6 +21,32 @@ pub struct ColumnDefinition {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableDefinition {
     pub columns: Vec<ColumnDefinition>,
+    pub primary_key: Option<KeyConstraint>,
+    pub foreign_keys: Vec<ForeignKey>,
+    pub unique_constraints: Vec<KeyConstraint>,
+    pub check_constraints: Vec<CheckConstraint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyConstraint {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckConstraint {
+    pub name: String,
+    /// As `pg_get_constraintdef` renders it, e.g. `CHECK ((x > 0))`.
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_schema: String,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
 }
 
 /// The definition of one database object. An enum rather than a struct of optional sections, so
@@ -47,11 +73,37 @@ pub enum DefinitionSection {
 impl ObjectDefinition {
     /// The definition laid out for display. Takes the object because a foreign key's referenced
     /// table is qualified only when it lives in a different schema from the object being shown.
-    pub fn sections(&self, _object: &DatabaseObject) -> Vec<DefinitionSection> {
+    pub fn sections(&self, object: &DatabaseObject) -> Vec<DefinitionSection> {
         match self {
             Self::Table(table) => {
                 let mut sections = Vec::new();
                 push_rows(&mut sections, "Columns", column_lines(&table.columns));
+                push_rows(
+                    &mut sections,
+                    "Primary Key",
+                    key_lines(table.primary_key.as_slice()),
+                );
+                push_rows(
+                    &mut sections,
+                    "Foreign Keys",
+                    foreign_key_lines(&table.foreign_keys, &object.schema),
+                );
+                push_rows(
+                    &mut sections,
+                    "Unique Constraints",
+                    key_lines(&table.unique_constraints),
+                );
+                push_rows(
+                    &mut sections,
+                    "Check Constraints",
+                    aligned(
+                        &table
+                            .check_constraints
+                            .iter()
+                            .map(|check| vec![check.name.clone(), check.expression.clone()])
+                            .collect::<Vec<_>>(),
+                    ),
+                );
                 sections
             }
             Self::Unsupported { reason, .. } => vec![DefinitionSection::Note {
@@ -98,6 +150,38 @@ fn push_rows(sections: &mut Vec<DefinitionSection>, heading: &str, lines: Vec<St
             lines,
         });
     }
+}
+
+fn key_lines(keys: &[KeyConstraint]) -> Vec<String> {
+    let rows: Vec<Vec<String>> = keys
+        .iter()
+        .map(|key| vec![key.name.clone(), format!("({})", key.columns.join(", "))])
+        .collect();
+    aligned(&rows)
+}
+
+/// A referenced table is qualified only when it lives outside the schema being displayed, which
+/// keeps the common same-schema case as short as the §6 example.
+fn foreign_key_lines(keys: &[ForeignKey], schema: &str) -> Vec<String> {
+    let rows: Vec<Vec<String>> = keys
+        .iter()
+        .map(|key| {
+            let target = if key.referenced_schema == schema {
+                key.referenced_table.clone()
+            } else {
+                format!("{}.{}", key.referenced_schema, key.referenced_table)
+            };
+            vec![
+                key.name.clone(),
+                format!(
+                    "({}) → {target} ({})",
+                    key.columns.join(", "),
+                    key.referenced_columns.join(", ")
+                ),
+            ]
+        })
+        .collect();
+    aligned(&rows)
 }
 
 fn column_lines(columns: &[ColumnDefinition]) -> Vec<String> {
@@ -169,7 +253,6 @@ mod tests {
 
     /// FR2-001. The alignment rule is max-width-plus-two per column, with the line right-trimmed.
     #[test]
-    #[allow(clippy::needless_update)]
     fn table_columns_render_aligned_with_nullability_and_defaults() {
         let definition = ObjectDefinition::Table(TableDefinition {
             columns: vec![
@@ -199,7 +282,6 @@ mod tests {
 
     /// §6: physical order is what `SELECT *` returns, so the model never sorts.
     #[test]
-    #[allow(clippy::needless_update)]
     fn table_columns_keep_physical_order_rather_than_alphabetical() {
         let definition = ObjectDefinition::Table(TableDefinition {
             columns: vec![
@@ -228,6 +310,78 @@ mod tests {
             definition
                 .sections(&object("empty", ObjectKind::Table))
                 .is_empty()
+        );
+    }
+
+    /// FR2-002. A referenced table in the same schema is unqualified; one elsewhere is qualified,
+    /// which is why `sections` needs the object it is describing.
+    #[test]
+    // TableDefinition gains `indexes` in the next task; ..default() stays load-bearing.
+    #[allow(clippy::needless_update)]
+    fn constraints_render_in_their_own_sections() {
+        let definition = ObjectDefinition::Table(TableDefinition {
+            columns: vec![column(1, "id", "bigint", false, None)],
+            primary_key: Some(KeyConstraint {
+                name: "customer_pkey".into(),
+                columns: vec!["id".into()],
+            }),
+            foreign_keys: vec![
+                ForeignKey {
+                    name: "customer_region_fkey".into(),
+                    columns: vec!["region_id".into()],
+                    referenced_schema: "public".into(),
+                    referenced_table: "region".into(),
+                    referenced_columns: vec!["id".into()],
+                },
+                ForeignKey {
+                    name: "customer_tenant_fkey".into(),
+                    columns: vec!["tenant_id".into()],
+                    referenced_schema: "billing".into(),
+                    referenced_table: "tenant".into(),
+                    referenced_columns: vec!["id".into()],
+                },
+            ],
+            unique_constraints: vec![KeyConstraint {
+                name: "customer_email_key".into(),
+                columns: vec!["email".into()],
+            }],
+            check_constraints: vec![CheckConstraint {
+                name: "customer_email_check".into(),
+                expression: "CHECK ((email <> ''::text))".into(),
+            }],
+            ..TableDefinition::default()
+        });
+
+        let sections = definition.sections(&object("customer", ObjectKind::Table));
+        let headings: Vec<&str> = sections
+            .iter()
+            .map(|section| match section {
+                DefinitionSection::Rows { heading, .. } => heading.as_str(),
+                DefinitionSection::Sql { heading, .. } => heading.as_str(),
+                DefinitionSection::Note { .. } => "",
+            })
+            .collect();
+
+        assert_eq!(
+            headings,
+            vec![
+                "Columns",
+                "Primary Key",
+                "Foreign Keys",
+                "Unique Constraints",
+                "Check Constraints"
+            ]
+        );
+
+        let DefinitionSection::Rows { lines, .. } = &sections[2] else {
+            panic!("expected a rows section");
+        };
+        assert_eq!(
+            lines,
+            &vec![
+                "customer_region_fkey  (region_id) → region (id)".to_owned(),
+                "customer_tenant_fkey  (tenant_id) → billing.tenant (id)".to_owned(),
+            ]
         );
     }
 }
