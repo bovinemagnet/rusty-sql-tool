@@ -4373,19 +4373,46 @@ mod tests {
         })
     }
 
+    /// Upper bound for the wall-clock waiters below. Generous enough to absorb CPU contention
+    /// from parallel `cargo test` processes, but firm enough that a genuinely stuck test still
+    /// fails rather than hanging.
+    const TEST_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Polls `condition` — parking the GPUI executor and then yielding real time between polls —
+    /// until it is satisfied or `TEST_WAIT_TIMEOUT` elapses. A fixed iteration budget races
+    /// asynchronous work that crosses a real `tokio::runtime::Runtime` boundary (`AppView` owns
+    /// an `Arc<Runtime>` and dispatches via `runtime.spawn`): under CPU contention an iteration
+    /// budget can run out while the work is still in flight, so this waits on wall-clock time
+    /// instead, sleeping briefly between polls so the waiting thread yields CPU to the work it is
+    /// waiting on rather than spinning against it.
+    fn wait_until(
+        cx: &mut gpui::VisualTestContext,
+        mut condition: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + TEST_WAIT_TIMEOUT;
+        loop {
+            cx.run_until_parked();
+            if condition(cx) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     fn wait_for_connection_state(
         view: &gpui::Entity<AppView>,
         cx: &mut gpui::VisualTestContext,
         expected: ConnectionState,
     ) {
-        for _ in 0..1_000 {
-            cx.run_until_parked();
-            if view.update(cx, |app, _| app.connection_state()) == expected {
-                return;
-            }
-            std::thread::yield_now();
+        let settled = wait_until(cx, |cx| {
+            view.update(cx, |app, _| app.connection_state()) == expected
+        });
+        if !settled {
+            view.update(cx, |app, _| assert_eq!(app.connection_state(), expected));
         }
-        view.update(cx, |app, _| assert_eq!(app.connection_state(), expected));
     }
 
     fn customer() -> DatabaseObject {
@@ -4403,22 +4430,19 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
         expected: usize,
     ) {
-        for _ in 0..1_000 {
-            cx.run_until_parked();
-            let settled = view.update(cx, |app, _| {
+        let settled = wait_until(cx, |cx| {
+            view.update(cx, |app, _| {
                 app.definitions.len() == expected
                     && !app
                         .definitions
                         .iter()
                         .any(|tab| matches!(tab.state, DefinitionState::Loading))
-            });
-            if settled {
-                return;
-            }
-            std::thread::yield_now();
+            })
+        });
+        if !settled {
+            view.update(cx, |app, _| assert_eq!(app.definitions.len(), expected));
+            panic!("definitions were still loading after {expected} tabs appeared");
         }
-        view.update(cx, |app, _| assert_eq!(app.definitions.len(), expected));
-        panic!("definitions were still loading after {expected} tabs appeared");
     }
 
     /// FR2-006, §8: the definition arrives beside the editor, which keeps its contents.
@@ -4596,16 +4620,11 @@ mod tests {
         view.update(cx, |app, cx| {
             app.load_schema(profile_id, "public".into(), false, cx)
         });
-        for _ in 0..1_000 {
-            cx.run_until_parked();
-            let loaded = view.update(cx, |app, _| {
+        wait_until(cx, |cx| {
+            view.update(cx, |app, _| {
                 app.session_for(profile_id).objects.contains_key("public")
-            });
-            if loaded {
-                break;
-            }
-            std::thread::yield_now();
-        }
+            })
+        });
 
         // `debug_bounds` wants a `'static` selector; the row id is only known once the profile
         // connects, so it is leaked for the lifetime of the test process — a standard trick for
@@ -5579,14 +5598,12 @@ mod tests {
         profile_id: uuid::Uuid,
         expected: ConnectionState,
     ) {
-        for _ in 0..1_000 {
-            cx.run_until_parked();
-            if view.update(cx, |app, _| app.state_of(profile_id)) == expected {
-                return;
-            }
-            std::thread::yield_now();
+        let settled = wait_until(cx, |cx| {
+            view.update(cx, |app, _| app.state_of(profile_id)) == expected
+        });
+        if !settled {
+            view.update(cx, |app, _| assert_eq!(app.state_of(profile_id), expected));
         }
-        view.update(cx, |app, _| assert_eq!(app.state_of(profile_id), expected));
     }
 
     /// Two connections, two editors, both live at once — the point of a per-editor selector
@@ -5752,16 +5769,14 @@ mod tests {
     ) {
         // The provider polls on a separate runtime, so this has to yield real time rather than
         // just spinning the GPUI executor.
-        for _ in 0..1_000 {
-            cx.run_until_parked();
-            if view.update(cx, |app, _| app.editor.execution_status) == expected {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        view.update(cx, |app, _| {
-            assert_eq!(app.editor.execution_status, expected)
+        let settled = wait_until(cx, |cx| {
+            view.update(cx, |app, _| app.editor.execution_status) == expected
         });
+        if !settled {
+            view.update(cx, |app, _| {
+                assert_eq!(app.editor.execution_status, expected)
+            });
+        }
     }
 
     /// Re-entering a corrected URL replaces the manual row rather than stacking a second one that
