@@ -117,3 +117,11 @@ pub fn indexes(rows: &[Row]) -> Vec<IndexDefinition> {
         })
         .collect()
 }
+
+/// `pg_get_viewdef(oid, true)` pretty-prints, which is PostgreSQL's own formatting rather than
+/// ours — §7 forbids reformatting, not asking PostgreSQL to format.
+pub const VIEW_DEFINITION: &str = "SELECT pg_catalog.pg_get_viewdef(c.oid, true), \
+     c.relkind = 'm' \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('v','m')";

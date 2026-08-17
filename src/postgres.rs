@@ -16,7 +16,7 @@ use crate::config::{ConnectionProfile, SslMode};
 use crate::database::{
     ConnectionInfo, ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind,
 };
-use crate::definition::{ObjectDefinition, TableDefinition};
+use crate::definition::{ObjectDefinition, TableDefinition, ViewDefinition};
 use crate::result::{CellValue, Column, ExecutionStatus, QueryError, QueryResult};
 
 mod catalogue;
@@ -223,6 +223,29 @@ impl PostgresProvider {
                     unique_constraints: constraints.unique_constraints,
                     check_constraints: constraints.check_constraints,
                     indexes: catalogue::indexes(&indexes),
+                }))
+            }
+            ObjectKind::View | ObjectKind::MaterialisedView => {
+                let (columns, view) = self
+                    .with_client(async |client| {
+                        let columns = client
+                            .query(catalogue::COLUMNS, &[&object.schema, &object.name])
+                            .await?;
+                        let view = client
+                            .query(catalogue::VIEW_DEFINITION, &[&object.schema, &object.name])
+                            .await?;
+                        Ok((columns, view))
+                    })
+                    .await?;
+                // The object was in the tree a moment ago; if it is gone now, say so rather than
+                // rendering a view with no definition (§12).
+                let Some(row) = view.first() else {
+                    return Err(simple_error("the object no longer exists"));
+                };
+                Ok(ObjectDefinition::View(ViewDefinition {
+                    columns: catalogue::columns(&columns),
+                    definition_sql: row.get(0),
+                    materialised: row.get(1),
                 }))
             }
             kind => Ok(ObjectDefinition::Unsupported {

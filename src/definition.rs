@@ -59,6 +59,16 @@ pub struct IndexDefinition {
     pub unique: bool,
 }
 
+/// §5 gives a view a column list plus its definition SQL. Indexes are omitted even for
+/// materialised views, which can carry them — following §5 literally for this phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewDefinition {
+    pub columns: Vec<ColumnDefinition>,
+    /// Exactly as `pg_get_viewdef` returns it; never reformatted (§7).
+    pub definition_sql: String,
+    pub materialised: bool,
+}
+
 /// The definition of one database object. An enum rather than a struct of optional sections, so
 /// states such as a sequence carrying foreign keys cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +79,7 @@ pub enum ObjectDefinition {
         reason: String,
     },
     Table(TableDefinition),
+    View(ViewDefinition),
 }
 
 /// One block of a rendered definition. `Rows` is pre-aligned monospace text; `Sql` is handed to
@@ -124,6 +135,12 @@ impl ObjectDefinition {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
+                sections
+            }
+            Self::View(view) => {
+                let mut sections = Vec::new();
+                push_rows(&mut sections, "Columns", column_lines(&view.columns));
+                push_sql(&mut sections, "Definition", view.definition_sql.clone());
                 sections
             }
             Self::Unsupported { reason, .. } => vec![DefinitionSection::Note {
@@ -409,6 +426,32 @@ mod tests {
             &vec![
                 "customer_region_fkey  (region_id) → region (id)".to_owned(),
                 "customer_tenant_fkey  (tenant_id) → billing.tenant (id)".to_owned(),
+            ]
+        );
+    }
+
+    /// FR2-004. §5 gives a view a column list plus its definition SQL — and no index section.
+    #[test]
+    fn a_view_renders_its_columns_and_its_definition_sql() {
+        let definition = ObjectDefinition::View(ViewDefinition {
+            columns: vec![column(1, "id", "bigint", true, None)],
+            definition_sql: " SELECT customer.id\n   FROM customer;".into(),
+            materialised: false,
+        });
+
+        let sections = definition.sections(&object("active_customer", ObjectKind::View));
+
+        assert_eq!(
+            sections,
+            vec![
+                DefinitionSection::Rows {
+                    heading: "Columns".into(),
+                    lines: vec!["id  bigint".into()],
+                },
+                DefinitionSection::Sql {
+                    heading: "Definition".into(),
+                    sql: " SELECT customer.id\n   FROM customer;".into(),
+                },
             ]
         );
     }
