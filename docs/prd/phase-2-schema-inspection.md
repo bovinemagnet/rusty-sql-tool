@@ -3,7 +3,7 @@
 ## PostgreSQL Schema Inspection
 
 **Working title:** RustSQL / GPUI SQL Client
-**Status:** Proposal
+**Status:** Implemented
 **Phase:** 2 — PostgreSQL Schema Inspection
 **Author:** Paul Snow
 **Version:** 0.0.0
