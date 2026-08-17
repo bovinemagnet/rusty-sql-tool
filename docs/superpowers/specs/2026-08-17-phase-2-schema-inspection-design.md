@@ -155,9 +155,12 @@ pub enum DefinitionSection {
 }
 
 impl ObjectDefinition {
-    pub fn sections(&self) -> Vec<DefinitionSection>;
+    pub fn sections(&self, object: &DatabaseObject) -> Vec<DefinitionSection>;
 }
 ```
+
+`sections` takes the object being described because a foreign key's referenced table is qualified
+only when it lives in a different schema, which cannot be decided from the definition alone.
 
 Putting alignment and section ordering in the model — not the view — is what makes Milestone 1's
 success criterion reachable: a definition can be retrieved and asserted in tests with no UI. It
