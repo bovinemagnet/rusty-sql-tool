@@ -1064,6 +1064,10 @@ impl AppView {
             cx.notify();
             return;
         }
+        // A definition tab shows no result grid, so a selection left over from the result surface
+        // must not survive underneath it — otherwise Ctrl+C would copy lines visible nowhere on
+        // screen (Task 9 review).
+        self.result_selection = None;
         if let Some(existing) = self
             .definitions
             .iter()
@@ -1146,6 +1150,35 @@ impl AppView {
             self.focus = Focus::Editor;
         }
         cx.notify();
+    }
+
+    /// The whole tab as text, in section order: heading, then its lines or its SQL. §9 permits
+    /// copying a definition; this is what the Copy action places on the clipboard.
+    fn definition_text(&self, id: uuid::Uuid) -> Option<String> {
+        let tab = self.definitions.iter().find(|tab| tab.id == id)?;
+        let DefinitionState::Loaded(definition) = &tab.state else {
+            return None;
+        };
+        let mut blocks = Vec::new();
+        for section in definition.sections(&tab.object) {
+            match section {
+                DefinitionSection::Rows { heading, lines } => {
+                    blocks.push(format!("{heading}\n{}", lines.join("\n")))
+                }
+                DefinitionSection::Sql { heading, sql } => blocks.push(format!("{heading}\n{sql}")),
+                DefinitionSection::Note { text } => blocks.push(text),
+            }
+        }
+        Some(blocks.join("\n\n"))
+    }
+
+    /// §9: copying is the one thing Phase 2 permits a user to do with a definition besides read it.
+    fn copy_definition(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        if let Some(text) = self.definition_text(id) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.status = "Copied definition".into();
+            cx.notify();
+        }
     }
 
     /// Refreshes the metadata of the connection the active editor is using (§17).
@@ -1436,6 +1469,9 @@ impl AppView {
                     self.editor.cursor = self.editor.document.len();
                     cx.notify();
                 }
+                // A definition tab in front takes Ctrl+C before the results check: a stale result
+                // selection must never win over the tab actually on screen (Task 9 review).
+                "c" if let Focus::Definition(id) = self.focus => self.copy_definition(id, cx),
                 "c" if self.results_have_focus() => self.copy_results(cx),
                 "c" => {
                     if let Some(range) = self.editor.selection.clone()
@@ -2504,8 +2540,39 @@ impl AppView {
 
     /// A definition, read-only by construction: no caret, no key handling, no editing path
     /// (FR2-007). `Rows` blocks are already aligned by the model; `Sql` blocks go through the
-    /// editor's own highlighter (§7).
-    fn definition_surface(&self, tab: &DefinitionTab) -> impl IntoElement {
+    /// editor's own highlighter (§7). The header's Refresh and Copy controls are the only actions
+    /// §9 permits against a definition.
+    fn definition_surface(&self, tab: &DefinitionTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = tab.id;
+        let loaded = matches!(tab.state, DefinitionState::Loaded(_));
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .pt_4()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(11.))
+                    .font_family(self.fonts.mono.clone())
+                    .text_color(rgb(MUTED))
+                    .child(format!("{}.{}", tab.object.schema, tab.object.name)),
+            )
+            .child(icon_button(
+                "refresh-definition",
+                "↻",
+                true,
+                false,
+                cx.listener(move |this, _, _, cx| this.refresh_definition(id, cx)),
+            ))
+            .child(icon_button(
+                "copy-definition",
+                "⧉",
+                loaded,
+                false,
+                cx.listener(move |this, _, _, cx| this.copy_definition(id, cx)),
+            ));
         let mut body = div().flex().flex_col().gap_4().p_4().min_w_0();
         match &tab.state {
             DefinitionState::Loading => {
@@ -2571,7 +2638,7 @@ impl AppView {
                 }
             }
         }
-        body
+        div().flex().flex_col().min_w_0().child(header).child(body)
     }
 
     /// The SQL document, with the caret drawn where the cursor actually is and the selection
@@ -3508,7 +3575,7 @@ impl Render for AppView {
                                                 .definitions
                                                 .iter()
                                                 .find(|tab| tab.id == id)
-                                                .map(|tab| self.definition_surface(tab));
+                                                .map(|tab| self.definition_surface(tab, cx));
                                             scrollable(
                                                 |view: &mut Self| &mut view.definition_scroll,
                                                 &self.definition_scroll,
@@ -4658,6 +4725,114 @@ mod tests {
                 DefinitionState::Loaded(_)
             ));
         });
+    }
+
+    /// FR2-009: refresh asks PostgreSQL again rather than replaying the cache.
+    #[gpui::test]
+    fn refreshing_a_definition_requests_it_again(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+
+        let id = view.update(cx, |app, _| app.definitions[0].id);
+        view.update(cx, |app, cx| app.refresh_definition(id, cx));
+        // The database round trip runs on the real `tokio::runtime::Runtime` `AppView` owns, off
+        // the deterministic test executor, so settling needs the same poll-and-yield loop the
+        // initial load waits on rather than a single `run_until_parked`.
+        wait_for_definitions(&view, cx, 1);
+
+        assert_eq!(provider.definition_calls.load(Ordering::SeqCst), 2);
+        view.update(cx, |app, _| assert_eq!(app.definitions.len(), 1));
+    }
+
+    /// §11: a refresh that fails replaces the body, so nothing stale is shown as current.
+    #[gpui::test]
+    fn a_failed_refresh_replaces_the_definition_rather_than_keeping_it(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+
+        provider.definition_fails.store(true, Ordering::SeqCst);
+        let id = view.update(cx, |app, _| app.definitions[0].id);
+        view.update(cx, |app, cx| app.refresh_definition(id, cx));
+        // See the comment in `refreshing_a_definition_requests_it_again`: the refresh settles on
+        // the real runtime, not the test executor, so it needs the poll-and-yield loop.
+        wait_for_definitions(&view, cx, 1);
+
+        view.update(cx, |app, _| {
+            assert!(matches!(
+                app.definitions[0].state,
+                DefinitionState::Failed(_)
+            ));
+        });
+    }
+
+    /// §9: copying is permitted — the whole tab, in section order.
+    #[gpui::test]
+    fn copying_a_definition_yields_its_whole_text(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+
+        let text = view.update(cx, |app, _| app.definition_text(app.definitions[0].id));
+
+        assert_eq!(
+            text.as_deref(),
+            Some("Columns\ncustomer_id  bigint  NOT NULL")
+        );
+    }
+
+    /// The Task 9 review ruling: opening a definition must clear any stale result selection, and
+    /// Ctrl+C under a definition tab must copy that definition rather than result-grid lines that
+    /// are visible nowhere on screen.
+    #[gpui::test]
+    fn ctrl_c_under_a_definition_tab_copies_the_definition_not_stale_result_lines(
+        cx: &mut TestAppContext,
+    ) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![result_with_rows(&["alpha"])];
+        });
+        view.update(cx, |app, cx| app.dispatch_command(command::CONNECT, cx));
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        // Stands in for whatever selection the result surface was left in before a definition tab
+        // was opened over it.
+        view.update(cx, |app, cx| app.select_all_results(cx));
+        assert!(view.update(cx, |app, _| app.result_selection.is_some()));
+
+        view.update(cx, |app, cx| app.open_definition(customer(), cx));
+        wait_for_definitions(&view, cx, 1);
+        assert!(view.update(cx, |app, _| app.result_selection.is_none()));
+
+        view.update(cx, |app, cx| app.handle_key(&command_key("c"), cx));
+
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            clipboard.as_deref(),
+            Some("Columns\ncustomer_id  bigint  NOT NULL")
+        );
     }
 
     #[test]

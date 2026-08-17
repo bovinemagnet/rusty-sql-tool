@@ -193,6 +193,15 @@ impl PostgresProvider {
         }
     }
 
+    /// §11: refreshing a branch of the tree invalidates the definitions beneath it, or a tab
+    /// reopened afterwards would show what the branch no longer describes.
+    async fn evict_definitions(&self, schema: &str) {
+        self.definitions_cache
+            .write()
+            .await
+            .retain(|key, _| key.schema != schema);
+    }
+
     /// Runs only the catalogue queries the object's kind requires. Later tasks add arms; anything
     /// still unhandled reports itself rather than rendering blank (§5).
     async fn load_definition(
@@ -516,6 +525,9 @@ impl DatabaseProvider for PostgresProvider {
         if !refresh && let Some(cached) = self.objects_cache.read().await.get(schema).cloned() {
             return Ok(cached);
         }
+        if refresh {
+            self.evict_definitions(schema).await;
+        }
         let objects: Vec<DatabaseObject> = self
             .with_client(async |client| {
                 let rows = client
@@ -679,6 +691,34 @@ fn safe_error(error: &tokio_postgres::Error, fallback: &str) -> QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §11 in isolation: the eviction rule, without needing a server to reach it.
+    #[tokio::test]
+    async fn refreshing_a_schema_evicts_only_that_schemas_definitions() {
+        let provider = PostgresProvider::default();
+        let kept = DefinitionKey {
+            schema: "billing".into(),
+            name: "invoice".into(),
+            kind: ObjectKind::Table,
+        };
+        let evicted = DefinitionKey {
+            schema: "public".into(),
+            name: "customer".into(),
+            kind: ObjectKind::Table,
+        };
+        {
+            let mut cache = provider.definitions_cache.write().await;
+            for key in [kept.clone(), evicted.clone()] {
+                cache.insert(key, ObjectDefinition::Table(TableDefinition::default()));
+            }
+        }
+
+        provider.evict_definitions("public").await;
+
+        let cache = provider.definitions_cache.read().await;
+        assert!(cache.contains_key(&kept));
+        assert!(!cache.contains_key(&evicted));
+    }
 
     #[test]
     fn a_notice_keeps_its_severity_alongside_its_message() {
