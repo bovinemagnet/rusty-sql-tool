@@ -195,15 +195,13 @@ impl PostgresProvider {
 
     /// Runs only the catalogue queries the object's kind requires. Later tasks add arms; anything
     /// still unhandled reports itself rather than rendering blank (§5).
-    // TableDefinition gains `indexes` in the next task; ..default() stays load-bearing.
-    #[allow(clippy::needless_update)]
     async fn load_definition(
         &self,
         object: &DatabaseObject,
     ) -> Result<ObjectDefinition, QueryError> {
         match object.kind {
             ObjectKind::Table => {
-                let (columns, constraints) = self
+                let (columns, constraints, indexes) = self
                     .with_client(async |client| {
                         let columns = client
                             .query(catalogue::COLUMNS, &[&object.schema, &object.name])
@@ -211,7 +209,10 @@ impl PostgresProvider {
                         let constraints = client
                             .query(catalogue::CONSTRAINTS, &[&object.schema, &object.name])
                             .await?;
-                        Ok((columns, constraints))
+                        let indexes = client
+                            .query(catalogue::INDEXES, &[&object.schema, &object.name])
+                            .await?;
+                        Ok((columns, constraints, indexes))
                     })
                     .await?;
                 let constraints = catalogue::constraints(&constraints);
@@ -221,7 +222,7 @@ impl PostgresProvider {
                     foreign_keys: constraints.foreign_keys,
                     unique_constraints: constraints.unique_constraints,
                     check_constraints: constraints.check_constraints,
-                    ..TableDefinition::default()
+                    indexes: catalogue::indexes(&indexes),
                 }))
             }
             kind => Ok(ObjectDefinition::Unsupported {

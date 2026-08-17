@@ -25,6 +25,7 @@ pub struct TableDefinition {
     pub foreign_keys: Vec<ForeignKey>,
     pub unique_constraints: Vec<KeyConstraint>,
     pub check_constraints: Vec<CheckConstraint>,
+    pub indexes: Vec<IndexDefinition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +48,15 @@ pub struct ForeignKey {
     pub referenced_schema: String,
     pub referenced_table: String,
     pub referenced_columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDefinition {
+    pub name: String,
+    /// Exactly as `pg_get_indexdef` returns it; never reformatted (§7).
+    pub definition_sql: String,
+    pub primary: bool,
+    pub unique: bool,
 }
 
 /// The definition of one database object. An enum rather than a struct of optional sections, so
@@ -104,6 +114,16 @@ impl ObjectDefinition {
                             .collect::<Vec<_>>(),
                     ),
                 );
+                push_sql(
+                    &mut sections,
+                    "Indexes",
+                    table
+                        .indexes
+                        .iter()
+                        .map(|index| format!("{};", index.definition_sql))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
                 sections
             }
             Self::Unsupported { reason, .. } => vec![DefinitionSection::Note {
@@ -148,6 +168,16 @@ fn push_rows(sections: &mut Vec<DefinitionSection>, heading: &str, lines: Vec<St
         sections.push(DefinitionSection::Rows {
             heading: heading.to_owned(),
             lines,
+        });
+    }
+}
+
+/// Skips the section entirely when the SQL is empty, matching `push_rows`.
+fn push_sql(sections: &mut Vec<DefinitionSection>, heading: &str, sql: String) {
+    if !sql.is_empty() {
+        sections.push(DefinitionSection::Sql {
+            heading: heading.to_owned(),
+            sql,
         });
     }
 }
@@ -316,8 +346,6 @@ mod tests {
     /// FR2-002. A referenced table in the same schema is unqualified; one elsewhere is qualified,
     /// which is why `sections` needs the object it is describing.
     #[test]
-    // TableDefinition gains `indexes` in the next task; ..default() stays load-bearing.
-    #[allow(clippy::needless_update)]
     fn constraints_render_in_their_own_sections() {
         let definition = ObjectDefinition::Table(TableDefinition {
             columns: vec![column(1, "id", "bigint", false, None)],
@@ -382,6 +410,45 @@ mod tests {
                 "customer_region_fkey  (region_id) → region (id)".to_owned(),
                 "customer_tenant_fkey  (tenant_id) → billing.tenant (id)".to_owned(),
             ]
+        );
+    }
+
+    /// FR2-003. `pg_get_indexdef` output goes through unchanged (§7 forbids reformatting).
+    #[test]
+    fn indexes_render_as_their_postgresql_definitions() {
+        let definition = ObjectDefinition::Table(TableDefinition {
+            columns: vec![column(1, "id", "bigint", false, None)],
+            indexes: vec![
+                IndexDefinition {
+                    name: "customer_pkey".into(),
+                    definition_sql:
+                        "CREATE UNIQUE INDEX customer_pkey ON public.customer USING btree (id)"
+                            .into(),
+                    primary: true,
+                    unique: true,
+                },
+                IndexDefinition {
+                    name: "customer_email_idx".into(),
+                    definition_sql:
+                        "CREATE INDEX customer_email_idx ON public.customer USING btree (email)"
+                            .into(),
+                    primary: false,
+                    unique: false,
+                },
+            ],
+            ..TableDefinition::default()
+        });
+
+        let sections = definition.sections(&object("customer", ObjectKind::Table));
+
+        assert_eq!(
+            sections.last(),
+            Some(&DefinitionSection::Sql {
+                heading: "Indexes".into(),
+                sql: "CREATE UNIQUE INDEX customer_pkey ON public.customer USING btree (id);\n\
+                      CREATE INDEX customer_email_idx ON public.customer USING btree (email);"
+                    .into(),
+            })
         );
     }
 }

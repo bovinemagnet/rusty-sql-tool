@@ -5,7 +5,9 @@
 
 use tokio_postgres::Row;
 
-use crate::definition::{CheckConstraint, ColumnDefinition, ForeignKey, KeyConstraint};
+use crate::definition::{
+    CheckConstraint, ColumnDefinition, ForeignKey, IndexDefinition, KeyConstraint,
+};
 
 /// Columns in physical order (§6). `attnum > 0` excludes system columns; `attisdropped` excludes
 /// the tombstones a dropped column leaves behind.
@@ -92,4 +94,26 @@ pub fn constraints(rows: &[Row]) -> Constraints {
         }
     }
     result
+}
+
+/// Indexes of one table, PostgreSQL's own definitions via `pg_get_indexdef` rather than a
+/// hand-reconstructed column list (§10). The primary key's index sorts first.
+pub const INDEXES: &str = "SELECT c.relname, pg_catalog.pg_get_indexdef(i.indexrelid), \
+     i.indisprimary, i.indisunique \
+     FROM pg_catalog.pg_index i \
+     JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+     JOIN pg_catalog.pg_class t ON t.oid = i.indrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+     WHERE n.nspname = $1 AND t.relname = $2 \
+     ORDER BY i.indisprimary DESC, c.relname";
+
+pub fn indexes(rows: &[Row]) -> Vec<IndexDefinition> {
+    rows.iter()
+        .map(|row| IndexDefinition {
+            name: row.get(0),
+            definition_sql: row.get(1),
+            primary: row.get(2),
+            unique: row.get(3),
+        })
+        .collect()
 }
