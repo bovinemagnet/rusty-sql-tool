@@ -6,12 +6,33 @@
 
 use crate::database::{DatabaseObject, ObjectKind};
 
+/// One column, in the physical order PostgreSQL reports (§6). `position` carries `attnum` so the
+/// order survives any later regrouping; nothing in the model or the UI re-sorts columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnDefinition {
+    pub position: i32,
+    pub name: String,
+    /// As `format_type` renders it, e.g. `varchar(200)`.
+    pub data_type: String,
+    pub nullable: bool,
+    pub default: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableDefinition {
+    pub columns: Vec<ColumnDefinition>,
+}
+
 /// The definition of one database object. An enum rather than a struct of optional sections, so
 /// states such as a sequence carrying foreign keys cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectDefinition {
     /// §5: the object exists but PostgreSQL offers no meaningful definition for its kind.
-    Unsupported { kind: ObjectKind, reason: String },
+    Unsupported {
+        kind: ObjectKind,
+        reason: String,
+    },
+    Table(TableDefinition),
 }
 
 /// One block of a rendered definition. `Rows` is pre-aligned monospace text; `Sql` is handed to
@@ -28,11 +49,75 @@ impl ObjectDefinition {
     /// table is qualified only when it lives in a different schema from the object being shown.
     pub fn sections(&self, _object: &DatabaseObject) -> Vec<DefinitionSection> {
         match self {
+            Self::Table(table) => {
+                let mut sections = Vec::new();
+                push_rows(&mut sections, "Columns", column_lines(&table.columns));
+                sections
+            }
             Self::Unsupported { reason, .. } => vec![DefinitionSection::Note {
                 text: reason.clone(),
             }],
         }
     }
+}
+
+/// Pads every field but the last to the widest value in its column plus two spaces, then trims
+/// the trailing run. One rule, used by every `Rows` section, so the blocks line up with each other.
+fn aligned(rows: &[Vec<String>]) -> Vec<String> {
+    let width = rows.iter().map(Vec::len).max().unwrap_or_default();
+    let widths: Vec<usize> = (0..width)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(String::len)
+                .max()
+                .unwrap_or_default()
+                + 2
+        })
+        .collect();
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (index, field) in row.iter().enumerate() {
+                if index + 1 == row.len() {
+                    line.push_str(field);
+                } else {
+                    line.push_str(&format!("{field:<width$}", width = widths[index]));
+                }
+            }
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
+/// Skips the section entirely when it has no lines, so no bare heading is ever rendered.
+fn push_rows(sections: &mut Vec<DefinitionSection>, heading: &str, lines: Vec<String>) {
+    if !lines.is_empty() {
+        sections.push(DefinitionSection::Rows {
+            heading: heading.to_owned(),
+            lines,
+        });
+    }
+}
+
+fn column_lines(columns: &[ColumnDefinition]) -> Vec<String> {
+    let rows: Vec<Vec<String>> = columns
+        .iter()
+        .map(|column| {
+            let mut suffix = String::new();
+            if !column.nullable {
+                suffix.push_str("NOT NULL");
+            }
+            if let Some(default) = &column.default {
+                if !suffix.is_empty() {
+                    suffix.push(' ');
+                }
+                suffix.push_str(&format!("DEFAULT {default}"));
+            }
+            vec![column.name.clone(), column.data_type.clone(), suffix]
+        })
+        .collect();
+    aligned(&rows)
 }
 
 #[cfg(test)]
@@ -45,6 +130,22 @@ mod tests {
             schema: "public".into(),
             name: name.into(),
             kind,
+        }
+    }
+
+    fn column(
+        position: i32,
+        name: &str,
+        data_type: &str,
+        nullable: bool,
+        default: Option<&str>,
+    ) -> ColumnDefinition {
+        ColumnDefinition {
+            position,
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable,
+            default: default.map(ToOwned::to_owned),
         }
     }
 
@@ -63,6 +164,70 @@ mod tests {
             vec![DefinitionSection::Note {
                 text: "PostgreSQL provides no definition for this object".into(),
             }]
+        );
+    }
+
+    /// FR2-001. The alignment rule is max-width-plus-two per column, with the line right-trimmed.
+    #[test]
+    #[allow(clippy::needless_update)]
+    fn table_columns_render_aligned_with_nullability_and_defaults() {
+        let definition = ObjectDefinition::Table(TableDefinition {
+            columns: vec![
+                column(1, "id", "bigint", false, None),
+                column(2, "name", "varchar(200)", false, None),
+                column(3, "email", "varchar(320)", true, None),
+                column(4, "active", "boolean", false, Some("true")),
+            ],
+            ..TableDefinition::default()
+        });
+
+        let sections = definition.sections(&object("customer", ObjectKind::Table));
+
+        assert_eq!(
+            sections,
+            vec![DefinitionSection::Rows {
+                heading: "Columns".into(),
+                lines: vec![
+                    "id      bigint        NOT NULL".into(),
+                    "name    varchar(200)  NOT NULL".into(),
+                    "email   varchar(320)".into(),
+                    "active  boolean       NOT NULL DEFAULT true".into(),
+                ],
+            }]
+        );
+    }
+
+    /// §6: physical order is what `SELECT *` returns, so the model never sorts.
+    #[test]
+    #[allow(clippy::needless_update)]
+    fn table_columns_keep_physical_order_rather_than_alphabetical() {
+        let definition = ObjectDefinition::Table(TableDefinition {
+            columns: vec![
+                column(1, "zebra", "text", true, None),
+                column(2, "alpha", "text", true, None),
+            ],
+            ..TableDefinition::default()
+        });
+
+        let DefinitionSection::Rows { lines, .. } =
+            &definition.sections(&object("beasts", ObjectKind::Table))[0]
+        else {
+            panic!("expected a rows section");
+        };
+
+        assert!(lines[0].starts_with("zebra"));
+        assert!(lines[1].starts_with("alpha"));
+    }
+
+    /// Empty sections are omitted rather than rendered as a bare heading.
+    #[test]
+    fn a_table_with_no_columns_yields_no_sections() {
+        let definition = ObjectDefinition::Table(TableDefinition::default());
+
+        assert!(
+            definition
+                .sections(&object("empty", ObjectKind::Table))
+                .is_empty()
         );
     }
 }
