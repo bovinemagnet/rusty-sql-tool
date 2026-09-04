@@ -20,6 +20,7 @@ use crate::definition::{ObjectDefinition, RoutineDefinition, TableDefinition, Vi
 use crate::result::{CellValue, Column, ExecutionStatus, QueryError, QueryResult};
 
 mod catalogue;
+pub mod plan;
 
 /// Identity of a cached definition. Kind is part of the key because a table and a function may
 /// share a name within one schema.
