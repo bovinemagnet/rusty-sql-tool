@@ -1255,6 +1255,7 @@ impl AppView {
             RunMode::Current => "Running statement…",
             RunMode::All => "Running all statements…",
             RunMode::Explain => "Explaining statement…",
+            RunMode::ExplainAnalyse => "Explaining statement with ANALYZE…",
         }
         .into();
         let service = self.active_session().service.clone();
@@ -1275,6 +1276,14 @@ impl AppView {
                             }
                             RunMode::Explain => service
                                 .explain(&mut editor)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| RunFailure {
+                                    statement_index: None,
+                                    error,
+                                }),
+                            RunMode::ExplainAnalyse => service
+                                .explain_analyse(&mut editor)
                                 .await
                                 .map(|_| ())
                                 .map_err(|error| RunFailure {
@@ -1477,7 +1486,7 @@ impl AppView {
             // (FR2-007); cancel and the window commands stay available wherever focus is.
             let executes_the_document = matches!(
                 command_id,
-                command::RUN | command::RUN_ALL | command::EXPLAIN
+                command::RUN | command::RUN_ALL | command::EXPLAIN | command::EXPLAIN_ANALYSE
             );
             if !executes_the_document || !matches!(self.focus, Focus::Definition(_)) {
                 self.dispatch_command(command_id, cx);
@@ -1568,6 +1577,7 @@ impl AppView {
             command::RUN => self.run(RunMode::Current, cx),
             command::RUN_ALL => self.run(RunMode::All, cx),
             command::EXPLAIN => self.run(RunMode::Explain, cx),
+            command::EXPLAIN_ANALYSE => self.run(RunMode::ExplainAnalyse, cx),
             command::CANCEL => self.cancel(cx),
             command::NEW_EDITOR => self.new_editor(cx),
             command::CLOSE_EDITOR => self.close_active_editor(cx),
@@ -2987,7 +2997,7 @@ impl AppView {
                         .text_size(px(11.))
                         .font_family(self.fonts.mono.clone())
                         .text_color(rgb(PANEL_LIGHT))
-                        .child("⌘↵ RUN · ⇧⌘↵ RUN ALL · ⌥⌘↵ EXPLAIN"),
+                        .child("⌘↵ RUN · ⇧⌘↵ RUN ALL · ⌥⌘↵ EXPLAIN · ⌥⇧⌘↵ ANALYZE"),
                 )
                 .into_any_element();
         }
@@ -3082,6 +3092,7 @@ enum RunMode {
     Current,
     All,
     Explain,
+    ExplainAnalyse,
 }
 
 /// A failed execution. Run All also records which statement stopped the batch, so the user is told
@@ -3537,6 +3548,16 @@ impl Render for AppView {
                                     ))
                                     .child(button(
                                         &self.fonts,
+                                        "explain-analyse",
+                                        "Explain Analyze",
+                                        Tone::Neutral,
+                                        connected && !running,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dispatch_command(command::EXPLAIN_ANALYSE, cx)
+                                        }),
+                                    ))
+                                    .child(button(
+                                        &self.fonts,
                                         "stop",
                                         "■ Stop",
                                         Tone::Danger,
@@ -3924,10 +3945,12 @@ fn metric_pill(fonts: &Fonts, label: String, colour: u32) -> impl IntoElement {
 }
 
 fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl IntoElement {
-    let count = if result.columns.is_empty() {
-        format!("{} affected", result.affected_rows.unwrap_or(0))
-    } else {
-        format!("{} rows", result.rows.len())
+    let count = match &result.plan {
+        Some(plan) => format!("{} nodes", plan.node_count()),
+        None if result.columns.is_empty() => {
+            format!("{} affected", result.affected_rows.unwrap_or(0))
+        }
+        None => format!("{} rows", result.rows.len()),
     };
     div()
         .flex()
@@ -3947,6 +3970,14 @@ fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl Into
             format!("{count} · {} ms", result.execution_time.as_millis()),
             ACCENT,
         ))
+        // ANALYZE executed the statement; say so where the result is read (FR3-019).
+        .children(
+            result
+                .plan
+                .as_ref()
+                .filter(|plan| plan.analysed)
+                .map(|_| metric_pill(fonts, "EXPLAIN ANALYZE".into(), WARN)),
+        )
         .children(
             result
                 .automatic_limit
@@ -4044,6 +4075,11 @@ fn completion_status(results: &[QueryResult]) -> String {
         .iter()
         .map(|result| result.execution_time.as_millis())
         .sum();
+    if let [result] = results
+        && let Some(plan) = &result.plan
+    {
+        return format!("Explained in {elapsed} ms · {} nodes", plan.node_count());
+    }
     let rows: usize = results.iter().map(|result| result.rows.len()).sum();
     format!("Completed in {elapsed} ms · {rows} rows")
 }
@@ -4078,6 +4114,7 @@ fn shortcut_command(
     let runnable = connected && !running;
     if command_modifier {
         return match key {
+            "enter" if shift && alt => runnable.then_some(command::EXPLAIN_ANALYSE),
             "enter" if shift => runnable.then_some(command::RUN_ALL),
             "enter" if alt => runnable.then_some(command::EXPLAIN),
             "enter" => runnable.then_some(command::RUN),
@@ -5283,6 +5320,10 @@ mod tests {
             Some(command::EXPLAIN)
         );
         assert_eq!(
+            shortcut_command("enter", true, true, true, false, true),
+            Some(command::EXPLAIN_ANALYSE)
+        );
+        assert_eq!(
             shortcut_command("n", true, false, false, false, false),
             Some(command::NEW_EDITOR)
         );
@@ -5301,7 +5342,7 @@ mod tests {
     #[test]
     fn execution_shortcuts_are_refused_while_a_query_is_running() {
         for key in ["enter"] {
-            for (shift, alt) in [(false, false), (true, false), (false, true)] {
+            for (shift, alt) in [(false, false), (true, false), (false, true), (true, true)] {
                 assert_eq!(
                     shortcut_command(key, true, shift, alt, true, true),
                     None,
@@ -6191,6 +6232,91 @@ mod tests {
                 assert_eq!(app.editor.execution_status, expected)
             });
         }
+    }
+
+    /// FR3-019: the toolbar carries Explain Analyze as its own action, and a refused statement
+    /// reports the refusal where every other failure is reported.
+    #[gpui::test]
+    fn explain_analyze_is_refused_for_a_modifying_statement(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "DELETE FROM customer;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| {
+            app.dispatch_command(command::EXPLAIN_ANALYSE, cx)
+        });
+        wait_for_execution_status(&view, cx, ExecutionStatus::Failed);
+
+        view.update(cx, |app, _| {
+            assert!(
+                app.status
+                    .starts_with("Query failed: Explain Analyze runs only")
+            );
+            assert!(app.editor.error.is_some());
+            assert_eq!(app.editor.document, "DELETE FROM customer;");
+        });
+    }
+
+    #[gpui::test]
+    fn explain_analyze_completes_with_a_plan_and_a_node_count(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        cx.simulate_keystrokes("ctrl-alt-shift-enter");
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+
+        view.update(cx, |app, _| {
+            let plan = app.editor.results[0].plan.as_ref().expect("a plan result");
+            assert!(plan.analysed);
+            assert_eq!(app.status, "Explained in 38 ms · 7 nodes");
+        });
+    }
+
+    #[gpui::test]
+    fn plain_explain_never_analyses(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.dispatch_command(command::EXPLAIN, cx));
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+
+        view.update(cx, |app, _| {
+            let plan = app.editor.results[0].plan.as_ref().expect("a plan result");
+            assert!(!plan.analysed);
+            assert!(plan.root.actual.is_none());
+        });
+    }
+
+    #[test]
+    fn a_plan_result_reports_nodes_rather_than_rows() {
+        let result = crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38));
+        assert_eq!(completion_status(&[result]), "Explained in 38 ms · 7 nodes");
     }
 
     /// Re-entering a corrected URL replaces the manual row rather than stacking a second one that
