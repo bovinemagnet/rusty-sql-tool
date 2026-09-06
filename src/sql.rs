@@ -235,9 +235,15 @@ pub fn prepare_statement(sql: &str, row_limit: u32) -> Result<PreparedStatement,
     })
 }
 
-/// Plain EXPLAIN only; callers cannot accidentally request ANALYZE (FR-016).
-pub fn prepare_explain(sql: &str) -> String {
-    format!("EXPLAIN {}", sql.trim())
+/// Builds the EXPLAIN statement. Only `CommandService::explain_analyse` passes `analyse = true`;
+/// plain Explain cannot request ANALYZE (FR-016). JSON output is what the provider parses (FR3-020).
+pub fn prepare_explain(sql: &str, analyse: bool) -> String {
+    let options = if analyse {
+        "ANALYZE, FORMAT JSON"
+    } else {
+        "FORMAT JSON"
+    };
+    format!("EXPLAIN ({options}) {}", sql.trim())
 }
 
 /// What the editor should paint a stretch of SQL as (FR-012).
@@ -766,10 +772,17 @@ mod tests {
         assert_eq!(prepare_statement(sql, 10).unwrap().sql, sql);
     }
 
+    /// FR-016: the plain form never analyses. Both forms ask for JSON so the provider can build
+    /// the plan model from one execution.
     #[test]
-    fn explain_is_never_analyse() {
-        let explained = prepare_explain("SELECT 1;");
-        assert_eq!(explained, "EXPLAIN SELECT 1;");
-        assert!(!explained.contains("ANALYZE"));
+    fn explain_forms_request_json_and_only_analyse_when_asked() {
+        assert_eq!(
+            prepare_explain("  SELECT 1;  ", false),
+            "EXPLAIN (FORMAT JSON) SELECT 1;"
+        );
+        assert_eq!(
+            prepare_explain("SELECT 1", true),
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1"
+        );
     }
 }

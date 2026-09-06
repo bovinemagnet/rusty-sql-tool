@@ -4362,6 +4362,23 @@ mod tests {
             Ok(QueryResult::default())
         }
 
+        async fn explain(&self, _: &str, analyse: bool) -> Result<QueryResult, QueryError> {
+            while self.blocked.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let mut plan = crate::plan::sample_plan();
+            if !analyse {
+                plan.analysed = false;
+                plan.execution_time_ms = None;
+                fn strip(node: &mut crate::plan::PlanNode) {
+                    node.actual = None;
+                    node.children.iter_mut().for_each(strip);
+                }
+                strip(&mut plan.root);
+            }
+            Ok(plan.into_result(std::time::Duration::from_millis(38)))
+        }
+
         async fn cancel(&self) -> Result<(), QueryError> {
             Ok(())
         }

@@ -1,6 +1,10 @@
 //! The execution plan model (FR3-020). Engine-neutral: the PostgreSQL provider builds it, the
 //! views render it, and neither side sees the other.
 
+use std::time::Duration;
+
+use crate::result::{CellValue, Column, ExecutionStatus, QueryResult};
+
 /// One execution plan (FR3-020). `analysed` records whether `ANALYZE` ran, which is what decides
 /// whether `actual` figures exist and whether the run had side effects (FR3-019).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -207,6 +211,28 @@ impl QueryPlan {
             .max()
             .unwrap_or(0);
         layout
+    }
+
+    /// The plan as a result: one `QUERY PLAN` text column holding the text lines, plus the plan
+    /// itself, so the text view, the result window and copying need nothing new.
+    pub fn into_result(self, execution_time: Duration) -> QueryResult {
+        let rows = self
+            .as_text()
+            .lines()
+            .map(|line| vec![CellValue::Text(line.to_owned())])
+            .collect();
+        QueryResult {
+            columns: vec![Column {
+                name: "QUERY PLAN".into(),
+                database_type: "text".into(),
+                nullable: None,
+            }],
+            rows,
+            execution_time,
+            status: ExecutionStatus::Completed,
+            plan: Some(self),
+            ..QueryResult::default()
+        }
     }
 }
 
@@ -500,6 +526,25 @@ mod tests {
         }
         strip(&mut plan.root);
         assert_close(plan.graph_layout().edges[3].rows, 21092.0);
+    }
+
+    #[test]
+    fn a_plan_result_carries_the_text_lines_and_the_plan() {
+        let result = sample_plan().into_result(std::time::Duration::from_millis(38));
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "QUERY PLAN");
+        assert_eq!(result.rows.len(), sample_plan().as_text().lines().count());
+        assert_eq!(
+            result.rows[0][0],
+            crate::result::CellValue::Text(
+                sample_plan().as_text().lines().next().unwrap().to_owned()
+            )
+        );
+        assert_eq!(result.plan, Some(sample_plan()));
+        assert_eq!(result.execution_time, std::time::Duration::from_millis(38));
+        assert_eq!(result.status, crate::result::ExecutionStatus::Completed);
+        // The text view prints the rows verbatim, one per line, and then its status line.
+        assert!(result.as_text().starts_with("QUERY PLAN\nLimit  (cost="));
     }
 }
 

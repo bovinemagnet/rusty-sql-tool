@@ -7,7 +7,7 @@ use crate::config::ConnectionProfile;
 use crate::database::{ConnectionInfo, ConnectionState, DatabaseObject, DatabaseProvider};
 use crate::definition::ObjectDefinition;
 use crate::result::{ExecutionStatus, QueryError, QueryResult};
-use crate::sql::{SqlError, prepare_explain, prepare_statement, relevant_sql, split_statements};
+use crate::sql::{SqlError, prepare_statement, relevant_sql, split_statements};
 use crate::{DEFAULT_ROW_LIMIT, MAX_ROW_LIMIT};
 
 pub mod command {
@@ -208,10 +208,9 @@ impl CommandService {
     pub async fn explain(&self, editor: &mut EditorState) -> Result<QueryResult, QueryError> {
         let sql = relevant_sql(&editor.document, editor.selection.clone(), editor.cursor)
             .map_err(query_selection_error)?;
-        let explained = prepare_explain(sql);
         editor.execution_status = ExecutionStatus::Running;
         editor.error = None;
-        match self.provider.execute(&explained).await {
+        match self.provider.explain(sql, false).await {
             Ok(result) => {
                 editor.execution_status = ExecutionStatus::Completed;
                 editor.results = vec![result.clone()];
@@ -323,6 +322,17 @@ mod tests {
             if sql.contains("FAIL") {
                 return Err(test_error("synthetic failure", None));
             }
+            if sql.contains("CANCELLED") {
+                return Err(test_error("cancelled", Some("57014")));
+            }
+            Ok(QueryResult::default())
+        }
+
+        async fn explain(&self, sql: &str, analyse: bool) -> Result<QueryResult, QueryError> {
+            self.statements
+                .lock()
+                .unwrap()
+                .push(format!("EXPLAIN analyse={analyse} {sql}"));
             if sql.contains("CANCELLED") {
                 return Err(test_error("cancelled", Some("57014")));
             }
@@ -447,8 +457,7 @@ mod tests {
         service.explain(&mut editor).await.unwrap();
 
         let sql = &provider.statements.lock().unwrap()[0];
-        assert_eq!(sql, "EXPLAIN SELECT 1;");
-        assert!(!sql.contains("ANALYZE"));
+        assert_eq!(sql, "EXPLAIN analyse=false SELECT 1;");
     }
 
     #[tokio::test]
