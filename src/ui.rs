@@ -16,7 +16,7 @@ use crate::application::{
 use crate::config::{ConnectionProfile, local_profile};
 use crate::database::{ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind};
 use crate::definition::{DefinitionSection, ObjectDefinition};
-use crate::plan::{PlanRow, QueryPlan};
+use crate::plan::{GraphLayout, PlanRow, QueryPlan};
 use crate::postgres::PostgresProvider;
 use crate::result::{CellValue, ExecutionStatus, QueryError, QueryResult};
 use crate::sql::{Highlight, HighlightSpan, highlight_lines};
@@ -81,6 +81,13 @@ const PLAN_TIME_COLUMN: f32 = 96.;
 const PLAN_BAR_WIDTH: f32 = 120.;
 /// The selected node's detail panel.
 const PLAN_DETAIL_WIDTH: f32 = 340.;
+
+/// Plan graph: node box and the pitch between columns (depth) and rows (leaf order).
+const PLAN_GRAPH_NODE_WIDTH: f32 = 132.;
+const PLAN_GRAPH_NODE_HEIGHT: f32 = 118.;
+const PLAN_GRAPH_COLUMN_PITCH: f32 = 148.;
+const PLAN_GRAPH_ROW_PITCH: f32 = 160.;
+const PLAN_GRAPH_PADDING: f32 = 24.;
 
 /// The single reusable slot for a connection typed into the dialog.
 const MANUAL_PROFILE_NAME: &str = "Manual";
@@ -3042,7 +3049,7 @@ impl AppView {
     /// The plan views with the detail panel alongside when a node is selected (§15.2).
     fn plan_surface(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = match self.editor.plan_display {
-            PlanDisplay::Graph => self.plan_tree(plan, cx), // Task 7 swaps in plan_graph
+            PlanDisplay::Graph => self.plan_graph(plan, cx),
             _ => self.plan_tree(plan, cx),
         };
         let mut surface = table_shell(&self.fonts).flex_row().items_start();
@@ -3089,6 +3096,167 @@ impl AppView {
             tree = tree.child(self.plan_tree_row(&row, analysed, cx));
         }
         tree
+    }
+
+    /// Root at the left, children to the right, connectors as thick as the rows that flowed
+    /// along them. Positions come from the model's layout; this only multiplies by pitches
+    /// (FR3-020, §15.2).
+    fn plan_graph(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::Div {
+        let layout: GraphLayout = plan.graph_layout();
+        let rows = plan.rows();
+        let position = |index: usize| -> (f32, f32) {
+            let placement = &layout.placements[index];
+            (
+                PLAN_GRAPH_PADDING + placement.column as f32 * PLAN_GRAPH_COLUMN_PITCH,
+                PLAN_GRAPH_PADDING + placement.row * PLAN_GRAPH_ROW_PITCH,
+            )
+        };
+        let width = PLAN_GRAPH_PADDING * 2.
+            + layout.columns.saturating_sub(1) as f32 * PLAN_GRAPH_COLUMN_PITCH
+            + PLAN_GRAPH_NODE_WIDTH;
+        let height = PLAN_GRAPH_PADDING * 2.
+            + layout.leaf_rows.saturating_sub(1) as f32 * PLAN_GRAPH_ROW_PITCH
+            + PLAN_GRAPH_NODE_HEIGHT;
+        let mut canvas = div().relative().flex_none().w(px(width)).h(px(height));
+        // Connectors first, so the boxes paint over their ends.
+        for edge in &layout.edges {
+            let (parent_x, parent_y) = position(edge.parent);
+            let (child_x, child_y) = position(edge.child);
+            let thickness = edge_thickness(edge.rows);
+            let start_x = parent_x + PLAN_GRAPH_NODE_WIDTH;
+            let start_y = parent_y + PLAN_GRAPH_NODE_HEIGHT / 2.;
+            let end_y = child_y + PLAN_GRAPH_NODE_HEIGHT / 2.;
+            let elbow_x = start_x + 8.;
+            let top = start_y.min(end_y);
+            canvas = canvas
+                .child(connector(
+                    start_x,
+                    start_y - thickness / 2.,
+                    elbow_x - start_x,
+                    thickness,
+                ))
+                .child(connector(
+                    elbow_x - thickness / 2.,
+                    top - thickness / 2.,
+                    thickness,
+                    (start_y - end_y).abs() + thickness,
+                ))
+                .child(connector(
+                    elbow_x,
+                    end_y - thickness / 2.,
+                    child_x - elbow_x,
+                    thickness,
+                ));
+        }
+        for row in &rows {
+            let (x, y) = position(row.index);
+            let index = row.index;
+            let id = SharedString::from(format!("plan-node-{index}"));
+            let selector = id.clone();
+            let selected = self.plan_selection == Some(index);
+            let (rows_line, time_line) = match &row.node.actual {
+                Some(actual) => (
+                    format!("rows {}", format_count(actual.rows * actual.loops)),
+                    format!("{:.1} ms", actual.total_time_ms),
+                ),
+                None => (
+                    format!("rows {}", format_count(row.node.plan_rows)),
+                    String::new(),
+                ),
+            };
+            canvas = canvas.child(
+                div()
+                    .id(id)
+                    .debug_selector(move || selector.to_string())
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(PLAN_GRAPH_NODE_WIDTH))
+                    .h(px(PLAN_GRAPH_NODE_HEIGHT))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(CONTROL_RADIUS))
+                    .bg(rgb(if row.hottest || selected {
+                        PANEL_HIGH
+                    } else {
+                        PANEL_LIGHT
+                    }))
+                    .border_1()
+                    .border_color(rgb(if row.hottest {
+                        RED
+                    } else if selected {
+                        ACCENT
+                    } else {
+                        BORDER
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_plan_node(index, cx)))
+                    .child(
+                        div()
+                            .h(px(30.))
+                            .text_size(px(12.5))
+                            .line_height(px(15.))
+                            .font_family(self.fonts.display.clone())
+                            .overflow_hidden()
+                            .child(row.node.operation.clone())
+                            .children(row.node.target.clone().map(|target| {
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .whitespace_nowrap()
+                                    .child(target)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .whitespace_nowrap()
+                            .child(rows_line),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(10.5))
+                            .text_color(rgb(FAINT))
+                            .whitespace_nowrap()
+                            .child(format!("est {}", format_count(row.node.plan_rows)))
+                            .children(
+                                estimate_flag(row.estimate_ratio)
+                                    .map(|flag| div().text_color(rgb(WARN)).child(flag)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(10.5))
+                            .text_color(rgb(MUTED))
+                            .whitespace_nowrap()
+                            .child(time_line)
+                            .child(format!("{:.0}%", row.share * 100.)),
+                    )
+                    .child(div().mt_auto().child(share_bar(
+                        row.share,
+                        row.hottest,
+                        PLAN_GRAPH_NODE_WIDTH - 24.,
+                    ))),
+            );
+        }
+        div().flex().flex_col().flex_none().child(canvas).child(
+            div()
+                .flex()
+                .gap_6()
+                .px(px(PLAN_GRAPH_PADDING))
+                .pb(px(20.))
+                .text_size(px(10.))
+                .text_color(rgb(FAINT))
+                .child("CONNECTOR WIDTH ∝ ROWS")
+                .child("BAR = SHARE OF PLAN COST")
+                .child("TIME IS INCLUSIVE OF CHILDREN"),
+        )
     }
 
     fn plan_tree_row(
@@ -4385,6 +4553,24 @@ fn share_bar(share: f64, hottest: bool, width: f32) -> gpui::Div {
                 .rounded_full()
                 .bg(rgb(colour)),
         )
+}
+
+/// One straight segment of an elbow connector between two graph nodes.
+fn connector(x: f32, y: f32, width: f32, height: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(width.max(0.)))
+        .h(px(height.max(0.)))
+        .rounded_full()
+        .bg(rgb(PANEL_HIGH))
+}
+
+/// Connector thickness in pixels: 1 px for a row or none, growing with log10 of the rows, capped
+/// so a hundred-million-row scan does not paint a wall.
+fn edge_thickness(rows: f64) -> f32 {
+    (1.0 + rows.max(1.0).log10() as f32 * 1.2).clamp(1.0, 8.0)
 }
 
 fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl IntoElement {
@@ -6840,6 +7026,37 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_graph_view_places_nodes_by_depth_and_selects_on_click(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+        let segment = cx.debug_bounds("plan-graph").expect("the GRAPH segment");
+        cx.simulate_click(segment.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.plan_display, PlanDisplay::Graph)
+        });
+
+        let limit = cx.debug_bounds("plan-node-0").expect("root box");
+        let sort = cx.debug_bounds("plan-node-1").expect("child box");
+        let orders = cx.debug_bounds("plan-node-4").expect("scan box");
+        let hash = cx.debug_bounds("plan-node-5").expect("hash box");
+        assert!(
+            sort.origin.x > limit.origin.x,
+            "children sit to the right of their parent"
+        );
+        assert_eq!(orders.origin.x, hash.origin.x, "siblings share a column");
+        assert!(
+            hash.origin.y > orders.origin.y,
+            "siblings are stacked in leaf order"
+        );
+        assert_eq!(limit.size.width, px(PLAN_GRAPH_NODE_WIDTH));
+
+        cx.simulate_click(orders.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, Some(4)));
+        assert!(cx.debug_bounds("plan-detail").is_some());
+    }
+
+    #[gpui::test]
     fn the_text_segment_shows_the_text_plan_and_a_new_result_clears_the_selection(
         cx: &mut TestAppContext,
     ) {
@@ -6914,6 +7131,15 @@ mod tests {
         assert_eq!(format_count(999.0), "999");
         assert_eq!(format_count(4960.0), "4 960");
         assert_eq!(format_count(151683.0), "151 683");
+    }
+
+    #[test]
+    fn edge_thickness_grows_with_the_logarithm_of_rows() {
+        assert_eq!(edge_thickness(0.0), 1.0);
+        assert_eq!(edge_thickness(1.0), 1.0);
+        assert!(edge_thickness(10.0) > edge_thickness(1.0));
+        assert!(edge_thickness(48317.0) > edge_thickness(4960.0));
+        assert!(edge_thickness(1e12) <= 8.0);
     }
 
     #[test]
