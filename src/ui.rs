@@ -10,10 +10,13 @@ use gpui::{
 };
 use tokio::runtime::Runtime;
 
-use crate::application::{CommandService, EditorState, ResultDestination, ResultDisplay, command};
+use crate::application::{
+    CommandService, EditorState, PlanDisplay, ResultDestination, ResultDisplay, command,
+};
 use crate::config::{ConnectionProfile, local_profile};
 use crate::database::{ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind};
 use crate::definition::{DefinitionSection, ObjectDefinition};
+use crate::plan::{PlanRow, QueryPlan};
 use crate::postgres::PostgresProvider;
 use crate::result::{CellValue, ExecutionStatus, QueryError, QueryResult};
 use crate::sql::{Highlight, HighlightSpan, highlight_lines};
@@ -68,6 +71,16 @@ const RESULT_CHROME_SLOP_ROWS: usize = 12;
 /// Left inset of a text-result line, matching its `px_5` padding. The selection highlight and the
 /// pointer-to-column arithmetic both measure from here.
 const RESULT_TEXT_INSET: f32 = 20.;
+
+/// Plan tree: indent per depth, and the widths of its fixed columns.
+const PLAN_INDENT: f32 = 22.;
+const PLAN_NODE_COLUMN: f32 = 420.;
+const PLAN_NUMBER_COLUMN: f32 = 120.;
+const PLAN_ACTUAL_COLUMN: f32 = 130.;
+const PLAN_TIME_COLUMN: f32 = 96.;
+const PLAN_BAR_WIDTH: f32 = 120.;
+/// The selected node's detail panel.
+const PLAN_DETAIL_WIDTH: f32 = 340.;
 
 /// The single reusable slot for a connection typed into the dialog.
 const MANUAL_PROFILE_NAME: &str = "Manual";
@@ -504,6 +517,8 @@ struct AppView {
     definition_scroll: ScrollState,
     /// Selected text in the results, and whether a drag is extending it.
     result_selection: Option<ResultSelection>,
+    /// The plan node showing in the detail panel, when one is selected (§15.2).
+    plan_selection: Option<usize>,
     selecting_results: bool,
     /// Whether a pointer drag is currently extending the SQL editor's selection.
     selecting_editor: bool,
@@ -638,6 +653,7 @@ impl AppView {
             results_scroll: ScrollState::default(),
             definition_scroll: ScrollState::default(),
             result_selection: None,
+            plan_selection: None,
             selecting_results: false,
             selecting_editor: false,
             mono_advance: measure_mono_advance(&fonts_for_advance, RESULT_TEXT_SIZE, cx),
@@ -782,31 +798,40 @@ impl AppView {
         self.editor
             .results
             .iter()
-            .flat_map(|result| match self.editor.display {
-                ResultDisplay::Text => result
-                    .as_text()
-                    .lines()
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>(),
-                ResultDisplay::Table => {
-                    let mut lines = Vec::with_capacity(result.rows.len() + 1);
-                    if !result.columns.is_empty() {
-                        lines.push(
-                            result
-                                .columns
-                                .iter()
-                                .map(|column| column.name.clone())
+            .flat_map(|result| {
+                if result.plan.is_some() {
+                    return result
+                        .as_text()
+                        .lines()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                }
+                match self.editor.display {
+                    ResultDisplay::Text => result
+                        .as_text()
+                        .lines()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>(),
+                    ResultDisplay::Table => {
+                        let mut lines = Vec::with_capacity(result.rows.len() + 1);
+                        if !result.columns.is_empty() {
+                            lines.push(
+                                result
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect::<Vec<_>>()
+                                    .join("\t"),
+                            );
+                        }
+                        lines.extend(result.rows.iter().map(|row| {
+                            row.iter()
+                                .map(CellValue::to_display_string)
                                 .collect::<Vec<_>>()
-                                .join("\t"),
-                        );
+                                .join("\t")
+                        }));
+                        lines
                     }
-                    lines.extend(result.rows.iter().map(|row| {
-                        row.iter()
-                            .map(CellValue::to_display_string)
-                            .collect::<Vec<_>>()
-                            .join("\t")
-                    }));
-                    lines
                 }
             })
             .collect()
@@ -1327,6 +1352,7 @@ impl AppView {
                         this.editor.execution_status = editor.execution_status;
                         // A selection into the previous result set means nothing against this one.
                         this.result_selection = None;
+                        this.plan_selection = None;
                         if result.is_ok() {
                             match this.editor.destination {
                                 ResultDestination::Pane => this.focus = Focus::Editor,
@@ -1786,6 +1812,30 @@ impl AppView {
         }
         self.editor.display = display;
         cx.notify();
+    }
+
+    fn set_plan_display(&mut self, display: PlanDisplay, cx: &mut Context<Self>) {
+        self.editor.plan_display = display;
+        cx.notify();
+    }
+
+    /// Selects a plan node for the detail panel; selecting it again clears it.
+    fn select_plan_node(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.plan_selection = if self.plan_selection == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+        cx.notify();
+    }
+
+    /// The plan the editor is showing, when its result is a plan. Explain always leaves exactly
+    /// one result, so the first is the only one to look at.
+    fn shown_plan(&self) -> Option<&QueryPlan> {
+        self.editor
+            .results
+            .first()
+            .and_then(|result| result.plan.as_ref())
     }
 
     fn set_destination(&mut self, destination: ResultDestination, cx: &mut Context<Self>) {
@@ -2470,6 +2520,27 @@ impl AppView {
             ))
     }
 
+    /// TREE / GRAPH / TEXT for a plan result, replacing TABLE / TEXT (FR3-020).
+    fn plan_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.editor.plan_display;
+        let mut control = segmented();
+        for (id, label, display) in [
+            ("plan-tree", "TREE", PlanDisplay::Tree),
+            ("plan-graph", "GRAPH", PlanDisplay::Graph),
+            ("plan-text", "TEXT", PlanDisplay::Text),
+        ] {
+            control = control.child(segment(
+                &self.fonts,
+                id,
+                label,
+                current == display,
+                true,
+                cx.listener(move |this, _, _, cx| this.set_plan_display(display, cx)),
+            ));
+        }
+        control
+    }
+
     fn destination_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         segmented()
             .child(segment(
@@ -2888,8 +2959,11 @@ impl AppView {
             .result_selection
             .and_then(|selection| selection.span_for(index, length));
         let advance = self.mono_advance;
+        let id = SharedString::from(format!("result-line-{index}"));
+        let selector = id.clone();
         div()
-            .id(SharedString::from(format!("result-line-{index}")))
+            .id(id)
+            .debug_selector(move || selector.to_string())
             .relative()
             .min_w_full()
             .cursor_text()
@@ -2964,6 +3038,263 @@ impl AppView {
         table.child(row_spacer(visible.below))
     }
 
+    /// The plan views with the detail panel alongside when a node is selected (§15.2).
+    fn plan_surface(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = match self.editor.plan_display {
+            PlanDisplay::Graph => self.plan_tree(plan, cx), // Task 7 swaps in plan_graph
+            _ => self.plan_tree(plan, cx),
+        };
+        let mut surface = table_shell(&self.fonts).flex_row().items_start();
+        surface = surface.child(view);
+        if let Some(index) = self
+            .plan_selection
+            .filter(|index| plan.node(*index).is_some())
+        {
+            surface = surface.child(self.plan_detail(plan, index));
+        }
+        surface.into_any_element()
+    }
+
+    /// One row per node, indented by depth, with the metrics as columns and a cost-share bar.
+    fn plan_tree(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::Div {
+        let analysed = plan.analysed;
+        let mut header = div()
+            .flex()
+            .flex_none()
+            .h(px(RESULT_ROW_HEIGHT))
+            .border_b_1()
+            .border_color(rgb(BORDER));
+        let mut columns = vec![("NODE", PLAN_NODE_COLUMN), ("EST ROWS", PLAN_NUMBER_COLUMN)];
+        if analysed {
+            columns.push(("ACTUAL ROWS", PLAN_ACTUAL_COLUMN));
+            columns.push(("TIME", PLAN_TIME_COLUMN));
+        }
+        columns.push(("COST", PLAN_NUMBER_COLUMN));
+        columns.push(("SHARE", PLAN_BAR_WIDTH + 24.));
+        for (name, width) in columns {
+            header = header.child(
+                div()
+                    .w(px(width))
+                    .flex_none()
+                    .px_4()
+                    .py(px(11.))
+                    .text_size(px(10.))
+                    .text_color(rgb(FAINT))
+                    .child(name),
+            );
+        }
+        let mut tree = div().flex().flex_col().flex_none().child(header);
+        for row in plan.rows() {
+            tree = tree.child(self.plan_tree_row(&row, analysed, cx));
+        }
+        tree
+    }
+
+    fn plan_tree_row(
+        &self,
+        row: &PlanRow<'_>,
+        analysed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let index = row.index;
+        let id = SharedString::from(format!("plan-node-{index}"));
+        let selector = id.clone();
+        let selected = self.plan_selection == Some(index);
+        let detail = row
+            .node
+            .properties
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut element = div()
+            .id(id)
+            .debug_selector(move || selector.to_string())
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(RESULT_ROW_HEIGHT))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .cursor_pointer()
+            .when(selected, |row| row.bg(rgb(ACCENT_SOFT)))
+            .when(!selected, |row| {
+                row.hover(|style| style.bg(rgb(PANEL_LIGHT)))
+            })
+            // The error card's red strip marks the node the plan spent most on (§15.2).
+            .when(row.hottest, |row| {
+                row.border_l(px(3.)).border_color(rgb(RED))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.select_plan_node(index, cx)))
+            .child(
+                div()
+                    .w(px(PLAN_NODE_COLUMN))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .pr_4()
+                    .pl(px(16. + PLAN_INDENT * row.depth as f32))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .whitespace_nowrap()
+                            .child(row.node.heading()),
+                    )
+                    .when(!detail.is_empty(), |cell| {
+                        cell.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .child(detail),
+                        )
+                    }),
+            )
+            .child(plan_number_cell(
+                format_count(row.node.plan_rows),
+                PLAN_NUMBER_COLUMN,
+            ));
+        if analysed {
+            let (actual_rows, time) = match &row.node.actual {
+                Some(actual) => (
+                    format_count(actual.rows * actual.loops),
+                    format!("{:.2} ms", actual.total_time_ms),
+                ),
+                None => ("—".to_owned(), "—".to_owned()),
+            };
+            let mut actual_cell = div()
+                .w(px(PLAN_ACTUAL_COLUMN))
+                .flex_none()
+                .flex()
+                .items_baseline()
+                .justify_end()
+                .gap(px(6.))
+                .px_4()
+                .text_size(px(13.))
+                .child(actual_rows);
+            if let Some(flag) = estimate_flag(row.estimate_ratio) {
+                actual_cell =
+                    actual_cell.child(div().text_size(px(10.)).text_color(rgb(WARN)).child(flag));
+            }
+            element = element
+                .child(actual_cell)
+                .child(plan_number_cell(time, PLAN_TIME_COLUMN));
+        }
+        element
+            .child(plan_number_cell(
+                format!("{:.2}", row.node.total_cost),
+                PLAN_NUMBER_COLUMN,
+            ))
+            .child(div().flex_none().px_3().child(share_bar(
+                row.share,
+                row.hottest,
+                PLAN_BAR_WIDTH,
+            )))
+    }
+
+    /// Everything about one node: the figures, every server property, and its own text lines.
+    fn plan_detail(&self, plan: &QueryPlan, index: usize) -> gpui::AnyElement {
+        let Some(node) = plan.node(index) else {
+            return div().into_any_element();
+        };
+        let row = plan.rows().into_iter().find(|row| row.index == index);
+        let share = row.as_ref().map_or(0.0, |row| row.share);
+        let hottest = row.as_ref().is_some_and(|row| row.hottest);
+        let mut subtitle = format!("{:.0}% of plan cost", share * 100.);
+        if hottest {
+            subtitle.push_str(" · most expensive node");
+        }
+        let mut pairs: Vec<(String, String)> = vec![
+            ("Startup cost".into(), format!("{:.2}", node.startup_cost)),
+            ("Total cost".into(), format!("{:.2}", node.total_cost)),
+            ("Plan rows".into(), format_count(node.plan_rows)),
+            ("Width".into(), node.plan_width.to_string()),
+        ];
+        if let Some(actual) = &node.actual {
+            let mut rows = format_count(actual.rows * actual.loops);
+            if let Some(flag) = estimate_flag(row.and_then(|row| row.estimate_ratio)) {
+                rows.push_str(&format!(" · {flag}"));
+            }
+            pairs.push(("Actual rows".into(), rows));
+            pairs.push((
+                "Actual time".into(),
+                format!(
+                    "{:.3} .. {:.3} ms",
+                    actual.startup_time_ms, actual.total_time_ms
+                ),
+            ));
+            pairs.push(("Loops".into(), format!("{:.0}", actual.loops)));
+        }
+        pairs.extend(node.properties.iter().cloned());
+        let mut panel = div()
+            .id("plan-detail")
+            .debug_selector(|| "plan-detail".to_owned())
+            .w(px(PLAN_DETAIL_WIDTH))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .px(px(20.))
+            .py(px(18.))
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_family(self.fonts.display.clone())
+                            .child(node.heading()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_family(self.fonts.body.clone())
+                            .text_color(rgb(MUTED))
+                            .child(subtitle),
+                    ),
+            );
+        let mut table = div().flex().flex_col();
+        for (key, value) in pairs {
+            table = table.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_4()
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(12.))
+                    .child(div().text_color(rgb(MUTED)).child(key))
+                    .child(div().text_right().child(value)),
+            );
+        }
+        panel = panel.child(table);
+        let mut raw = div()
+            .flex()
+            .flex_col()
+            .px(px(12.))
+            .py(px(10.))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgb(PANEL_LIGHT))
+            .text_size(px(11.))
+            .line_height(px(16.))
+            .text_color(rgb(MUTED));
+        for line in node.text_lines(0) {
+            raw = raw.child(div().whitespace_nowrap().child(line));
+        }
+        panel
+            .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child("RAW"))
+            .child(raw)
+            .into_any_element()
+    }
+
     /// The window for one block of result rows, given how many rows precede it on the surface.
     fn visible_result_rows(&self, before: usize, count: usize, row_height: Pixels) -> VisibleLines {
         let handle = &self.results_scroll.handle;
@@ -3003,7 +3334,22 @@ impl AppView {
         }
         for (index, result) in self.editor.results.iter().enumerate() {
             content = content.child(result_header(&self.fonts, index, result));
-            content = match self.editor.display {
+            if let Some(plan) = &result.plan
+                && self.editor.plan_display != PlanDisplay::Text
+            {
+                content = content.child(self.plan_surface(plan, cx));
+                line_index += result.rows.len();
+                continue;
+            }
+            // A plan's TEXT segment always renders through the text path below, regardless of
+            // `editor.display` — that field toggles TABLE/TEXT for ordinary results and plays no
+            // part in a plan's own TREE/GRAPH/TEXT choice.
+            let effective_display = if result.plan.is_some() {
+                ResultDisplay::Text
+            } else {
+                self.editor.display
+            };
+            content = match effective_display {
                 ResultDisplay::Text => {
                     let text = result.as_text();
                     let visible = self.visible_result_rows(
@@ -3725,7 +4071,11 @@ impl Render for AppView {
                                                     }),
                                                 ))
                                             })
-                                            .child(self.display_segments(cx))
+                                            .child(if self.shown_plan().is_some() {
+                                                self.plan_segments(cx).into_any_element()
+                                            } else {
+                                                self.display_segments(cx).into_any_element()
+                                            })
                                             .child(self.destination_segments(cx)),
                                     )
                                     // Only the visible surface tracks the results scroll handle;
@@ -3942,6 +4292,72 @@ fn metric_pill(fonts: &Fonts, label: String, colour: u32) -> impl IntoElement {
         .font_family(fonts.mono.clone())
         .text_color(rgb(colour))
         .child(label.to_uppercase())
+}
+
+/// A right-aligned numeric cell of the plan tree.
+fn plan_number_cell(text: String, width: f32) -> gpui::Div {
+    div()
+        .w(px(width))
+        .flex_none()
+        .flex()
+        .justify_end()
+        .px_4()
+        .text_size(px(13.))
+        .whitespace_nowrap()
+        .child(text)
+}
+
+/// Thousands separated by thin spaces, as the design shows them: `48 317`.
+fn format_count(value: f64) -> String {
+    let digits = format!("{:.0}", value.max(0.0));
+    let mut grouped = String::new();
+    for (position, character) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position) % 3 == 0 {
+            grouped.push(' ');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
+/// `↑2.3×` for an under-estimate of at least 2×, `↓2.0×` for an over-estimate of at least 2×.
+fn estimate_flag(ratio: Option<f64>) -> Option<String> {
+    let ratio = ratio?;
+    if ratio >= 2.0 {
+        Some(format!("↑{ratio:.1}×"))
+    } else if ratio > 0.0 && ratio <= 0.5 {
+        Some(format!("↓{:.1}×", 1.0 / ratio))
+    } else {
+        None
+    }
+}
+
+/// The cost-share bar: red for the hottest node, amber for anything at 5 % or more, faint below.
+fn share_bar(share: f64, hottest: bool, width: f32) -> gpui::Div {
+    let colour = if hottest {
+        RED
+    } else if share >= 0.05 {
+        WARN
+    } else {
+        FAINT
+    };
+    div()
+        .relative()
+        .w(px(width))
+        .h(px(6.))
+        .rounded_full()
+        .bg(rgb(PANEL_LIGHT))
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .bottom(px(0.))
+                .w(px((width * share as f32).max(2.)))
+                .rounded_full()
+                .bg(rgb(colour)),
+        )
 }
 
 fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl IntoElement {
@@ -6313,10 +6729,152 @@ mod tests {
         });
     }
 
+    /// Opens the app, connects, explains `SELECT 1` and waits for the sample plan to land.
+    fn explained_app(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.dispatch_command(command::EXPLAIN_ANALYSE, cx)
+        });
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// FR3-020: a plan renders as one row per node, and the results header offers the three
+    /// views in place of TABLE/TEXT.
+    #[gpui::test]
+    fn a_plan_renders_as_a_tree_with_one_row_per_node(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+
+        for index in 0..7 {
+            let id: &'static str = Box::leak(format!("plan-node-{index}").into_boxed_str());
+            assert!(
+                cx.debug_bounds(id).is_some(),
+                "node {index} should be rendered"
+            );
+        }
+        assert!(cx.debug_bounds("plan-node-7").is_none());
+        assert!(cx.debug_bounds("plan-tree").is_some());
+        assert!(cx.debug_bounds("plan-graph").is_some());
+        assert!(cx.debug_bounds("plan-text").is_some());
+        // Not `cx.debug_bounds("display-table").is_none()`: gpui's test harness never evicts a
+        // selector from its debug-bounds map once painted (verified against this pinned gpui
+        // version — it stays "found" for the life of the window even after the element leaves
+        // the tree for good), so that check would report `Some` regardless of what is on screen
+        // now. `AppView::render` puts `plan_segments`/`display_segments` in mutually exclusive
+        // branches of one `if`, so the TREE/GRAPH/TEXT assertions above already prove
+        // `display-table` is not part of the current render.
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.plan_display, PlanDisplay::Tree)
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_a_node_selects_it_and_clicking_again_clears_it(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+        // Node 4 sits below the fold of the fixed-height result pane; scroll it into view first
+        // so the click lands on the row rather than on clipped, unhittable content.
+        view.update(cx, |app, cx| {
+            let max = app.results_scroll.handle.max_offset();
+            app.results_scroll
+                .handle
+                .set_offset(point(px(0.), -max.height));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let row = cx.debug_bounds("plan-node-4").expect("the hot node row");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, Some(4)));
+        assert!(cx.debug_bounds("plan-detail").is_some());
+
+        let row = cx
+            .debug_bounds("plan-node-4")
+            .expect("the row is still there");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        // Not `cx.debug_bounds("plan-detail").is_none()`: see the note above — the map cannot
+        // report an element's removal. `plan_detail` only ever joins `plan_surface` when
+        // `plan_selection` is `Some`, so this state check already proves the panel is gone.
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, None));
+    }
+
+    #[gpui::test]
+    fn the_text_segment_shows_the_text_plan_and_a_new_result_clears_the_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = explained_app(cx);
+        view.update(cx, |app, cx| app.select_plan_node(2, cx));
+
+        let segment = cx.debug_bounds("plan-text").expect("the TEXT segment");
+        cx.simulate_click(segment.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.plan_display, PlanDisplay::Text)
+        });
+        // Not `cx.debug_bounds("plan-node-0").is_none()`: see the note in
+        // `a_plan_renders_as_a_tree_with_one_row_per_node` — the map cannot report an element's
+        // removal. `results_surface` only builds `plan_tree` (and so `plan-node-*`) while
+        // `plan_display != PlanDisplay::Text`, so the state assertion above already proves it.
+        //
+        // Text mode renders result lines; the first is the column name.
+        assert!(cx.debug_bounds("result-line-0").is_some());
+
+        view.update(cx, |app, cx| app.dispatch_command(command::EXPLAIN, cx));
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, None));
+    }
+
+    /// Whatever view is showing, COPY ALL puts the text plan on the clipboard.
+    #[gpui::test]
+    fn copying_a_plan_copies_its_text_form(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+        view.update(cx, |app, cx| app.copy_results(cx));
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(copied.starts_with("QUERY PLAN\nLimit  (cost=4821.14..4821.16"));
+        assert!(copied.contains("->  Seq Scan on orders o"));
+    }
+
     #[test]
     fn a_plan_result_reports_nodes_rather_than_rows() {
         let result = crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38));
         assert_eq!(completion_status(&[result]), "Explained in 38 ms · 7 nodes");
+    }
+
+    #[test]
+    fn counts_group_thousands_with_spaces() {
+        assert_eq!(format_count(0.0), "0");
+        assert_eq!(format_count(999.0), "999");
+        assert_eq!(format_count(4960.0), "4 960");
+        assert_eq!(format_count(151683.0), "151 683");
+    }
+
+    #[test]
+    fn estimate_flags_mark_two_fold_misses_in_either_direction() {
+        assert_eq!(estimate_flag(None), None);
+        assert_eq!(estimate_flag(Some(1.0)), None);
+        assert_eq!(estimate_flag(Some(1.9)), None);
+        assert_eq!(
+            estimate_flag(Some(48317.0 / 21092.0)).as_deref(),
+            Some("↑2.3×")
+        );
+        assert_eq!(estimate_flag(Some(0.25)).as_deref(), Some("↓4.0×"));
     }
 
     /// Re-entering a corrected URL replaces the manual row rather than stacking a second one that
