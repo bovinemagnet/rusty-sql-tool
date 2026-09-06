@@ -1939,6 +1939,7 @@ impl AppView {
         let closed = std::mem::replace(&mut self.editor, promoted);
         self.focus = Focus::Editor;
         self.result_selection = None;
+        self.plan_selection = None;
         self.status = format!("Closed {}", closed.title);
         cx.notify();
     }
@@ -3207,28 +3208,38 @@ impl AppView {
         if hottest {
             subtitle.push_str(" · most expensive node");
         }
-        let mut pairs: Vec<(String, String)> = vec![
-            ("Startup cost".into(), format!("{:.2}", node.startup_cost)),
-            ("Total cost".into(), format!("{:.2}", node.total_cost)),
-            ("Plan rows".into(), format_count(node.plan_rows)),
-            ("Width".into(), node.plan_width.to_string()),
+        // The third element is the estimate flag, WARN-coloured of its own accord — never folded
+        // into the value string, so it keeps its colour wherever a row shows one (§15.2).
+        let mut pairs: Vec<(String, String, Option<String>)> = vec![
+            (
+                "Startup cost".into(),
+                format!("{:.2}", node.startup_cost),
+                None,
+            ),
+            ("Total cost".into(), format!("{:.2}", node.total_cost), None),
+            ("Plan rows".into(), format_count(node.plan_rows), None),
+            ("Width".into(), node.plan_width.to_string(), None),
         ];
         if let Some(actual) = &node.actual {
-            let mut rows = format_count(actual.rows * actual.loops);
-            if let Some(flag) = estimate_flag(row.and_then(|row| row.estimate_ratio)) {
-                rows.push_str(&format!(" · {flag}"));
-            }
-            pairs.push(("Actual rows".into(), rows));
+            let rows = format_count(actual.rows * actual.loops);
+            let flag = estimate_flag(row.and_then(|row| row.estimate_ratio));
+            pairs.push(("Actual rows".into(), rows, flag));
             pairs.push((
                 "Actual time".into(),
                 format!(
                     "{:.3} .. {:.3} ms",
                     actual.startup_time_ms, actual.total_time_ms
                 ),
+                None,
             ));
-            pairs.push(("Loops".into(), format!("{:.0}", actual.loops)));
+            pairs.push(("Loops".into(), format!("{:.0}", actual.loops), None));
         }
-        pairs.extend(node.properties.iter().cloned());
+        pairs.extend(
+            node.properties
+                .iter()
+                .cloned()
+                .map(|(key, value)| (key, value, None)),
+        );
         let mut panel = div()
             .id("plan-detail")
             .debug_selector(|| "plan-detail".to_owned())
@@ -3261,7 +3272,23 @@ impl AppView {
                     ),
             );
         let mut table = div().flex().flex_col();
-        for (key, value) in pairs {
+        for (key, value, flag) in pairs {
+            let mut value_cell = div()
+                .flex()
+                .items_baseline()
+                .justify_end()
+                .gap(px(6.))
+                .child(value);
+            if let Some(flag) = flag {
+                value_cell = value_cell.child(
+                    div()
+                        .id("plan-detail-flag")
+                        .debug_selector(|| "plan-detail-flag".to_owned())
+                        .text_size(px(10.))
+                        .text_color(rgb(WARN))
+                        .child(flag),
+                );
+            }
             table = table.child(
                 div()
                     .flex()
@@ -3272,7 +3299,7 @@ impl AppView {
                     .border_color(rgb(BORDER))
                     .text_size(px(12.))
                     .child(div().text_color(rgb(MUTED)).child(key))
-                    .child(div().text_right().child(value)),
+                    .child(value_cell),
             );
         }
         panel = panel.child(table);
@@ -6851,6 +6878,30 @@ mod tests {
         assert!(copied.contains("->  Seq Scan on orders o"));
     }
 
+    /// §15.2: the estimate flag is WARN-coloured wherever it appears, not only in the tree row —
+    /// it must render as its own element in the detail panel rather than being folded into the
+    /// value text, or it would inherit ordinary foreground colour.
+    #[gpui::test]
+    fn selecting_a_node_with_an_estimate_miss_shows_a_separate_flag_in_the_detail_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = explained_app(cx);
+        // Node 4 ("Seq Scan on orders o") is the row whose estimate the sample plan misses by
+        // more than 2x, so `estimate_flag` is `Some` for it.
+        view.update(cx, |app, cx| app.select_plan_node(4, cx));
+        assert!(cx.debug_bounds("plan-detail-flag").is_some());
+    }
+
+    #[gpui::test]
+    fn selecting_a_node_with_an_accurate_estimate_shows_no_flag_in_the_detail_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = explained_app(cx);
+        // Node 0 ("Limit") estimated 10 rows and got exactly 10, so there is no flag to show.
+        view.update(cx, |app, cx| app.select_plan_node(0, cx));
+        assert!(cx.debug_bounds("plan-detail-flag").is_none());
+    }
+
     #[test]
     fn a_plan_result_reports_nodes_rather_than_rows() {
         let result = crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38));
@@ -7798,6 +7849,26 @@ mod tests {
 
             assert!(app.background_editors.is_empty());
             assert_eq!(app.editor.document, "SELECT 1");
+        });
+    }
+
+    /// `plan_selection` is reset by `close_active_editor` exactly where `result_selection`
+    /// already is: an index that meant something against the closed editor's plan means nothing
+    /// against whichever editor is promoted in its place.
+    #[gpui::test]
+    fn closing_an_editor_clears_a_stale_plan_selection(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.results =
+                vec![crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38))];
+            app.plan_selection = Some(4);
+            app.new_editor(cx);
+        });
+
+        view.update(cx, |app, cx| {
+            app.close_active_editor(cx);
+
+            assert_eq!(app.plan_selection, None);
         });
     }
 
