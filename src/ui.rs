@@ -6237,7 +6237,7 @@ mod tests {
     /// FR3-019: the toolbar carries Explain Analyze as its own action, and a refused statement
     /// reports the refusal where every other failure is reported.
     #[gpui::test]
-    fn explain_analyze_is_refused_for_a_modifying_statement(cx: &mut TestAppContext) {
+    fn explain_analyse_is_refused_for_a_modifying_statement(cx: &mut TestAppContext) {
         let provider = Arc::new(UiTestProvider::default());
         let (view, cx) = build_app_view(cx);
         view.update(cx, |app, _| {
@@ -6266,7 +6266,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn explain_analyze_completes_with_a_plan_and_a_node_count(cx: &mut TestAppContext) {
+    fn explain_analyse_completes_with_a_plan_and_a_node_count(cx: &mut TestAppContext) {
         let provider = Arc::new(UiTestProvider::default());
         let (view, cx) = build_app_view(cx);
         view.update(cx, |app, _| {
