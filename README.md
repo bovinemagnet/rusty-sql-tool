@@ -51,7 +51,9 @@ logs/errors (FR-002, FR-033).
 - Run uses selected SQL, then falls back to the statement containing the cursor (FR-013–FR-014).
 - Run All executes statements in order and keeps earlier results when a later statement fails
   (FR-015, FR-029).
-- Explain always uses plain `EXPLAIN`, never `EXPLAIN ANALYZE` (FR-016).
+- Explain always uses plain `EXPLAIN`, never `EXPLAIN ANALYZE` (FR-016). Explain Analyze
+  (⌥⇧⌘↵) is a separate command that refuses anything but a row-returning statement before it
+  runs (FR3-019). Plans render as a tree, a graph or text; click a node for its detail.
 - Row-returning statements receive `LIMIT 10` by default. Explicit `LIMIT`/`FETCH FIRST`, data
   changes, `RETURNING`, DDL, and uncertain statements are not rewritten (FR-018–FR-020, FR-032).
 - Results support table/text rendering and pane/tab/native-window destinations (FR-021–FR-025).
@@ -63,6 +65,7 @@ required by section 51. Current bindings are:
 - `Ctrl/Cmd+Enter` — run the current or selected statement.
 - `Ctrl/Cmd+Shift+Enter` — run all statements.
 - `Ctrl/Cmd+Alt+Enter` — explain the current or selected statement.
+- `Ctrl/Cmd+Alt+Shift+Enter` — Explain Analyze the current or selected statement.
 - `Escape` or `Ctrl/Cmd+.` — stop a running query.
 - `Ctrl/Cmd+N` — open a new SQL editor.
 - `Ctrl/Cmd+W` — close the active SQL editor. Alt-click a tab to close that one. The last editor
