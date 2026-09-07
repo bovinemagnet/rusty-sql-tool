@@ -688,6 +688,12 @@ fn plan_result(result: QueryResult) -> Result<QueryResult, QueryError> {
             ));
         }
     };
+    if plan::is_utility_statement(json) {
+        // A utility statement (CREATE INDEX, VACUUM, SET, ALTER TABLE, …) has no plan to show;
+        // fall through to the original text result unchanged so the Text renderer shows the
+        // server's own output, as it did before FORMAT JSON was added to plain Explain.
+        return Ok(result);
+    }
     let mut converted = plan::parse_plan(json)?.into_result(result.execution_time);
     converted.notices = result.notices;
     Ok(converted)
@@ -907,6 +913,30 @@ mod tests {
         assert_eq!(converted.execution_time, Duration::from_millis(40));
         assert_eq!(converted.notices, vec!["NOTICE: hello".to_owned()]);
         assert!(!converted.rows.is_empty());
+    }
+
+    /// FR3-020: a utility statement (`CREATE INDEX`, `VACUUM`, `SET`, `ALTER TABLE`, …) is
+    /// rendered by PostgreSQL as `ExplainDummyGroup("Utility Statement", …)` — a bare string in
+    /// the array, not a plan object. This must fall through to the original text result rather
+    /// than be reported as a broken plan.
+    #[test]
+    fn a_utility_statement_falls_back_to_the_original_text_result() {
+        let result = QueryResult {
+            columns: vec![Column {
+                name: "QUERY PLAN".into(),
+                database_type: "json".into(),
+                nullable: None,
+            }],
+            rows: vec![vec![CellValue::Json("[\"Utility Statement\"]".into())]],
+            execution_time: Duration::from_millis(5),
+            ..QueryResult::default()
+        };
+        let converted = plan_result(result).unwrap();
+        assert_eq!(converted.plan, None);
+        assert_eq!(
+            converted.rows,
+            vec![vec![CellValue::Json("[\"Utility Statement\"]".into())]]
+        );
     }
 
     #[test]

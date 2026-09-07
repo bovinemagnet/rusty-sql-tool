@@ -131,6 +131,11 @@ impl PlanNode {
         }
     }
 
+    /// `total_cost` minus every child's `total_cost`, floored at zero. This is a heuristic shared
+    /// with other plan visualisers, not an exact figure: `InitPlan`/`SubPlan` children are
+    /// counted as ordinary children here even though PostgreSQL folds their cost into the parent
+    /// rather than adding it as a sibling, so a plan with a large InitPlan can under-report its
+    /// parent's share.
     fn exclusive_cost(&self) -> f64 {
         let children: f64 = self.children.iter().map(|child| child.total_cost).sum();
         (self.total_cost - children).max(0.0)

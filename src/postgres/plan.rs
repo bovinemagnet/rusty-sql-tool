@@ -23,11 +23,28 @@ const CONSUMED_KEYS: &[&str] = &[
     "Plans",
     "Strategy",
     "Partial Mode",
+    // Folded into `operation_name` as the "Parallel " prefix, the way `Strategy`/`Partial Mode`
+    // fold in above — not structural noise, but not a bare property either.
+    "Parallel Aware",
     // Structural noise the text form does not print either.
     "Parent Relationship",
-    "Parallel Aware",
     "Async Capable",
 ];
+
+/// PostgreSQL renders a utility statement (`CREATE INDEX`, `VACUUM`, `SET`, `ALTER TABLE`, …) as
+/// `ExplainDummyGroup("Utility Statement", …)`, whose JSON is a bare string inside the array
+/// rather than a plan object — well-formed, but not something `parse_plan` can read as a plan.
+/// The caller uses this to fall back to the original text result instead of treating it as an
+/// error (FR3-020: plain Explain of a utility statement is not a regression).
+pub fn is_utility_statement(json: &str) -> bool {
+    let Ok(document) = serde_json::from_str::<Value>(json) else {
+        return false;
+    };
+    matches!(
+        document.as_array().and_then(|array| array.first()),
+        Some(Value::String(_))
+    )
+}
 
 /// `EXPLAIN (FORMAT JSON)` returns a one-element array holding the plan and its timings.
 #[allow(clippy::result_large_err)]
@@ -71,6 +88,10 @@ fn parse_node(object: &serde_json::Map<String, Value>) -> Result<PlanNode, Query
         &node_type,
         string("Strategy").as_deref(),
         string("Partial Mode").as_deref(),
+        object
+            .get("Parallel Aware")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     );
     let actual = match (
         object.get("Actual Startup Time").and_then(Value::as_f64),
@@ -121,25 +142,45 @@ fn parse_node(object: &serde_json::Map<String, Value>) -> Result<PlanNode, Query
     })
 }
 
-/// The text form's name for an aggregate: strategy and partial mode fold into the node type.
-fn operation_name(node_type: &str, strategy: Option<&str>, partial_mode: Option<&str>) -> String {
+/// The text form's name for a node: strategy and partial mode fold into the node type for an
+/// aggregate, and a parallel-aware node gets the "Parallel " prefix PostgreSQL's text form prints
+/// (`Parallel Seq Scan on orders`) — otherwise the hottest node in a parallel plan reads as an
+/// ordinary scan.
+fn operation_name(
+    node_type: &str,
+    strategy: Option<&str>,
+    partial_mode: Option<&str>,
+    parallel_aware: bool,
+) -> String {
     let base = match (node_type, strategy) {
         ("Aggregate", Some("Hashed")) => "HashAggregate".to_owned(),
         ("Aggregate", Some("Sorted")) => "GroupAggregate".to_owned(),
         ("Aggregate", Some("Mixed")) => "MixedAggregate".to_owned(),
         _ => node_type.to_owned(),
     };
-    match partial_mode {
+    let base = match partial_mode {
         Some(mode) if mode != "Simple" => format!("{mode} {base}"),
         _ => base,
+    };
+    if parallel_aware {
+        format!("Parallel {base}")
+    } else {
+        base
     }
 }
 
-/// "using customer_pkey on customer c" — the clause the text form appends to a scan.
+/// "using customer_pkey on customer c" — the clause the text form appends to a scan. The `using`
+/// wording only applies when a relation is also present (`Index Scan`); a `Bitmap Index Scan`
+/// carries an `Index Name` with no `Relation Name`, and PostgreSQL prints that bare, as
+/// "Bitmap Index Scan on tenk1_unique1", not "... using tenk1_unique1".
 fn target(index: Option<&str>, relation: Option<&str>, alias: Option<&str>) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(index) = index {
-        parts.push(format!("using {index}"));
+        if relation.is_some() {
+            parts.push(format!("using {index}"));
+        } else {
+            parts.push(index.to_owned());
+        }
     }
     match (relation, alias) {
         (Some(relation), Some(alias)) if alias != relation => {
@@ -190,13 +231,16 @@ mod tests {
 
     #[test]
     fn a_plain_explain_has_no_actual_figures_and_is_not_analysed() {
-        let json = r#"[{"Plan":{"Node Type":"Result","Startup Cost":0.00,"Total Cost":0.01,"Plan Rows":1,"Plan Width":4},"Planning Time":0.02}]"#;
+        // PostgreSQL only emits "Planning Time" under summary (`es->summary = summary_set ?
+        // summary_set : es->analyze`), which a plain, non-ANALYZE EXPLAIN never sets, so this
+        // fixture carries no "Planning Time" key — a real server never sends one here.
+        let json = r#"[{"Plan":{"Node Type":"Result","Startup Cost":0.00,"Total Cost":0.01,"Plan Rows":1,"Plan Width":4}}]"#;
         let plan = parse_plan(json).unwrap();
         assert!(!plan.analysed);
         assert_eq!(plan.root.operation, "Result");
         assert!(plan.root.actual.is_none());
         assert_eq!(plan.execution_time_ms, None);
-        assert_eq!(plan.planning_time_ms, Some(0.02));
+        assert_eq!(plan.planning_time_ms, None);
     }
 
     #[test]
@@ -212,6 +256,14 @@ mod tests {
         assert_eq!(
             parse_plan(json).unwrap().root.heading(),
             "Subquery Scan on sub"
+        );
+
+        // A Bitmap Index Scan carries an Index Name but no Relation Name; PostgreSQL prints it
+        // bare ("on tenk1_unique1"), not with the "using" wording an Index Scan gets.
+        let json = r#"[{"Plan":{"Node Type":"Bitmap Index Scan","Index Name":"tenk1_unique1","Startup Cost":0.0,"Total Cost":4.27,"Plan Rows":1,"Plan Width":0}}]"#;
+        assert_eq!(
+            parse_plan(json).unwrap().root.heading(),
+            "Bitmap Index Scan on tenk1_unique1"
         );
     }
 
@@ -235,6 +287,23 @@ mod tests {
         }
     }
 
+    /// `Parallel Aware` is folded into the operation name as the "Parallel " prefix, matching
+    /// PostgreSQL's text form (`Parallel Seq Scan on orders`), rather than dropped as structural
+    /// noise like `Parent Relationship`/`Async Capable`.
+    #[test]
+    fn a_parallel_aware_node_gets_the_parallel_prefix() {
+        let json = r#"[{"Plan":{"Node Type":"Seq Scan","Parallel Aware":true,"Relation Name":"orders","Alias":"orders","Startup Cost":0.0,"Total Cost":1.0,"Plan Rows":1,"Plan Width":4}}]"#;
+        let plan = parse_plan(json).unwrap();
+        assert_eq!(plan.root.operation, "Parallel Seq Scan");
+        assert!(
+            plan.root.properties.is_empty(),
+            "Parallel Aware is consumed, not left as a bare property"
+        );
+
+        let json = r#"[{"Plan":{"Node Type":"Seq Scan","Parallel Aware":false,"Relation Name":"orders","Alias":"orders","Startup Cost":0.0,"Total Cost":1.0,"Plan Rows":1,"Plan Width":4}}]"#;
+        assert_eq!(parse_plan(json).unwrap().root.operation, "Seq Scan");
+    }
+
     #[test]
     fn property_values_are_formatted_for_display_in_server_order() {
         let json = r#"[{"Plan":{"Node Type":"Sort","Startup Cost":0.0,"Total Cost":1.0,"Plan Rows":1,"Plan Width":4,"Sort Key":["a","b DESC"],"Workers":{"Number":2},"Inner Unique":false,"Sort Space Used":26}}]"#;
@@ -248,6 +317,14 @@ mod tests {
                 ("Sort Space Used".to_owned(), "26".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_utility_statement_is_recognised_by_its_bare_string_element() {
+        assert!(is_utility_statement(r#"["Utility Statement"]"#));
+        assert!(!is_utility_statement(SAMPLE_PLAN_JSON));
+        assert!(!is_utility_statement("[]"));
+        assert!(!is_utility_statement("not json"));
     }
 
     #[test]

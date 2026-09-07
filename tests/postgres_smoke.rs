@@ -104,7 +104,10 @@ async fn connects_browses_and_executes_against_postgres() {
         .expect("EXPLAIN should yield a plan");
     assert!(!plan.analysed, "FR-016: plain Explain must not analyse");
     assert!(plan.root.actual.is_none());
-    assert!(plan.planning_time_ms.is_some());
+    // Plain EXPLAIN has no summary (PostgreSQL sets `es->summary = summary_set ? es->summary :
+    // es->analyze`), so `Planning Time` is never emitted — exactly as plain `EXPLAIN` in psql
+    // prints no `Planning Time:` line.
+    assert!(plan.planning_time_ms.is_none());
     assert!(
         !explained.rows.is_empty(),
         "the text lines travel with the plan"

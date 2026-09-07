@@ -1514,9 +1514,10 @@ impl AppView {
             self.editor.execution_status == ExecutionStatus::Running,
             self.connection_state() == ConnectionState::Connected,
         ) {
-            // Run, Run All and Explain act on the SQL document, which a definition tab has
-            // replaced on screen. A shortcut must not execute a document the user cannot see
-            // (FR2-007); cancel and the window commands stay available wherever focus is.
+            // Run, Run All, Explain and Explain Analyze act on the SQL document, which a
+            // definition tab has replaced on screen. A shortcut must not execute a document the
+            // user cannot see (FR2-007); cancel and the window commands stay available wherever
+            // focus is.
             let executes_the_document = matches!(
                 command_id,
                 command::RUN | command::RUN_ALL | command::EXPLAIN | command::EXPLAIN_ANALYSE
@@ -1961,6 +1962,8 @@ impl AppView {
         if let Some(editor) = self.background_editors.get_mut(index) {
             std::mem::swap(&mut self.editor, editor);
             self.focus = Focus::Editor;
+            self.result_selection = None;
+            self.plan_selection = None;
             self.status = format!("Editor: {}", self.editor.connection_identity());
             cx.notify();
         }
@@ -3206,12 +3209,17 @@ impl AppView {
                                 div()
                                     .text_color(rgb(MUTED))
                                     .whitespace_nowrap()
+                                    .overflow_hidden()
                                     .child(target)
                             })),
                     )
+                    // An explicit line height keeps the three metric rows below to 14 px each
+                    // (gpui otherwise defaults to `phi() * font_size`, ≈17 px, which overflows
+                    // the card and collides with the `mt_auto` share bar).
                     .child(
                         div()
                             .text_size(px(10.5))
+                            .line_height(px(14.))
                             .whitespace_nowrap()
                             .child(rows_line),
                     )
@@ -3220,6 +3228,7 @@ impl AppView {
                             .flex()
                             .justify_between()
                             .text_size(px(10.5))
+                            .line_height(px(14.))
                             .text_color(rgb(FAINT))
                             .whitespace_nowrap()
                             .child(format!("est {}", format_count(row.node.plan_rows)))
@@ -3233,6 +3242,7 @@ impl AppView {
                             .flex()
                             .justify_between()
                             .text_size(px(10.5))
+                            .line_height(px(14.))
                             .text_color(rgb(MUTED))
                             .whitespace_nowrap()
                             .child(time_line)
@@ -3480,7 +3490,10 @@ impl AppView {
             .bg(rgb(PANEL_LIGHT))
             .text_size(px(11.))
             .line_height(px(16.))
-            .text_color(rgb(MUTED));
+            .text_color(rgb(MUTED))
+            // Matches the tree row's detail cell: each line is `whitespace_nowrap`, so without
+            // this a long `Filter:` expression paints past the 340 px panel's right edge.
+            .overflow_hidden();
         for line in node.text_lines(0) {
             raw = raw.child(div().whitespace_nowrap().child(line));
         }
@@ -3533,7 +3546,9 @@ impl AppView {
                 && self.editor.plan_display != PlanDisplay::Text
             {
                 content = content.child(self.plan_surface(plan, cx));
-                line_index += result.rows.len();
+                // `selectable_lines()` yields `result.as_text().lines()` for a plan — the rows
+                // plus the `QUERY PLAN` header and the status line — not just `result.rows`.
+                line_index += result.as_text().lines().count();
                 continue;
             }
             // A plan's TEXT segment always renders through the text path below, regardless of
@@ -4502,7 +4517,7 @@ fn plan_number_cell(text: String, width: f32) -> gpui::Div {
         .child(text)
 }
 
-/// Thousands separated by thin spaces, as the design shows them: `48 317`.
+/// Thousands separated by ordinary spaces, as the design shows them: `48 317`.
 fn format_count(value: f64) -> String {
     let digits = format!("{:.0}", value.max(0.0));
     let mut grouped = String::new();
@@ -4699,6 +4714,8 @@ fn data_row(values: &[CellValue]) -> gpui::Div {
     row
 }
 
+/// The status bar's summary of the last run: node count for a plan (FR3-020), row count
+/// otherwise — Explain Analyze's own timing is already the `elapsed` it reports (FR3-019).
 fn completion_status(results: &[QueryResult]) -> String {
     let elapsed: u128 = results
         .iter()
@@ -7095,6 +7112,75 @@ mod tests {
         assert!(copied.contains("->  Seq Scan on orders o"));
     }
 
+    /// `debug_bounds` takes a `&'static str`, so a per-index selector has to outlive the frame.
+    fn line_selector(index: usize) -> &'static str {
+        Box::leak(format!("result-line-{index}").into_boxed_str())
+    }
+
+    /// The tree/graph branch of `results_surface` used to advance `line_index` by
+    /// `result.rows.len()`, which is short of what `selectable_lines()` counts for a plan —
+    /// `result.as_text().lines()` — because that also carries the `QUERY PLAN` header, the blank
+    /// line before the summary, and the status line. This pins the fix by clicking into the
+    /// result that follows a plan and checking it lands where `selectable_lines()` says it should.
+    #[gpui::test]
+    fn a_line_index_after_a_plan_accounts_for_its_full_text_form(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let plan = crate::plan::QueryPlan {
+            root: crate::plan::PlanNode {
+                operation: "Result".into(),
+                ..crate::plan::PlanNode::default()
+            },
+            analysed: false,
+            planning_time_ms: None,
+            execution_time_ms: None,
+        };
+        let plan_result = plan.into_result(std::time::Duration::from_millis(1));
+        let expected_offset = plan_result.as_text().lines().count();
+
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![plan_result, result_with_rows(&["only"])];
+            // The plan tree pushes the following result past the default pane height, and a
+            // click outside the pane is clipped away before it reaches the line.
+            app.result_pane_height = px(500.);
+        });
+        // Force a layout pass so the surface is painted and its lines have measured geometry.
+        cx.simulate_resize(size(px(1280.), px(1000.)));
+        cx.run_until_parked();
+
+        let lines = view.update(cx, |app, _| app.selectable_lines());
+        assert_eq!(
+            lines[expected_offset], "value",
+            "the second result's own header should sit at the offset its predecessor's full text implies"
+        );
+
+        // The plan renders as a tree, never as result lines, so every `result-line-*` element on
+        // the surface belongs to the second result — and the topmost of them is its header. Under
+        // the old `result.rows.len()` arithmetic this one-node plan advanced the index by 1 rather
+        // than 4, so that header rendered as `result-line-1` and a click on it selected the wrong
+        // line. Asserting the index alone would not catch it: whichever element is clicked reports
+        // its own index, so the check has to be that the *first* rendered line is the expected one.
+        let first_rendered =
+            (0..lines.len()).find(|index| cx.debug_bounds(line_selector(*index)).is_some());
+        assert_eq!(
+            first_rendered,
+            Some(expected_offset),
+            "the second result's first rendered line should carry the index selectable_lines() gives it"
+        );
+
+        let bounds = cx
+            .debug_bounds(line_selector(expected_offset))
+            .expect("the second result's header line should render at the correct index");
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.result_selection.map(|selection| selection.anchor.line),
+                Some(expected_offset)
+            );
+        });
+    }
+
     /// §15.2: the estimate flag is WARN-coloured wherever it appears, not only in the tree row —
     /// it must render as its own element in the detail panel rather than being folded into the
     /// value text, or it would inherit ordinary foreground colour.
@@ -8095,6 +8181,27 @@ mod tests {
             app.close_active_editor(cx);
 
             assert_eq!(app.plan_selection, None);
+        });
+    }
+
+    /// Switching editors is the same hazard as closing one: an index that meant something
+    /// against the previous editor's plan or result means nothing against the one now in front.
+    #[gpui::test]
+    fn switching_editors_clears_a_stale_plan_and_result_selection(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.results =
+                vec![crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38))];
+            app.plan_selection = Some(4);
+            app.result_selection = Some(ResultSelection::whole_lines(0, 0));
+            app.new_editor(cx);
+        });
+
+        view.update(cx, |app, cx| {
+            app.switch_editor(0, cx);
+
+            assert_eq!(app.plan_selection, None);
+            assert!(app.result_selection.is_none());
         });
     }
 

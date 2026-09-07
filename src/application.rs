@@ -238,7 +238,16 @@ impl CommandService {
     ) -> Result<QueryResult, QueryError> {
         let sql = relevant_sql(&editor.document, editor.selection.clone(), editor.cursor)
             .map_err(query_selection_error)?;
-        if analyse_statement(sql).kind != StatementKind::RowReturning {
+        let analysis = analyse_statement(sql);
+        // `has_returning` must be checked alongside `kind`: a data-modifying CTE such as
+        // `WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d` is classified `RowReturning`
+        // by its outer SELECT (the DML sits at paren depth 1), so `kind` alone would let it
+        // through to `ANALYZE`, which executes it. This is the same reasoning `safe_to_limit`
+        // already applies. Multi-statement input (`SELECT 1; DELETE FROM t;`) is rejected
+        // downstream by `client.prepare`, which refuses multiple commands in Parse — this
+        // safeguard currently depends on that, and a future switch to a `simple_query`-only
+        // path would reopen it.
+        if analysis.kind != StatementKind::RowReturning || analysis.has_returning {
             let error = QueryError {
                 message: "Explain Analyze runs only row-returning statements (SELECT, WITH … SELECT, VALUES); the statement would execute".into(),
                 severity: None,
@@ -708,6 +717,7 @@ mod tests {
             "INSERT INTO customer VALUES (1) RETURNING id;",
             "CREATE TABLE t (id int);",
             "SELECT 1 INTO t;",
+            "WITH d AS (DELETE FROM customer RETURNING *) SELECT * FROM d;",
         ] {
             let provider = Arc::new(FakeProvider::default());
             let service = CommandService::new(provider.clone());
@@ -733,6 +743,17 @@ mod tests {
             assert_eq!(editor.error.as_ref(), Some(&error));
             assert_eq!(editor.results[0].command_tag.as_deref(), Some("PREVIOUS"));
         }
+    }
+
+    /// A data-modifying CTE is classified `RowReturning` by its outer `SELECT` — `kind` alone
+    /// would let it through to `ANALYZE`. Only `has_returning` catches it, which is why the
+    /// guard above checks both.
+    #[test]
+    fn a_data_modifying_cte_passes_the_kind_check_and_is_caught_only_by_has_returning() {
+        let analysis =
+            analyse_statement("WITH d AS (DELETE FROM customer RETURNING *) SELECT * FROM d;");
+        assert_eq!(analysis.kind, StatementKind::RowReturning);
+        assert!(analysis.has_returning);
     }
 
     #[tokio::test]
