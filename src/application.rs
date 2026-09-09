@@ -72,6 +72,12 @@ pub struct EditorState {
     pub execution_status: ExecutionStatus,
     pub results: Vec<QueryResult>,
     pub error: Option<QueryError>,
+    /// Document snapshots paired with the caret they were taken at. History describes one
+    /// document, so it belongs beside that document rather than to the view: held on the view it
+    /// outlived an editor switch, and undo then restored one editor's text over another's
+    /// (§46, §47).
+    pub undo: Vec<(String, usize)>,
+    pub redo: Vec<(String, usize)>,
 }
 
 impl EditorState {
@@ -90,6 +96,8 @@ impl EditorState {
             execution_status: ExecutionStatus::Queued,
             results: Vec::new(),
             error: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 

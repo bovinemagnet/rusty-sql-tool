@@ -506,9 +506,6 @@ struct AppView {
     focus: Focus,
     status: String,
     focus_handle: FocusHandle,
-    /// Document snapshots paired with the caret they were taken at.
-    undo: Vec<(String, usize)>,
-    redo: Vec<(String, usize)>,
     connection_dialog: bool,
     connection_buffer: String,
     /// Digits typed into the row-limit field, or `None` when it is not being edited. The ± steps
@@ -653,8 +650,6 @@ impl AppView {
             focus: Focus::Editor,
             status: "Disconnected · Run a query to see results.".into(),
             focus_handle: cx.focus_handle(),
-            undo: Vec::new(),
-            redo: Vec::new(),
             connection_dialog: false,
             connection_buffer: String::new(),
             limit_buffer: None,
@@ -1689,12 +1684,13 @@ impl AppView {
     /// Snapshots the document *and* the caret before an edit, so undo can put the user back where
     /// they were working rather than at the end of the document.
     fn record_edit(&mut self) {
-        self.undo
+        self.editor
+            .undo
             .push((self.editor.document.clone(), self.editor.cursor));
-        if self.undo.len() > 200 {
-            self.undo.remove(0);
+        if self.editor.undo.len() > 200 {
+            self.editor.undo.remove(0);
         }
-        self.redo.clear();
+        self.editor.redo.clear();
     }
 
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1792,17 +1788,17 @@ impl AppView {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        if let Some(previous) = self.undo.pop() {
+        if let Some(previous) = self.editor.undo.pop() {
             let current = self.restore(previous);
-            self.redo.push(current);
+            self.editor.redo.push(current);
             cx.notify();
         }
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
-        if let Some(next) = self.redo.pop() {
+        if let Some(next) = self.editor.redo.pop() {
             let current = self.restore(next);
-            self.undo.push(current);
+            self.editor.undo.push(current);
             cx.notify();
         }
     }
@@ -7524,6 +7520,35 @@ mod tests {
         let visible = visible_lines(500, px(0.), px(0.), 3);
 
         assert!(!visible.range.is_empty());
+    }
+
+    /// Undo history describes one document, so it belongs to the editor holding that document.
+    /// Kept on `AppView` it survived an editor switch, and Ctrl+Z then replaced the document in
+    /// front with a snapshot taken against a different one — silently, and destructively, because
+    /// undo restores the whole document (§46, §47: one editor must not disturb another).
+    #[gpui::test]
+    fn undo_history_belongs_to_the_editor_it_was_recorded_against(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "EDITOR ONE".into();
+            app.editor.cursor = 10;
+            app.insert_text("!", cx);
+
+            app.new_editor(cx);
+            app.editor.document = "EDITOR TWO".into();
+            app.editor.cursor = 10;
+            app.undo(cx);
+            assert_eq!(
+                app.editor.document, "EDITOR TWO",
+                "a fresh editor has no history of its own, so undo must leave it alone"
+            );
+
+            // And the history did not merely get cleared: it travelled with the editor that owns it.
+            app.switch_editor(0, cx);
+            assert_eq!(app.editor.document, "EDITOR ONE!");
+            app.undo(cx);
+            assert_eq!(app.editor.document, "EDITOR ONE");
+        });
     }
 
     #[gpui::test]
