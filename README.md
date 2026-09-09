@@ -100,7 +100,8 @@ with click/drag selection and `Shift` to extend any movement into a selection. M
 the arrow keys and `Home`/`End` on the current line, `Ctrl/Cmd` with the arrows to step a word at
 a time (a SQL identifier such as `order_line` is one word) or with `Home`/`End` to reach the ends
 of the document, and `PageUp`/`PageDown` to move a viewport at a time. The editor scrolls to
-follow the caret whenever a movement takes it off screen.
+follow the caret whenever it goes off screen, sideways on a long line as well as vertically, and
+after an edit or an undo as well as after a movement.
 
 Undo history belongs to the editor whose document it was recorded against, so switching tabs
 carries each editor's history with it (FR-046, FR-047).
