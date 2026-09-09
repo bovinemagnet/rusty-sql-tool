@@ -52,6 +52,8 @@ const EDITOR_LINE_HEIGHT: f32 = 25.;
 const EDITOR_OVERSCAN: usize = 8;
 /// How many lines to assume before the first layout pass has measured the editor viewport.
 const UNMEASURED_VIEWPORT_LINES: usize = 80;
+/// What Page Up and Page Down move by before the viewport has been measured.
+const UNMEASURED_PAGE_LINES: usize = 20;
 const EDITOR_TEXT_SIZE: f32 = 14.;
 const GUTTER_WIDTH: f32 = 40.;
 const RESULT_PANE_HEIGHT: f32 = 296.;
@@ -1577,6 +1579,12 @@ impl AppView {
                 }
                 "z" if modifiers.shift => self.redo(cx),
                 "z" => self.undo(cx),
+                // Word-wise movement and the document edges. Plain Left/Right/Home/End are
+                // handled below; the command modifier widens each to its larger unit.
+                "left" => self.move_word(false, modifiers.shift, cx),
+                "right" => self.move_word(true, modifiers.shift, cx),
+                "home" => self.move_to_document_edge(false, modifiers.shift, cx),
+                "end" => self.move_to_document_edge(true, modifiers.shift, cx),
                 _ => {}
             }
             return;
@@ -1595,6 +1603,8 @@ impl AppView {
             "down" => self.move_line(true, modifiers.shift, cx),
             "home" => self.move_to_line_edge(false, modifiers.shift, cx),
             "end" => self.move_to_line_edge(true, modifiers.shift, cx),
+            "pageup" => self.move_page(false, modifiers.shift, cx),
+            "pagedown" => self.move_page(true, modifiers.shift, cx),
             "enter" => self.insert_text("\n", cx),
             "tab" => self.insert_text("    ", cx),
             _ => {
@@ -1755,7 +1765,43 @@ impl AppView {
             anchor.min(offset)..anchor.max(offset)
         });
         self.editor.cursor = offset;
+        self.follow_caret();
         cx.notify();
+    }
+
+    /// Scrolls the caret back into view after it has moved. The editor windows its render on the
+    /// scroll offset alone, so a caret that moves out of that window simply vanishes: Page Down
+    /// moves by a whole viewport and would otherwise land the caret exactly past the bottom edge,
+    /// leaving the screen unchanged and the key looking broken.
+    ///
+    /// It scrolls by whole lines and only as far as it takes to bring the caret just inside, so a
+    /// movement that stays on screen leaves the offset alone rather than recentring and jumping
+    /// the text under the user. Dragging a selection past an edge gets autoscroll from the same
+    /// path, since a drag places the caret the same way.
+    fn follow_caret(&self) {
+        let handle = &self.editor_scroll.handle;
+        // Before the first layout pass there is no measured viewport to be outside of, and
+        // `max_offset` has nothing to clamp against.
+        if handle.bounds().size.height <= px(0.) {
+            return;
+        }
+        let visible = self.editor_page_lines();
+        let line = document_position(&self.editor.document, self.editor.cursor).line;
+        let top = (-f32::from(handle.offset().y) / EDITOR_LINE_HEIGHT)
+            .max(0.)
+            .round() as usize;
+        let target = if line < top {
+            line
+        } else if line >= top + visible {
+            line + 1 - visible
+        } else {
+            return;
+        };
+        let travel = handle.max_offset().height;
+        self.editor_scroll.set_offset(
+            ScrollAxis::Vertical,
+            px(-(target as f32 * EDITOR_LINE_HEIGHT)).clamp(-travel, px(0.)),
+        );
     }
 
     fn move_cursor(&mut self, right: bool, selecting: bool, cx: &mut Context<Self>) {
@@ -1774,6 +1820,49 @@ impl AppView {
             position.line + 1
         } else {
             position.line.saturating_sub(1)
+        };
+        let offset = offset_of(&self.editor.document, line, position.column);
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// Ctrl+Left and Ctrl+Right, which step over a whole word rather than a character.
+    fn move_word(&mut self, right: bool, selecting: bool, cx: &mut Context<Self>) {
+        let offset = if right {
+            next_word_end(&self.editor.document, self.editor.cursor)
+        } else {
+            previous_word_start(&self.editor.document, self.editor.cursor)
+        };
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// Ctrl+Home and Ctrl+End, which reach the ends of the whole document where plain Home and
+    /// End stay on the current line.
+    fn move_to_document_edge(&mut self, end: bool, selecting: bool, cx: &mut Context<Self>) {
+        let offset = if end { self.editor.document.len() } else { 0 };
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// How many whole lines the editor viewport shows, which is what Page Up and Page Down move
+    /// by. Before the first layout pass the viewport measures zero; a page is then a conservative
+    /// screenful rather than the generous overscan the virtualised surfaces fall back to, because
+    /// this figure moves the caret rather than deciding what to build.
+    fn editor_page_lines(&self) -> usize {
+        let height = self.editor_scroll.handle.bounds().size.height;
+        if height <= px(0.) {
+            return UNMEASURED_PAGE_LINES;
+        }
+        ((f32::from(height) / EDITOR_LINE_HEIGHT) as usize).max(1)
+    }
+
+    /// Page Up and Page Down, which move a viewport at a time and hold the column the way Up and
+    /// Down do. `offset_of` clamps past the last line, so a page off the end lands at the end.
+    fn move_page(&mut self, down: bool, selecting: bool, cx: &mut Context<Self>) {
+        let position = document_position(&self.editor.document, self.editor.cursor);
+        let page = self.editor_page_lines();
+        let line = if down {
+            position.line.saturating_add(page)
+        } else {
+            position.line.saturating_sub(page)
         };
         let offset = offset_of(&self.editor.document, line, position.column);
         self.place_cursor(offset, selecting, cx);
@@ -4986,6 +5075,47 @@ fn next_boundary(text: &str, offset: usize) -> usize {
         .map_or(text.len(), |(index, _)| offset + index)
 }
 
+/// What Ctrl+Arrow treats as belonging to a word. A SQL identifier carries underscores
+/// (`order_line`), so `_` is part of the word; the punctuation that surrounds identifiers —
+/// `.`, `,`, `(`, quotes, operators — separates one from the next, as does whitespace.
+fn is_word_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn char_before(text: &str, offset: usize) -> Option<char> {
+    text[..offset].chars().next_back()
+}
+
+/// Ctrl+Left: back over any separators, then over the word itself, landing on its first
+/// character.
+fn previous_word_start(text: &str, offset: usize) -> usize {
+    let mut index = offset.min(text.len());
+    while char_before(text, index).is_some_and(|character| !is_word_char(character)) {
+        index = previous_boundary(text, index);
+    }
+    while char_before(text, index).is_some_and(is_word_char) {
+        index = previous_boundary(text, index);
+    }
+    index
+}
+
+/// Ctrl+Right: forward over any separators, then over the word itself, landing just past its last
+/// character.
+fn next_word_end(text: &str, offset: usize) -> usize {
+    let mut index = offset.min(text.len());
+    while text[index..]
+        .chars()
+        .next()
+        .is_some_and(|character| !is_word_char(character))
+    {
+        index = next_boundary(text, index);
+    }
+    while text[index..].chars().next().is_some_and(is_word_char) {
+        index = next_boundary(text, index);
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -7334,6 +7464,254 @@ mod tests {
             app.editor.cursor = 0;
         });
         (view, cx)
+    }
+
+    /// A document whose words are separated by the punctuation SQL actually uses, so word-wise
+    /// movement is exercised against identifiers rather than prose.
+    const WORD_DOCUMENT: &str = "SELECT order_line.id, qty\nFROM order_line;";
+
+    fn word_editor(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = WORD_DOCUMENT.into();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        (view, cx)
+    }
+
+    /// Ctrl+Right lands on the end of the next word and Ctrl+Left on the start of the previous
+    /// one, the way Zed binds them. `_` is a word character because a SQL identifier carries it:
+    /// `order_line` is one word, and the `.` and `,` around it are separators.
+    #[gpui::test]
+    fn ctrl_arrow_moves_by_word_over_sql_identifiers(cx: &mut TestAppContext) {
+        let (view, cx) = word_editor(cx);
+
+        for expected in ["SELECT", "SELECT order_line", "SELECT order_line.id"] {
+            cx.simulate_keystrokes("ctrl-right");
+            view.update(cx, |app, _| {
+                assert_eq!(&WORD_DOCUMENT[..app.editor.cursor], expected);
+            });
+        }
+
+        // And back again, landing on the first character of each word rather than past it.
+        for expected in ["SELECT order_line.", "SELECT ", ""] {
+            cx.simulate_keystrokes("ctrl-left");
+            view.update(cx, |app, _| {
+                assert_eq!(&WORD_DOCUMENT[..app.editor.cursor], expected);
+            });
+        }
+    }
+
+    /// Word movement is caret movement, so Shift extends the selection exactly as a plain arrow
+    /// does rather than dropping it.
+    #[gpui::test]
+    fn ctrl_shift_arrow_extends_the_selection_by_word(cx: &mut TestAppContext) {
+        let (view, cx) = word_editor(cx);
+
+        cx.simulate_keystrokes("ctrl-shift-right ctrl-shift-right");
+
+        view.update(cx, |app, _| {
+            let selection = app.editor.selection.clone().expect("a selection");
+            assert_eq!(&WORD_DOCUMENT[selection], "SELECT order_line");
+        });
+    }
+
+    /// Ctrl+Home and Ctrl+End reach the ends of the whole document, where plain Home and End stay
+    /// on the current line.
+    #[gpui::test]
+    fn ctrl_home_and_end_reach_the_document_edges(cx: &mut TestAppContext) {
+        let (view, cx) = word_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 12);
+
+        cx.simulate_keystrokes("ctrl-end");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, WORD_DOCUMENT.len());
+            assert!(app.editor.selection.is_none());
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-home");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, 0);
+            assert_eq!(
+                app.editor.selection.clone().expect("a selection"),
+                0..WORD_DOCUMENT.len(),
+                "Shift from the far end should select the whole document"
+            );
+        });
+    }
+
+    /// Page Down moves by however many whole lines the viewport shows, holding the column the way
+    /// Up and Down do. The measured viewport in these tests is ten lines tall.
+    #[gpui::test]
+    fn page_up_and_down_move_by_a_viewport_of_lines(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..40)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(1000.)));
+        cx.run_until_parked();
+
+        let page = view.update(cx, |app, _| app.editor_page_lines());
+        assert!(page > 1, "the viewport should have measured, got {page}");
+
+        cx.simulate_keystrokes("pagedown");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor).line,
+                page
+            );
+        });
+
+        cx.simulate_keystrokes("pageup");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor).line,
+                0,
+                "back to where it started"
+            );
+        });
+
+        // Past the last line, Page Down stops on it rather than running off the end, holding the
+        // column the way Down already does rather than jumping to the final character.
+        cx.simulate_keystrokes("pagedown pagedown pagedown pagedown pagedown pagedown");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor),
+                DocumentPosition {
+                    line: 39,
+                    column: 0
+                }
+            );
+            assert!(app.editor.cursor < app.editor.document.len());
+        });
+    }
+
+    /// Asserts the caret sits on one of the lines the editor viewport is actually showing.
+    #[track_caller]
+    fn assert_caret_visible(app: &AppView, what: &str) {
+        let handle = &app.editor_scroll.handle;
+        let top = (-f32::from(handle.offset().y) / EDITOR_LINE_HEIGHT)
+            .max(0.)
+            .round() as usize;
+        let visible = app.editor_page_lines();
+        let line = document_position(&app.editor.document, app.editor.cursor).line;
+        assert!(
+            (top..top + visible).contains(&line),
+            "after {what} the caret is on line {line}, outside the visible lines {top}..{}",
+            top + visible
+        );
+    }
+
+    /// Moving the caret is only half of a movement command — the caret has to stay on screen.
+    /// Page Down moves by exactly one viewport, so with a viewport that does not follow it the
+    /// caret lands precisely past the bottom edge and the screen does not change at all, which
+    /// makes the key look broken however correct the caret offset underneath is.
+    #[gpui::test]
+    fn the_viewport_follows_the_caret_when_paging(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        // Without the layout pass nothing has measured, so nothing overflows and every offset
+        // clamps back to zero.
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        for page in 1..=3 {
+            cx.simulate_keystrokes("pagedown");
+            cx.run_until_parked();
+            view.update(cx, |app, _| {
+                assert_caret_visible(app, &format!("page down {page}"));
+            });
+        }
+
+        for page in 1..=3 {
+            cx.simulate_keystrokes("pageup");
+            cx.run_until_parked();
+            view.update(cx, |app, _| {
+                assert_caret_visible(app, &format!("page up {page}"));
+            });
+        }
+
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(0.),
+                "back on the first line, the viewport should be back at the top"
+            );
+        });
+    }
+
+    /// The same follow applies to the arrow keys, which walk off the bottom edge one line at a
+    /// time, and to Ctrl+End, which leaves the viewport in one jump.
+    #[gpui::test]
+    fn the_viewport_follows_the_caret_off_either_edge(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // One line past the bottom edge scrolls by one line, not by a screenful: the caret is
+        // brought just inside, so the text does not jump under the user.
+        let visible = view.update(cx, |app, _| app.editor_page_lines());
+        for _ in 0..visible {
+            cx.simulate_keystrokes("down");
+        }
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "walking off the bottom");
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(-EDITOR_LINE_HEIGHT),
+                "one line past the edge should scroll by exactly one line"
+            );
+        });
+
+        // A movement that stays inside the viewport leaves the scroll position alone.
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(-EDITOR_LINE_HEIGHT),
+                "a caret still on screen should not move the viewport"
+            );
+        });
+
+        // Ctrl+End leaves the viewport far behind in a single jump, and Ctrl+Home comes back.
+        cx.simulate_keystrokes("ctrl-end");
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_caret_visible(app, "ctrl-end"));
+
+        cx.simulate_keystrokes("ctrl-home");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "ctrl-home");
+            assert_eq!(app.editor_scroll.handle.offset().y, px(0.));
+        });
     }
 
     #[gpui::test]

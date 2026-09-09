@@ -96,7 +96,11 @@ required by section 51. Current bindings are:
 - `Ctrl/Cmd+Shift+D` — connect or disconnect.
 
 Normal editor copy, cut, paste, select-all, undo, and redo shortcuts are also supported, along
-with arrow-key and `Home`/`End` movement, `Shift` selection, and click/drag selection.
+with click/drag selection and `Shift` to extend any movement into a selection. Movement covers
+the arrow keys and `Home`/`End` on the current line, `Ctrl/Cmd` with the arrows to step a word at
+a time (a SQL identifier such as `order_line` is one word) or with `Home`/`End` to reach the ends
+of the document, and `PageUp`/`PageDown` to move a viewport at a time. The editor scrolls to
+follow the caret whenever a movement takes it off screen.
 
 Undo history belongs to the editor whose document it was recorded against, so switching tabs
 carries each editor's history with it (FR-046, FR-047).
