@@ -56,6 +56,8 @@ const UNMEASURED_VIEWPORT_LINES: usize = 80;
 const UNMEASURED_PAGE_LINES: usize = 20;
 const EDITOR_TEXT_SIZE: f32 = 14.;
 const GUTTER_WIDTH: f32 = 40.;
+/// The drawn width of the caret, which the sideways follow has to keep clear of the right edge.
+const CARET_WIDTH: f32 = 2.;
 const RESULT_PANE_HEIGHT: f32 = 296.;
 const RESULT_PANE_MIN_HEIGHT: f32 = 120.;
 /// Vertical space the rest of the workspace needs — chrome, header, toolbar, status bar and a
@@ -1773,38 +1775,67 @@ impl AppView {
         cx.notify();
     }
 
-    /// Scrolls the caret back into view after it has moved. The editor windows its render on the
-    /// scroll offset alone, so a caret that moves out of that window simply vanishes: Page Down
-    /// moves by a whole viewport and would otherwise land the caret exactly past the bottom edge,
-    /// leaving the screen unchanged and the key looking broken.
+    /// Scrolls the caret back into view, on both axes. The editor windows its render on the
+    /// scroll offset alone, so a caret outside that window simply vanishes: Page Down moves by a
+    /// whole viewport and would otherwise land the caret exactly past the bottom edge, leaving
+    /// the screen unchanged and the key looking broken.
     ///
-    /// It scrolls by whole lines and only as far as it takes to bring the caret just inside, so a
-    /// movement that stays on screen leaves the offset alone rather than recentring and jumping
-    /// the text under the user. Dragging a selection past an edge gets autoscroll from the same
-    /// path, since a drag places the caret the same way.
+    /// It scrolls only as far as it takes to bring the caret just inside — by whole lines
+    /// vertically — so a caret that is already on screen leaves the offset alone rather than
+    /// recentring and jumping the text under the user.
+    ///
+    /// Every path that moves the caret calls this: `place_cursor` for movement and for the
+    /// pointer, which gives a drag past an edge its autoscroll, and the edit paths, which set the
+    /// caret directly. Typing is not movement but moves the caret all the same, and undo lands it
+    /// at an edit the user may have scrolled far away from.
     fn follow_caret(&self) {
         let handle = &self.editor_scroll.handle;
+        let viewport = handle.bounds().size;
         // Before the first layout pass there is no measured viewport to be outside of, and
         // `max_offset` has nothing to clamp against.
-        if handle.bounds().size.height <= px(0.) {
+        if viewport.height <= px(0.) {
             return;
         }
+        let position = document_position(&self.editor.document, self.editor.cursor);
+        let travel = handle.max_offset();
+
         let visible = self.editor_page_lines();
-        let line = document_position(&self.editor.document, self.editor.cursor).line;
         let top = (-f32::from(handle.offset().y) / EDITOR_LINE_HEIGHT)
             .max(0.)
             .round() as usize;
-        let target = if line < top {
-            line
-        } else if line >= top + visible {
-            line + 1 - visible
+        let row = if position.line < top {
+            position.line
+        } else if position.line >= top + visible {
+            position.line + 1 - visible
+        } else {
+            top
+        };
+        if row != top {
+            self.editor_scroll.set_offset(
+                ScrollAxis::Vertical,
+                px(-(row as f32 * EDITOR_LINE_HEIGHT)).clamp(-travel.height, px(0.)),
+            );
+        }
+
+        // And sideways, on a line wider than the pane. The gutter scrolls with the text rather
+        // than staying pinned, so the caret's own x is measured from the left of the gutter.
+        if self.editor_advance <= px(0.) || viewport.width <= px(0.) {
+            return;
+        }
+        let caret = px(GUTTER_WIDTH) + self.editor_advance * position.column as f32;
+        let left = -handle.offset().x;
+        let target = if caret < left {
+            // Coming back to a caret on the left brings the gutter with it, so returning to the
+            // start of a line does not leave the line numbers scrolled off to the left.
+            caret - px(GUTTER_WIDTH)
+        } else if caret + px(CARET_WIDTH) > left + viewport.width {
+            caret + px(CARET_WIDTH) - viewport.width
         } else {
             return;
         };
-        let travel = handle.max_offset().height;
         self.editor_scroll.set_offset(
-            ScrollAxis::Vertical,
-            px(-(target as f32 * EDITOR_LINE_HEIGHT)).clamp(-travel, px(0.)),
+            ScrollAxis::Horizontal,
+            (-target).clamp(-travel.width, px(0.)),
         );
     }
 
@@ -3007,7 +3038,7 @@ impl AppView {
                             .top(px(3.))
                             .bottom(px(3.))
                             .left(px(GUTTER_WIDTH) + advance * caret.column as f32)
-                            .w(px(2.))
+                            .w(px(CARET_WIDTH))
                             .bg(rgb(ACCENT))
                     })),
             );
@@ -7602,7 +7633,7 @@ mod tests {
         });
     }
 
-    /// Asserts the caret sits on one of the lines the editor viewport is actually showing.
+    /// Asserts the caret sits inside the editor viewport, on both axes.
     #[track_caller]
     fn assert_caret_visible(app: &AppView, what: &str) {
         let handle = &app.editor_scroll.handle;
@@ -7610,11 +7641,21 @@ mod tests {
             .max(0.)
             .round() as usize;
         let visible = app.editor_page_lines();
-        let line = document_position(&app.editor.document, app.editor.cursor).line;
+        let position = document_position(&app.editor.document, app.editor.cursor);
         assert!(
-            (top..top + visible).contains(&line),
-            "after {what} the caret is on line {line}, outside the visible lines {top}..{}",
+            (top..top + visible).contains(&position.line),
+            "after {what} the caret is on line {}, outside the visible lines {top}..{}",
+            position.line,
             top + visible
+        );
+
+        let left = (-f32::from(handle.offset().x)).max(0.);
+        let width = f32::from(handle.bounds().size.width);
+        let caret = GUTTER_WIDTH + f32::from(app.editor_advance) * position.column as f32;
+        assert!(
+            (left..=left + width).contains(&caret),
+            "after {what} the caret is at x {caret}, outside the visible span {left}..{}",
+            left + width
         );
     }
 
@@ -7848,6 +7889,47 @@ mod tests {
             assert_caret_visible(app, "redo");
             assert_eq!(app.editor.cursor, app.editor.document.len());
             assert!(app.editor_scroll.handle.offset().y < px(-EDITOR_LINE_HEIGHT));
+        });
+    }
+
+    /// A caret can leave the viewport sideways just as easily as off the bottom, on a line wider
+    /// than the pane. End on a long line is the obvious way there.
+    #[gpui::test]
+    fn the_viewport_follows_the_caret_sideways(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        // A first line far wider than any window this test will open, and a second wider still,
+        // so the caret at the end of the first is somewhere the pane can actually centre on
+        // rather than pinned against the right edge of the content.
+        let document = format!("SELECT {};\n{}", "a".repeat(300), "b".repeat(600));
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "end of a long line");
+            assert!(
+                app.editor_scroll.handle.offset().x < px(0.),
+                "reaching the end of a long line should have scrolled sideways"
+            );
+        });
+
+        // And Home comes back, bringing the gutter with it rather than leaving the line numbers
+        // scrolled off to the left.
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "home");
+            assert_eq!(
+                app.editor_scroll.handle.offset().x,
+                px(0.),
+                "back at column zero the gutter should be on screen again"
+            );
         });
     }
 
