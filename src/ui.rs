@@ -1569,6 +1569,7 @@ impl AppView {
                         self.editor.document.replace_range(range.clone(), "");
                         self.editor.cursor = range.start;
                         self.editor.selection = None;
+                        self.follow_caret();
                         cx.notify();
                     }
                 }
@@ -1713,6 +1714,7 @@ impl AppView {
             .unwrap_or(self.editor.cursor..self.editor.cursor);
         self.editor.document.replace_range(range.clone(), text);
         self.editor.cursor = range.start + text.len();
+        self.follow_caret();
         cx.notify();
     }
 
@@ -1723,6 +1725,7 @@ impl AppView {
             self.record_edit();
             self.editor.document.replace_range(range.clone(), "");
             self.editor.cursor = range.start;
+            self.follow_caret();
             cx.notify();
             return;
         }
@@ -1733,6 +1736,7 @@ impl AppView {
                 .document
                 .replace_range(previous..self.editor.cursor, "");
             self.editor.cursor = previous;
+            self.follow_caret();
             cx.notify();
         }
     }
@@ -1901,6 +1905,9 @@ impl AppView {
         );
         self.editor.cursor = cursor;
         self.editor.selection = None;
+        // Both stacks land the caret at an edit the user may have scrolled far away from, so the
+        // change never happens off screen.
+        self.follow_caret();
         replaced
     }
 
@@ -7711,6 +7718,136 @@ mod tests {
         view.update(cx, |app, _| {
             assert_caret_visible(app, "ctrl-home");
             assert_eq!(app.editor_scroll.handle.offset().y, px(0.));
+        });
+    }
+
+    /// A document long enough that the vertical travel is never the thing under test, so a
+    /// viewport that should scroll by one line is not clamped by the end of the content.
+    fn long_document() -> String {
+        (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Typing is not movement, but it moves the caret all the same: pressing Enter on the bottom
+    /// line of the viewport walks the caret off the edge exactly as the Down key does. The edit
+    /// paths set the caret directly rather than through `place_cursor`, so they have to follow it
+    /// too, or the line being typed on disappears from under the typist.
+    #[gpui::test]
+    fn typing_past_the_bottom_edge_scrolls_to_follow(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = long_document();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // Down to the last line the viewport shows, which scrolls by nothing on its own.
+        let visible = view.update(cx, |app, _| app.editor_page_lines());
+        for _ in 0..visible - 1 {
+            cx.simulate_keystrokes("down");
+        }
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor_scroll.handle.offset().y, px(0.));
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "typing past the bottom edge");
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(-EDITOR_LINE_HEIGHT),
+                "the new line is one past the edge, so the viewport should follow by one line"
+            );
+        });
+    }
+
+    /// Backspace across a line boundary moves the caret to the line above, which is off the top
+    /// edge when the caret was on the first line the viewport was showing.
+    #[gpui::test]
+    fn deleting_back_past_the_top_edge_scrolls_to_follow(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = long_document();
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // Scrolled to line 5, with the caret at the start of that first visible line.
+        view.update(cx, |app, cx| {
+            app.editor_scroll
+                .handle
+                .set_offset(point(px(0.), px(-EDITOR_LINE_HEIGHT * 5.)));
+            app.editor.cursor = offset_of(&app.editor.document, 5, 0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "deleting back past the top edge");
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor).line,
+                4,
+                "backspace at the start of a line joins it onto the one above"
+            );
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(-EDITOR_LINE_HEIGHT * 4.),
+                "the viewport should follow up to the line the caret landed on"
+            );
+        });
+    }
+
+    /// Undo restores the caret to where the edit was made, which may be a screenful away from
+    /// wherever the user has since scrolled to. Without the viewport following, the document
+    /// visibly changes while the change itself happens off screen.
+    #[gpui::test]
+    fn undo_brings_the_viewport_back_to_the_edit(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = long_document();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // An edit at the top, then away to the far end of the document.
+        cx.simulate_keystrokes("x");
+        cx.simulate_keystrokes("ctrl-end");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert!(
+                app.editor_scroll.handle.offset().y < px(-EDITOR_LINE_HEIGHT),
+                "the caret should have scrolled well away from the edit"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "undo");
+            assert_eq!(app.editor_scroll.handle.offset().y, px(0.));
+        });
+
+        // Redo restores the caret each stack entry recorded, which for this entry is where the
+        // caret sat when undo was pressed — the far end of the document. The viewport follows it
+        // back down rather than leaving the caret off screen.
+        cx.simulate_keystrokes("ctrl-shift-z");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "redo");
+            assert_eq!(app.editor.cursor, app.editor.document.len());
+            assert!(app.editor_scroll.handle.offset().y < px(-EDITOR_LINE_HEIGHT));
         });
     }
 
