@@ -381,6 +381,12 @@ fn resolve_family(available: &[String], preferred: &str, fallback: &'static str)
     }
 }
 
+/// The window's application identifier, which gpui sets as the Wayland `app_id` and the X11
+/// `WM_CLASS`. gpui has no window-icon API, so on Linux this string is the whole mechanism: the
+/// desktop environment matches it against a desktop entry's `StartupWMClass` and takes the icon
+/// from there. It is also the icon's own name in the hicolor theme, and the installed binary name.
+pub const APP_ID: &str = "rusty-sql-tool";
+
 pub fn launch() {
     gpui::Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
@@ -391,6 +397,7 @@ pub fn launch() {
                     title: Some("Rusty SQL Tool".into()),
                     ..Default::default()
                 }),
+                app_id: Some(APP_ID.to_owned()),
                 ..Default::default()
             },
             |window, cx| {
@@ -5147,6 +5154,37 @@ mod tests {
                 .expect("a test should supply one provider per session it opens")
                 as Arc<dyn DatabaseProvider>
         })
+    }
+
+    /// On Linux the desktop entry *is* the icon mechanism: the compositor matches the window's
+    /// `app_id` against `StartupWMClass` and takes `Icon` from the entry it finds. gpui offers no
+    /// window-icon API to fall back on, so if the entry and `APP_ID` ever drift apart the icon
+    /// silently disappears with nothing to report it — which is what this pins.
+    #[test]
+    fn the_desktop_entry_agrees_with_the_window_app_id() {
+        let entry = include_str!("../packaging/rusty-sql-tool.desktop");
+        let field = |key: &str| {
+            entry
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(key))
+                .map(str::trim)
+        };
+
+        assert_eq!(
+            field("StartupWMClass="),
+            Some(APP_ID),
+            "the entry must claim the same identity the window announces"
+        );
+        assert_eq!(
+            field("Icon="),
+            Some(APP_ID),
+            "the icon is installed into the hicolor theme under APP_ID"
+        );
+        assert_eq!(
+            field("Exec="),
+            Some(env!("CARGO_PKG_NAME")),
+            "the template runs the installed binary; the installer rewrites this to a full path"
+        );
     }
 
     fn build_app_view(

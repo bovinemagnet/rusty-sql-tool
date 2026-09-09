@@ -46,6 +46,29 @@ The app never modifies `.env`. A manual PostgreSQL URL can also be entered with 
 the Connections pane; its contents are masked and passwords are never persisted or formatted in
 logs/errors (FR-002, FR-033).
 
+## Desktop entry and icon
+
+GPUI has no window-icon API, so on Linux the icon reaches the window indirectly. The window
+announces an application identifier — `app_id` on Wayland, `WM_CLASS` on X11 — and the desktop
+environment matches it against a desktop entry, then draws that entry's `Icon`. Under Wayland
+there is no way for the process to set a window icon itself, so installing both halves is the
+only mechanism.
+
+```bash
+cargo build --release        # or: cargo install --path .
+packaging/install-linux.sh
+```
+
+The script scales [`art/rusty_sql_icon.png`](art/rusty_sql_icon.png) into the hicolor theme at
+sizes 16 through 512, installs
+[`packaging/rusty-sql-tool.desktop`](packaging/rusty-sql-tool.desktop) under
+`$XDG_DATA_HOME/applications`, and rewrites its `Exec` to the absolute path of the binary it
+finds — a desktop entry runs with the session's `PATH`, which usually does not include
+`~/.cargo/bin`. It needs ImageMagick, and installs for the current user only.
+
+`APP_ID` in `src/ui.rs` and the entry's `StartupWMClass` have to stay identical or the icon
+silently disappears, so a unit test asserts they match.
+
 ## Core behaviour
 
 - Run uses selected SQL, then falls back to the statement containing the cursor (FR-013–FR-014).
