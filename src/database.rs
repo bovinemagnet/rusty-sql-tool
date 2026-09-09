@@ -61,6 +61,9 @@ pub trait DatabaseProvider: Send + Sync {
     async fn connect(&self, profile: &ConnectionProfile) -> Result<ConnectionInfo, QueryError>;
     async fn disconnect(&self) -> Result<(), QueryError>;
     async fn execute(&self, sql: &str) -> Result<QueryResult, QueryError>;
+    /// Runs `EXPLAIN` — with `ANALYZE` only when `analyse` is set (FR3-019) — and returns the
+    /// plan as a result carrying both the text lines and the structured plan (FR3-020).
+    async fn explain(&self, sql: &str, analyse: bool) -> Result<QueryResult, QueryError>;
     async fn cancel(&self) -> Result<(), QueryError>;
     async fn schemas(&self, refresh: bool) -> Result<Vec<String>, QueryError>;
     async fn objects(&self, schema: &str, refresh: bool)

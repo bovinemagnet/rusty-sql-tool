@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Rusty SQL Tool
+GenericName=PostgreSQL Client
+Comment=A fast, native, editor-first PostgreSQL client
+Exec=rusty-sql-tool
+Icon=rusty-sql-tool
+Terminal=false
+Categories=Development;Database;
+Keywords=SQL;PostgreSQL;Postgres;Database;Query;
+StartupNotify=true
+StartupWMClass=rusty-sql-tool

@@ -20,6 +20,7 @@ use crate::definition::{ObjectDefinition, RoutineDefinition, TableDefinition, Vi
 use crate::result::{CellValue, Column, ExecutionStatus, QueryError, QueryResult};
 
 mod catalogue;
+pub mod plan;
 
 /// Identity of a cached definition. Kind is part of the key because a table and a function may
 /// share a name within one schema.
@@ -480,6 +481,12 @@ impl DatabaseProvider for PostgresProvider {
         }
     }
 
+    async fn explain(&self, sql: &str, analyse: bool) -> Result<QueryResult, QueryError> {
+        let statement = crate::sql::prepare_explain(sql, analyse);
+        let result = self.execute(&statement).await?;
+        plan_result(result)
+    }
+
     async fn cancel(&self) -> Result<(), QueryError> {
         tracing::info!("cancelling the running statement");
         let (token, ssl_mode) = self
@@ -667,6 +674,29 @@ fn command_name(sql: &str) -> String {
 /// apart in the text view without a second field.
 fn notice_line(severity: &str, message: &str) -> String {
     format!("{severity}: {message}")
+}
+
+/// Turns the single JSON cell `EXPLAIN (FORMAT JSON)` returns into a plan result, keeping the
+/// timing and notices of the execution that produced it.
+#[allow(clippy::result_large_err)]
+fn plan_result(result: QueryResult) -> Result<QueryResult, QueryError> {
+    let json = match result.rows.first().and_then(|row| row.first()) {
+        Some(CellValue::Json(json)) | Some(CellValue::Text(json)) => json,
+        _ => {
+            return Err(simple_error(
+                "Could not read the execution plan: the server returned no plan",
+            ));
+        }
+    };
+    if plan::is_utility_statement(json) {
+        // A utility statement (CREATE INDEX, VACUUM, SET, ALTER TABLE, …) has no plan to show;
+        // fall through to the original text result unchanged so the Text renderer shows the
+        // server's own output, as it did before FORMAT JSON was added to plain Explain.
+        return Ok(result);
+    }
+    let mut converted = plan::parse_plan(json)?.into_result(result.execution_time);
+    converted.notices = result.notices;
+    Ok(converted)
 }
 
 fn simple_error(message: &str) -> QueryError {
@@ -862,6 +892,60 @@ mod tests {
         assert!(
             !logs.contains(password),
             "the password appeared in the log output:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn a_json_cell_becomes_a_plan_result() {
+        let result = QueryResult {
+            columns: vec![Column {
+                name: "QUERY PLAN".into(),
+                database_type: "json".into(),
+                nullable: None,
+            }],
+            rows: vec![vec![CellValue::Json(plan::SAMPLE_PLAN_JSON.into())]],
+            execution_time: Duration::from_millis(40),
+            notices: vec!["NOTICE: hello".into()],
+            ..QueryResult::default()
+        };
+        let converted = plan_result(result).unwrap();
+        assert_eq!(converted.plan, Some(crate::plan::sample_plan()));
+        assert_eq!(converted.execution_time, Duration::from_millis(40));
+        assert_eq!(converted.notices, vec!["NOTICE: hello".to_owned()]);
+        assert!(!converted.rows.is_empty());
+    }
+
+    /// FR3-020: a utility statement (`CREATE INDEX`, `VACUUM`, `SET`, `ALTER TABLE`, …) is
+    /// rendered by PostgreSQL as `ExplainDummyGroup("Utility Statement", …)` — a bare string in
+    /// the array, not a plan object. This must fall through to the original text result rather
+    /// than be reported as a broken plan.
+    #[test]
+    fn a_utility_statement_falls_back_to_the_original_text_result() {
+        let result = QueryResult {
+            columns: vec![Column {
+                name: "QUERY PLAN".into(),
+                database_type: "json".into(),
+                nullable: None,
+            }],
+            rows: vec![vec![CellValue::Json("[\"Utility Statement\"]".into())]],
+            execution_time: Duration::from_millis(5),
+            ..QueryResult::default()
+        };
+        let converted = plan_result(result).unwrap();
+        assert_eq!(converted.plan, None);
+        assert_eq!(
+            converted.rows,
+            vec![vec![CellValue::Json("[\"Utility Statement\"]".into())]]
+        );
+    }
+
+    #[test]
+    fn a_result_without_a_json_cell_is_an_error() {
+        let error = plan_result(QueryResult::default()).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("Could not read the execution plan")
         );
     }
 }

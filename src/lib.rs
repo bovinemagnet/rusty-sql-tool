@@ -8,6 +8,7 @@ pub mod config;
 pub mod database;
 pub mod definition;
 pub mod logging;
+pub mod plan;
 pub mod postgres;
 pub mod result;
 pub mod sql;

@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::plan::QueryPlan;
+
 /// A driver-independent cell value (FR-021, 59.2).
 #[derive(Clone, Debug, PartialEq)]
 pub enum CellValue {
@@ -74,6 +76,9 @@ pub struct QueryResult {
     pub command_tag: Option<String>,
     pub notices: Vec<String>,
     pub automatic_limit: Option<u32>,
+    /// The structured plan when the statement was an `EXPLAIN` (FR3-020). The text lines are in
+    /// `rows` as well, so every existing renderer and the copy path keep working.
+    pub plan: Option<QueryPlan>,
 }
 
 impl QueryResult {

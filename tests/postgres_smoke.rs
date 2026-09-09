@@ -98,7 +98,46 @@ async fn connects_browses_and_executes_against_postgres() {
         .explain(&mut editor)
         .await
         .expect("plain EXPLAIN should execute");
-    assert!(!explained.rows.is_empty());
+    let plan = explained
+        .plan
+        .as_ref()
+        .expect("EXPLAIN should yield a plan");
+    assert!(!plan.analysed, "FR-016: plain Explain must not analyse");
+    assert!(plan.root.actual.is_none());
+    // Plain EXPLAIN has no summary (PostgreSQL sets `es->summary = summary_set ? es->summary :
+    // es->analyze`), so `Planning Time` is never emitted — exactly as plain `EXPLAIN` in psql
+    // prints no `Planning Time:` line.
+    assert!(plan.planning_time_ms.is_none());
+    assert!(
+        !explained.rows.is_empty(),
+        "the text lines travel with the plan"
+    );
+
+    editor.document = "SELECT generate_series(1, 1000) AS number ORDER BY number DESC;".into();
+    editor.cursor = 3;
+    let analysed = service
+        .explain_analyse(&mut editor)
+        .await
+        .expect("EXPLAIN ANALYZE of a SELECT should execute");
+    let plan = analysed
+        .plan
+        .as_ref()
+        .expect("EXPLAIN ANALYZE should yield a plan");
+    assert!(plan.analysed);
+    assert!(plan.execution_time_ms.is_some());
+    assert!(plan.node_count() >= 2, "a sort over a function scan");
+    assert!(
+        plan.rows().iter().any(|row| row.hottest),
+        "some node must be the most expensive"
+    );
+
+    editor.document = "CREATE TEMP TABLE smoke_refused (id int);".into();
+    editor.cursor = 3;
+    let refused = service
+        .explain_analyse(&mut editor)
+        .await
+        .expect_err("FR3-019: ANALYZE of DDL is refused before execution");
+    assert!(refused.message.starts_with("Explain Analyze runs only"));
 
     let provider_for_query = provider.clone();
     let long_query =

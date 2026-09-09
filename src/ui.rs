@@ -10,10 +10,13 @@ use gpui::{
 };
 use tokio::runtime::Runtime;
 
-use crate::application::{CommandService, EditorState, ResultDestination, ResultDisplay, command};
+use crate::application::{
+    CommandService, EditorState, PlanDisplay, ResultDestination, ResultDisplay, command,
+};
 use crate::config::{ConnectionProfile, local_profile};
 use crate::database::{ConnectionState, DatabaseObject, DatabaseProvider, ObjectKind};
 use crate::definition::{DefinitionSection, ObjectDefinition};
+use crate::plan::{GraphLayout, PlanRow, QueryPlan};
 use crate::postgres::PostgresProvider;
 use crate::result::{CellValue, ExecutionStatus, QueryError, QueryResult};
 use crate::sql::{Highlight, HighlightSpan, highlight_lines};
@@ -49,6 +52,8 @@ const EDITOR_LINE_HEIGHT: f32 = 25.;
 const EDITOR_OVERSCAN: usize = 8;
 /// How many lines to assume before the first layout pass has measured the editor viewport.
 const UNMEASURED_VIEWPORT_LINES: usize = 80;
+/// What Page Up and Page Down move by before the viewport has been measured.
+const UNMEASURED_PAGE_LINES: usize = 20;
 const EDITOR_TEXT_SIZE: f32 = 14.;
 const GUTTER_WIDTH: f32 = 40.;
 const RESULT_PANE_HEIGHT: f32 = 296.;
@@ -68,6 +73,23 @@ const RESULT_CHROME_SLOP_ROWS: usize = 12;
 /// Left inset of a text-result line, matching its `px_5` padding. The selection highlight and the
 /// pointer-to-column arithmetic both measure from here.
 const RESULT_TEXT_INSET: f32 = 20.;
+
+/// Plan tree: indent per depth, and the widths of its fixed columns.
+const PLAN_INDENT: f32 = 22.;
+const PLAN_NODE_COLUMN: f32 = 420.;
+const PLAN_NUMBER_COLUMN: f32 = 120.;
+const PLAN_ACTUAL_COLUMN: f32 = 130.;
+const PLAN_TIME_COLUMN: f32 = 96.;
+const PLAN_BAR_WIDTH: f32 = 120.;
+/// The selected node's detail panel.
+const PLAN_DETAIL_WIDTH: f32 = 340.;
+
+/// Plan graph: node box and the pitch between columns (depth) and rows (leaf order).
+const PLAN_GRAPH_NODE_WIDTH: f32 = 132.;
+const PLAN_GRAPH_NODE_HEIGHT: f32 = 118.;
+const PLAN_GRAPH_COLUMN_PITCH: f32 = 148.;
+const PLAN_GRAPH_ROW_PITCH: f32 = 160.;
+const PLAN_GRAPH_PADDING: f32 = 24.;
 
 /// The single reusable slot for a connection typed into the dialog.
 const MANUAL_PROFILE_NAME: &str = "Manual";
@@ -361,6 +383,12 @@ fn resolve_family(available: &[String], preferred: &str, fallback: &'static str)
     }
 }
 
+/// The window's application identifier, which gpui sets as the Wayland `app_id` and the X11
+/// `WM_CLASS`. gpui has no window-icon API, so on Linux this string is the whole mechanism: the
+/// desktop environment matches it against a desktop entry's `StartupWMClass` and takes the icon
+/// from there. It is also the icon's own name in the hicolor theme, and the installed binary name.
+pub const APP_ID: &str = "rusty-sql-tool";
+
 pub fn launch() {
     gpui::Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
@@ -371,6 +399,7 @@ pub fn launch() {
                     title: Some("Rusty SQL Tool".into()),
                     ..Default::default()
                 }),
+                app_id: Some(APP_ID.to_owned()),
                 ..Default::default()
             },
             |window, cx| {
@@ -479,9 +508,6 @@ struct AppView {
     focus: Focus,
     status: String,
     focus_handle: FocusHandle,
-    /// Document snapshots paired with the caret they were taken at.
-    undo: Vec<(String, usize)>,
-    redo: Vec<(String, usize)>,
     connection_dialog: bool,
     connection_buffer: String,
     /// Digits typed into the row-limit field, or `None` when it is not being edited. The ± steps
@@ -504,6 +530,8 @@ struct AppView {
     definition_scroll: ScrollState,
     /// Selected text in the results, and whether a drag is extending it.
     result_selection: Option<ResultSelection>,
+    /// The plan node showing in the detail panel, when one is selected (§15.2).
+    plan_selection: Option<usize>,
     selecting_results: bool,
     /// Whether a pointer drag is currently extending the SQL editor's selection.
     selecting_editor: bool,
@@ -624,8 +652,6 @@ impl AppView {
             focus: Focus::Editor,
             status: "Disconnected · Run a query to see results.".into(),
             focus_handle: cx.focus_handle(),
-            undo: Vec::new(),
-            redo: Vec::new(),
             connection_dialog: false,
             connection_buffer: String::new(),
             limit_buffer: None,
@@ -638,6 +664,7 @@ impl AppView {
             results_scroll: ScrollState::default(),
             definition_scroll: ScrollState::default(),
             result_selection: None,
+            plan_selection: None,
             selecting_results: false,
             selecting_editor: false,
             mono_advance: measure_mono_advance(&fonts_for_advance, RESULT_TEXT_SIZE, cx),
@@ -782,31 +809,40 @@ impl AppView {
         self.editor
             .results
             .iter()
-            .flat_map(|result| match self.editor.display {
-                ResultDisplay::Text => result
-                    .as_text()
-                    .lines()
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>(),
-                ResultDisplay::Table => {
-                    let mut lines = Vec::with_capacity(result.rows.len() + 1);
-                    if !result.columns.is_empty() {
-                        lines.push(
-                            result
-                                .columns
-                                .iter()
-                                .map(|column| column.name.clone())
+            .flat_map(|result| {
+                if result.plan.is_some() {
+                    return result
+                        .as_text()
+                        .lines()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                }
+                match self.editor.display {
+                    ResultDisplay::Text => result
+                        .as_text()
+                        .lines()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>(),
+                    ResultDisplay::Table => {
+                        let mut lines = Vec::with_capacity(result.rows.len() + 1);
+                        if !result.columns.is_empty() {
+                            lines.push(
+                                result
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect::<Vec<_>>()
+                                    .join("\t"),
+                            );
+                        }
+                        lines.extend(result.rows.iter().map(|row| {
+                            row.iter()
+                                .map(CellValue::to_display_string)
                                 .collect::<Vec<_>>()
-                                .join("\t"),
-                        );
+                                .join("\t")
+                        }));
+                        lines
                     }
-                    lines.extend(result.rows.iter().map(|row| {
-                        row.iter()
-                            .map(CellValue::to_display_string)
-                            .collect::<Vec<_>>()
-                            .join("\t")
-                    }));
-                    lines
                 }
             })
             .collect()
@@ -1255,6 +1291,7 @@ impl AppView {
             RunMode::Current => "Running statement…",
             RunMode::All => "Running all statements…",
             RunMode::Explain => "Explaining statement…",
+            RunMode::ExplainAnalyse => "Explaining statement with ANALYZE…",
         }
         .into();
         let service = self.active_session().service.clone();
@@ -1275,6 +1312,14 @@ impl AppView {
                             }
                             RunMode::Explain => service
                                 .explain(&mut editor)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| RunFailure {
+                                    statement_index: None,
+                                    error,
+                                }),
+                            RunMode::ExplainAnalyse => service
+                                .explain_analyse(&mut editor)
                                 .await
                                 .map(|_| ())
                                 .map_err(|error| RunFailure {
@@ -1318,6 +1363,7 @@ impl AppView {
                         this.editor.execution_status = editor.execution_status;
                         // A selection into the previous result set means nothing against this one.
                         this.result_selection = None;
+                        this.plan_selection = None;
                         if result.is_ok() {
                             match this.editor.destination {
                                 ResultDestination::Pane => this.focus = Focus::Editor,
@@ -1472,12 +1518,13 @@ impl AppView {
             self.editor.execution_status == ExecutionStatus::Running,
             self.connection_state() == ConnectionState::Connected,
         ) {
-            // Run, Run All and Explain act on the SQL document, which a definition tab has
-            // replaced on screen. A shortcut must not execute a document the user cannot see
-            // (FR2-007); cancel and the window commands stay available wherever focus is.
+            // Run, Run All, Explain and Explain Analyze act on the SQL document, which a
+            // definition tab has replaced on screen. A shortcut must not execute a document the
+            // user cannot see (FR2-007); cancel and the window commands stay available wherever
+            // focus is.
             let executes_the_document = matches!(
                 command_id,
-                command::RUN | command::RUN_ALL | command::EXPLAIN
+                command::RUN | command::RUN_ALL | command::EXPLAIN | command::EXPLAIN_ANALYSE
             );
             if !executes_the_document || !matches!(self.focus, Focus::Definition(_)) {
                 self.dispatch_command(command_id, cx);
@@ -1532,6 +1579,12 @@ impl AppView {
                 }
                 "z" if modifiers.shift => self.redo(cx),
                 "z" => self.undo(cx),
+                // Word-wise movement and the document edges. Plain Left/Right/Home/End are
+                // handled below; the command modifier widens each to its larger unit.
+                "left" => self.move_word(false, modifiers.shift, cx),
+                "right" => self.move_word(true, modifiers.shift, cx),
+                "home" => self.move_to_document_edge(false, modifiers.shift, cx),
+                "end" => self.move_to_document_edge(true, modifiers.shift, cx),
                 _ => {}
             }
             return;
@@ -1550,6 +1603,8 @@ impl AppView {
             "down" => self.move_line(true, modifiers.shift, cx),
             "home" => self.move_to_line_edge(false, modifiers.shift, cx),
             "end" => self.move_to_line_edge(true, modifiers.shift, cx),
+            "pageup" => self.move_page(false, modifiers.shift, cx),
+            "pagedown" => self.move_page(true, modifiers.shift, cx),
             "enter" => self.insert_text("\n", cx),
             "tab" => self.insert_text("    ", cx),
             _ => {
@@ -1568,6 +1623,7 @@ impl AppView {
             command::RUN => self.run(RunMode::Current, cx),
             command::RUN_ALL => self.run(RunMode::All, cx),
             command::EXPLAIN => self.run(RunMode::Explain, cx),
+            command::EXPLAIN_ANALYSE => self.run(RunMode::ExplainAnalyse, cx),
             command::CANCEL => self.cancel(cx),
             command::NEW_EDITOR => self.new_editor(cx),
             command::CLOSE_EDITOR => self.close_active_editor(cx),
@@ -1638,12 +1694,13 @@ impl AppView {
     /// Snapshots the document *and* the caret before an edit, so undo can put the user back where
     /// they were working rather than at the end of the document.
     fn record_edit(&mut self) {
-        self.undo
+        self.editor
+            .undo
             .push((self.editor.document.clone(), self.editor.cursor));
-        if self.undo.len() > 200 {
-            self.undo.remove(0);
+        if self.editor.undo.len() > 200 {
+            self.editor.undo.remove(0);
         }
-        self.redo.clear();
+        self.editor.redo.clear();
     }
 
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1708,7 +1765,43 @@ impl AppView {
             anchor.min(offset)..anchor.max(offset)
         });
         self.editor.cursor = offset;
+        self.follow_caret();
         cx.notify();
+    }
+
+    /// Scrolls the caret back into view after it has moved. The editor windows its render on the
+    /// scroll offset alone, so a caret that moves out of that window simply vanishes: Page Down
+    /// moves by a whole viewport and would otherwise land the caret exactly past the bottom edge,
+    /// leaving the screen unchanged and the key looking broken.
+    ///
+    /// It scrolls by whole lines and only as far as it takes to bring the caret just inside, so a
+    /// movement that stays on screen leaves the offset alone rather than recentring and jumping
+    /// the text under the user. Dragging a selection past an edge gets autoscroll from the same
+    /// path, since a drag places the caret the same way.
+    fn follow_caret(&self) {
+        let handle = &self.editor_scroll.handle;
+        // Before the first layout pass there is no measured viewport to be outside of, and
+        // `max_offset` has nothing to clamp against.
+        if handle.bounds().size.height <= px(0.) {
+            return;
+        }
+        let visible = self.editor_page_lines();
+        let line = document_position(&self.editor.document, self.editor.cursor).line;
+        let top = (-f32::from(handle.offset().y) / EDITOR_LINE_HEIGHT)
+            .max(0.)
+            .round() as usize;
+        let target = if line < top {
+            line
+        } else if line >= top + visible {
+            line + 1 - visible
+        } else {
+            return;
+        };
+        let travel = handle.max_offset().height;
+        self.editor_scroll.set_offset(
+            ScrollAxis::Vertical,
+            px(-(target as f32 * EDITOR_LINE_HEIGHT)).clamp(-travel, px(0.)),
+        );
     }
 
     fn move_cursor(&mut self, right: bool, selecting: bool, cx: &mut Context<Self>) {
@@ -1732,6 +1825,49 @@ impl AppView {
         self.place_cursor(offset, selecting, cx);
     }
 
+    /// Ctrl+Left and Ctrl+Right, which step over a whole word rather than a character.
+    fn move_word(&mut self, right: bool, selecting: bool, cx: &mut Context<Self>) {
+        let offset = if right {
+            next_word_end(&self.editor.document, self.editor.cursor)
+        } else {
+            previous_word_start(&self.editor.document, self.editor.cursor)
+        };
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// Ctrl+Home and Ctrl+End, which reach the ends of the whole document where plain Home and
+    /// End stay on the current line.
+    fn move_to_document_edge(&mut self, end: bool, selecting: bool, cx: &mut Context<Self>) {
+        let offset = if end { self.editor.document.len() } else { 0 };
+        self.place_cursor(offset, selecting, cx);
+    }
+
+    /// How many whole lines the editor viewport shows, which is what Page Up and Page Down move
+    /// by. Before the first layout pass the viewport measures zero; a page is then a conservative
+    /// screenful rather than the generous overscan the virtualised surfaces fall back to, because
+    /// this figure moves the caret rather than deciding what to build.
+    fn editor_page_lines(&self) -> usize {
+        let height = self.editor_scroll.handle.bounds().size.height;
+        if height <= px(0.) {
+            return UNMEASURED_PAGE_LINES;
+        }
+        ((f32::from(height) / EDITOR_LINE_HEIGHT) as usize).max(1)
+    }
+
+    /// Page Up and Page Down, which move a viewport at a time and hold the column the way Up and
+    /// Down do. `offset_of` clamps past the last line, so a page off the end lands at the end.
+    fn move_page(&mut self, down: bool, selecting: bool, cx: &mut Context<Self>) {
+        let position = document_position(&self.editor.document, self.editor.cursor);
+        let page = self.editor_page_lines();
+        let line = if down {
+            position.line.saturating_add(page)
+        } else {
+            position.line.saturating_sub(page)
+        };
+        let offset = offset_of(&self.editor.document, line, position.column);
+        self.place_cursor(offset, selecting, cx);
+    }
+
     /// Home and End, which stay within the current line.
     fn move_to_line_edge(&mut self, end: bool, selecting: bool, cx: &mut Context<Self>) {
         let line = document_position(&self.editor.document, self.editor.cursor).line;
@@ -1741,17 +1877,17 @@ impl AppView {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        if let Some(previous) = self.undo.pop() {
+        if let Some(previous) = self.editor.undo.pop() {
             let current = self.restore(previous);
-            self.redo.push(current);
+            self.editor.redo.push(current);
             cx.notify();
         }
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
-        if let Some(next) = self.redo.pop() {
+        if let Some(next) = self.editor.redo.pop() {
             let current = self.restore(next);
-            self.undo.push(current);
+            self.editor.undo.push(current);
             cx.notify();
         }
     }
@@ -1776,6 +1912,30 @@ impl AppView {
         }
         self.editor.display = display;
         cx.notify();
+    }
+
+    fn set_plan_display(&mut self, display: PlanDisplay, cx: &mut Context<Self>) {
+        self.editor.plan_display = display;
+        cx.notify();
+    }
+
+    /// Selects a plan node for the detail panel; selecting it again clears it.
+    fn select_plan_node(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.plan_selection = if self.plan_selection == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+        cx.notify();
+    }
+
+    /// The plan the editor is showing, when its result is a plan. Explain always leaves exactly
+    /// one result, so the first is the only one to look at.
+    fn shown_plan(&self) -> Option<&QueryPlan> {
+        self.editor
+            .results
+            .first()
+            .and_then(|result| result.plan.as_ref())
     }
 
     fn set_destination(&mut self, destination: ResultDestination, cx: &mut Context<Self>) {
@@ -1879,6 +2039,7 @@ impl AppView {
         let closed = std::mem::replace(&mut self.editor, promoted);
         self.focus = Focus::Editor;
         self.result_selection = None;
+        self.plan_selection = None;
         self.status = format!("Closed {}", closed.title);
         cx.notify();
     }
@@ -1893,6 +2054,8 @@ impl AppView {
         if let Some(editor) = self.background_editors.get_mut(index) {
             std::mem::swap(&mut self.editor, editor);
             self.focus = Focus::Editor;
+            self.result_selection = None;
+            self.plan_selection = None;
             self.status = format!("Editor: {}", self.editor.connection_identity());
             cx.notify();
         }
@@ -2460,6 +2623,27 @@ impl AppView {
             ))
     }
 
+    /// TREE / GRAPH / TEXT for a plan result, replacing TABLE / TEXT (FR3-020).
+    fn plan_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.editor.plan_display;
+        let mut control = segmented();
+        for (id, label, display) in [
+            ("plan-tree", "TREE", PlanDisplay::Tree),
+            ("plan-graph", "GRAPH", PlanDisplay::Graph),
+            ("plan-text", "TEXT", PlanDisplay::Text),
+        ] {
+            control = control.child(segment(
+                &self.fonts,
+                id,
+                label,
+                current == display,
+                true,
+                cx.listener(move |this, _, _, cx| this.set_plan_display(display, cx)),
+            ));
+        }
+        control
+    }
+
     fn destination_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         segmented()
             .child(segment(
@@ -2878,8 +3062,11 @@ impl AppView {
             .result_selection
             .and_then(|selection| selection.span_for(index, length));
         let advance = self.mono_advance;
+        let id = SharedString::from(format!("result-line-{index}"));
+        let selector = id.clone();
         div()
-            .id(SharedString::from(format!("result-line-{index}")))
+            .id(id)
+            .debug_selector(move || selector.to_string())
             .relative()
             .min_w_full()
             .cursor_text()
@@ -2954,6 +3141,460 @@ impl AppView {
         table.child(row_spacer(visible.below))
     }
 
+    /// The plan views with the detail panel alongside when a node is selected (§15.2).
+    fn plan_surface(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = match self.editor.plan_display {
+            PlanDisplay::Graph => self.plan_graph(plan, cx),
+            _ => self.plan_tree(plan, cx),
+        };
+        let mut surface = table_shell(&self.fonts).flex_row().items_start();
+        surface = surface.child(view);
+        if let Some(index) = self
+            .plan_selection
+            .filter(|index| plan.node(*index).is_some())
+        {
+            surface = surface.child(self.plan_detail(plan, index));
+        }
+        surface.into_any_element()
+    }
+
+    /// One row per node, indented by depth, with the metrics as columns and a cost-share bar.
+    fn plan_tree(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::Div {
+        let analysed = plan.analysed;
+        let mut header = div()
+            .flex()
+            .flex_none()
+            .h(px(RESULT_ROW_HEIGHT))
+            .border_b_1()
+            .border_color(rgb(BORDER));
+        let mut columns = vec![("NODE", PLAN_NODE_COLUMN), ("EST ROWS", PLAN_NUMBER_COLUMN)];
+        if analysed {
+            columns.push(("ACTUAL ROWS", PLAN_ACTUAL_COLUMN));
+            columns.push(("TIME", PLAN_TIME_COLUMN));
+        }
+        columns.push(("COST", PLAN_NUMBER_COLUMN));
+        columns.push(("SHARE", PLAN_BAR_WIDTH + 24.));
+        for (name, width) in columns {
+            header = header.child(
+                div()
+                    .w(px(width))
+                    .flex_none()
+                    .px_4()
+                    .py(px(11.))
+                    .text_size(px(10.))
+                    .text_color(rgb(FAINT))
+                    .child(name),
+            );
+        }
+        let mut tree = div().flex().flex_col().flex_none().child(header);
+        for row in plan.rows() {
+            tree = tree.child(self.plan_tree_row(&row, analysed, cx));
+        }
+        tree
+    }
+
+    /// Root at the left, children to the right, connectors as thick as the rows that flowed
+    /// along them. Positions come from the model's layout; this only multiplies by pitches
+    /// (FR3-020, §15.2).
+    fn plan_graph(&self, plan: &QueryPlan, cx: &mut Context<Self>) -> gpui::Div {
+        let layout: GraphLayout = plan.graph_layout();
+        let rows = plan.rows();
+        let position = |index: usize| -> (f32, f32) {
+            let placement = &layout.placements[index];
+            (
+                PLAN_GRAPH_PADDING + placement.column as f32 * PLAN_GRAPH_COLUMN_PITCH,
+                PLAN_GRAPH_PADDING + placement.row * PLAN_GRAPH_ROW_PITCH,
+            )
+        };
+        let width = PLAN_GRAPH_PADDING * 2.
+            + layout.columns.saturating_sub(1) as f32 * PLAN_GRAPH_COLUMN_PITCH
+            + PLAN_GRAPH_NODE_WIDTH;
+        let height = PLAN_GRAPH_PADDING * 2.
+            + layout.leaf_rows.saturating_sub(1) as f32 * PLAN_GRAPH_ROW_PITCH
+            + PLAN_GRAPH_NODE_HEIGHT;
+        let mut canvas = div().relative().flex_none().w(px(width)).h(px(height));
+        // Connectors first, so the boxes paint over their ends.
+        for edge in &layout.edges {
+            let (parent_x, parent_y) = position(edge.parent);
+            let (child_x, child_y) = position(edge.child);
+            let thickness = edge_thickness(edge.rows);
+            let start_x = parent_x + PLAN_GRAPH_NODE_WIDTH;
+            let start_y = parent_y + PLAN_GRAPH_NODE_HEIGHT / 2.;
+            let end_y = child_y + PLAN_GRAPH_NODE_HEIGHT / 2.;
+            let elbow_x = start_x + 8.;
+            let top = start_y.min(end_y);
+            canvas = canvas
+                .child(connector(
+                    start_x,
+                    start_y - thickness / 2.,
+                    elbow_x - start_x,
+                    thickness,
+                ))
+                .child(connector(
+                    elbow_x - thickness / 2.,
+                    top - thickness / 2.,
+                    thickness,
+                    (start_y - end_y).abs() + thickness,
+                ))
+                .child(connector(
+                    elbow_x,
+                    end_y - thickness / 2.,
+                    child_x - elbow_x,
+                    thickness,
+                ));
+        }
+        for row in &rows {
+            let (x, y) = position(row.index);
+            let index = row.index;
+            let id = SharedString::from(format!("plan-node-{index}"));
+            let selector = id.clone();
+            let selected = self.plan_selection == Some(index);
+            let (rows_line, time_line) = match &row.node.actual {
+                Some(actual) => (
+                    format!("rows {}", format_count(actual.rows * actual.loops)),
+                    format!("{:.1} ms", actual.total_time_ms),
+                ),
+                None => (
+                    format!("rows {}", format_count(row.node.plan_rows)),
+                    String::new(),
+                ),
+            };
+            canvas = canvas.child(
+                div()
+                    .id(id)
+                    .debug_selector(move || selector.to_string())
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(PLAN_GRAPH_NODE_WIDTH))
+                    .h(px(PLAN_GRAPH_NODE_HEIGHT))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(CONTROL_RADIUS))
+                    .bg(rgb(if row.hottest || selected {
+                        PANEL_HIGH
+                    } else {
+                        PANEL_LIGHT
+                    }))
+                    .border_1()
+                    .border_color(rgb(if row.hottest {
+                        RED
+                    } else if selected {
+                        ACCENT
+                    } else {
+                        BORDER
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_plan_node(index, cx)))
+                    .child(
+                        div()
+                            .h(px(30.))
+                            .text_size(px(12.5))
+                            .line_height(px(15.))
+                            .font_family(self.fonts.display.clone())
+                            .overflow_hidden()
+                            .child(row.node.operation.clone())
+                            .children(row.node.target.clone().map(|target| {
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(target)
+                            })),
+                    )
+                    // An explicit line height keeps the three metric rows below to 14 px each
+                    // (gpui otherwise defaults to `phi() * font_size`, ≈17 px, which overflows
+                    // the card and collides with the `mt_auto` share bar).
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .line_height(px(14.))
+                            .whitespace_nowrap()
+                            .child(rows_line),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(10.5))
+                            .line_height(px(14.))
+                            .text_color(rgb(FAINT))
+                            .whitespace_nowrap()
+                            .child(format!("est {}", format_count(row.node.plan_rows)))
+                            .children(
+                                estimate_flag(row.estimate_ratio)
+                                    .map(|flag| div().text_color(rgb(WARN)).child(flag)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(10.5))
+                            .line_height(px(14.))
+                            .text_color(rgb(MUTED))
+                            .whitespace_nowrap()
+                            .child(time_line)
+                            .child(format!("{:.0}%", row.share * 100.)),
+                    )
+                    .child(div().mt_auto().child(share_bar(
+                        row.share,
+                        row.hottest,
+                        PLAN_GRAPH_NODE_WIDTH - 24.,
+                    ))),
+            );
+        }
+        div().flex().flex_col().flex_none().child(canvas).child(
+            div()
+                .flex()
+                .gap_6()
+                .px(px(PLAN_GRAPH_PADDING))
+                .pb(px(20.))
+                .text_size(px(10.))
+                .text_color(rgb(FAINT))
+                .child("CONNECTOR WIDTH ∝ ROWS")
+                .child("BAR = SHARE OF PLAN COST")
+                .child("TIME IS INCLUSIVE OF CHILDREN"),
+        )
+    }
+
+    fn plan_tree_row(
+        &self,
+        row: &PlanRow<'_>,
+        analysed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let index = row.index;
+        let id = SharedString::from(format!("plan-node-{index}"));
+        let selector = id.clone();
+        let selected = self.plan_selection == Some(index);
+        let detail = row
+            .node
+            .properties
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut element = div()
+            .id(id)
+            .debug_selector(move || selector.to_string())
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(RESULT_ROW_HEIGHT))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .cursor_pointer()
+            .when(selected, |row| row.bg(rgb(ACCENT_SOFT)))
+            .when(!selected, |row| {
+                row.hover(|style| style.bg(rgb(PANEL_LIGHT)))
+            })
+            // The error card's red strip marks the node the plan spent most on (§15.2).
+            .when(row.hottest, |row| {
+                row.border_l(px(3.)).border_color(rgb(RED))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.select_plan_node(index, cx)))
+            .child(
+                div()
+                    .w(px(PLAN_NODE_COLUMN))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .pr_4()
+                    .pl(px(16. + PLAN_INDENT * row.depth as f32))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .whitespace_nowrap()
+                            .child(row.node.heading()),
+                    )
+                    .when(!detail.is_empty(), |cell| {
+                        cell.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .child(detail),
+                        )
+                    }),
+            )
+            .child(plan_number_cell(
+                format_count(row.node.plan_rows),
+                PLAN_NUMBER_COLUMN,
+            ));
+        if analysed {
+            let (actual_rows, time) = match &row.node.actual {
+                Some(actual) => (
+                    format_count(actual.rows * actual.loops),
+                    format!("{:.2} ms", actual.total_time_ms),
+                ),
+                None => ("—".to_owned(), "—".to_owned()),
+            };
+            let mut actual_cell = div()
+                .w(px(PLAN_ACTUAL_COLUMN))
+                .flex_none()
+                .flex()
+                .items_baseline()
+                .justify_end()
+                .gap(px(6.))
+                .px_4()
+                .text_size(px(13.))
+                .child(actual_rows);
+            if let Some(flag) = estimate_flag(row.estimate_ratio) {
+                actual_cell =
+                    actual_cell.child(div().text_size(px(10.)).text_color(rgb(WARN)).child(flag));
+            }
+            element = element
+                .child(actual_cell)
+                .child(plan_number_cell(time, PLAN_TIME_COLUMN));
+        }
+        element
+            .child(plan_number_cell(
+                format!("{:.2}", row.node.total_cost),
+                PLAN_NUMBER_COLUMN,
+            ))
+            .child(div().flex_none().px_3().child(share_bar(
+                row.share,
+                row.hottest,
+                PLAN_BAR_WIDTH,
+            )))
+    }
+
+    /// Everything about one node: the figures, every server property, and its own text lines.
+    fn plan_detail(&self, plan: &QueryPlan, index: usize) -> gpui::AnyElement {
+        let Some(node) = plan.node(index) else {
+            return div().into_any_element();
+        };
+        let row = plan.rows().into_iter().find(|row| row.index == index);
+        let share = row.as_ref().map_or(0.0, |row| row.share);
+        let hottest = row.as_ref().is_some_and(|row| row.hottest);
+        let mut subtitle = format!("{:.0}% of plan cost", share * 100.);
+        if hottest {
+            subtitle.push_str(" · most expensive node");
+        }
+        // The third element is the estimate flag, WARN-coloured of its own accord — never folded
+        // into the value string, so it keeps its colour wherever a row shows one (§15.2).
+        let mut pairs: Vec<(String, String, Option<String>)> = vec![
+            (
+                "Startup cost".into(),
+                format!("{:.2}", node.startup_cost),
+                None,
+            ),
+            ("Total cost".into(), format!("{:.2}", node.total_cost), None),
+            ("Plan rows".into(), format_count(node.plan_rows), None),
+            ("Width".into(), node.plan_width.to_string(), None),
+        ];
+        if let Some(actual) = &node.actual {
+            let rows = format_count(actual.rows * actual.loops);
+            let flag = estimate_flag(row.and_then(|row| row.estimate_ratio));
+            pairs.push(("Actual rows".into(), rows, flag));
+            pairs.push((
+                "Actual time".into(),
+                format!(
+                    "{:.3} .. {:.3} ms",
+                    actual.startup_time_ms, actual.total_time_ms
+                ),
+                None,
+            ));
+            pairs.push(("Loops".into(), format!("{:.0}", actual.loops), None));
+        }
+        pairs.extend(
+            node.properties
+                .iter()
+                .cloned()
+                .map(|(key, value)| (key, value, None)),
+        );
+        let mut panel = div()
+            .id("plan-detail")
+            .debug_selector(|| "plan-detail".to_owned())
+            .w(px(PLAN_DETAIL_WIDTH))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .px(px(20.))
+            .py(px(18.))
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_family(self.fonts.display.clone())
+                            .child(node.heading()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_family(self.fonts.body.clone())
+                            .text_color(rgb(MUTED))
+                            .child(subtitle),
+                    ),
+            );
+        let mut table = div().flex().flex_col();
+        for (key, value, flag) in pairs {
+            let mut value_cell = div()
+                .flex()
+                .items_baseline()
+                .justify_end()
+                .gap(px(6.))
+                .child(value);
+            if let Some(flag) = flag {
+                value_cell = value_cell.child(
+                    div()
+                        .id("plan-detail-flag")
+                        .debug_selector(|| "plan-detail-flag".to_owned())
+                        .text_size(px(10.))
+                        .text_color(rgb(WARN))
+                        .child(flag),
+                );
+            }
+            table = table.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_4()
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(12.))
+                    .child(div().text_color(rgb(MUTED)).child(key))
+                    .child(value_cell),
+            );
+        }
+        panel = panel.child(table);
+        let mut raw = div()
+            .flex()
+            .flex_col()
+            .px(px(12.))
+            .py(px(10.))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgb(PANEL_LIGHT))
+            .text_size(px(11.))
+            .line_height(px(16.))
+            .text_color(rgb(MUTED))
+            // Matches the tree row's detail cell: each line is `whitespace_nowrap`, so without
+            // this a long `Filter:` expression paints past the 340 px panel's right edge.
+            .overflow_hidden();
+        for line in node.text_lines(0) {
+            raw = raw.child(div().whitespace_nowrap().child(line));
+        }
+        panel
+            .child(div().text_size(px(10.)).text_color(rgb(FAINT)).child("RAW"))
+            .child(raw)
+            .into_any_element()
+    }
+
     /// The window for one block of result rows, given how many rows precede it on the surface.
     fn visible_result_rows(&self, before: usize, count: usize, row_height: Pixels) -> VisibleLines {
         let handle = &self.results_scroll.handle;
@@ -2987,13 +3628,30 @@ impl AppView {
                         .text_size(px(11.))
                         .font_family(self.fonts.mono.clone())
                         .text_color(rgb(PANEL_LIGHT))
-                        .child("⌘↵ RUN · ⇧⌘↵ RUN ALL · ⌥⌘↵ EXPLAIN"),
+                        .child("⌘↵ RUN · ⇧⌘↵ RUN ALL · ⌥⌘↵ EXPLAIN · ⌥⇧⌘↵ ANALYZE"),
                 )
                 .into_any_element();
         }
         for (index, result) in self.editor.results.iter().enumerate() {
             content = content.child(result_header(&self.fonts, index, result));
-            content = match self.editor.display {
+            if let Some(plan) = &result.plan
+                && self.editor.plan_display != PlanDisplay::Text
+            {
+                content = content.child(self.plan_surface(plan, cx));
+                // `selectable_lines()` yields `result.as_text().lines()` for a plan — the rows
+                // plus the `QUERY PLAN` header and the status line — not just `result.rows`.
+                line_index += result.as_text().lines().count();
+                continue;
+            }
+            // A plan's TEXT segment always renders through the text path below, regardless of
+            // `editor.display` — that field toggles TABLE/TEXT for ordinary results and plays no
+            // part in a plan's own TREE/GRAPH/TEXT choice.
+            let effective_display = if result.plan.is_some() {
+                ResultDisplay::Text
+            } else {
+                self.editor.display
+            };
+            content = match effective_display {
                 ResultDisplay::Text => {
                     let text = result.as_text();
                     let visible = self.visible_result_rows(
@@ -3082,6 +3740,7 @@ enum RunMode {
     Current,
     All,
     Explain,
+    ExplainAnalyse,
 }
 
 /// A failed execution. Run All also records which statement stopped the batch, so the user is told
@@ -3537,6 +4196,16 @@ impl Render for AppView {
                                     ))
                                     .child(button(
                                         &self.fonts,
+                                        "explain-analyse",
+                                        "Explain Analyze",
+                                        Tone::Neutral,
+                                        connected && !running,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dispatch_command(command::EXPLAIN_ANALYSE, cx)
+                                        }),
+                                    ))
+                                    .child(button(
+                                        &self.fonts,
                                         "stop",
                                         "■ Stop",
                                         Tone::Danger,
@@ -3704,7 +4373,11 @@ impl Render for AppView {
                                                     }),
                                                 ))
                                             })
-                                            .child(self.display_segments(cx))
+                                            .child(if self.shown_plan().is_some() {
+                                                self.plan_segments(cx).into_any_element()
+                                            } else {
+                                                self.display_segments(cx).into_any_element()
+                                            })
                                             .child(self.destination_segments(cx)),
                                     )
                                     // Only the visible surface tracks the results scroll handle;
@@ -3923,11 +4596,97 @@ fn metric_pill(fonts: &Fonts, label: String, colour: u32) -> impl IntoElement {
         .child(label.to_uppercase())
 }
 
-fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl IntoElement {
-    let count = if result.columns.is_empty() {
-        format!("{} affected", result.affected_rows.unwrap_or(0))
+/// A right-aligned numeric cell of the plan tree.
+fn plan_number_cell(text: String, width: f32) -> gpui::Div {
+    div()
+        .w(px(width))
+        .flex_none()
+        .flex()
+        .justify_end()
+        .px_4()
+        .text_size(px(13.))
+        .whitespace_nowrap()
+        .child(text)
+}
+
+/// Thousands separated by ordinary spaces, as the design shows them: `48 317`.
+fn format_count(value: f64) -> String {
+    let digits = format!("{:.0}", value.max(0.0));
+    let mut grouped = String::new();
+    for (position, character) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position) % 3 == 0 {
+            grouped.push(' ');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
+/// `↑2.3×` for an under-estimate of at least 2×, `↓2.0×` for an over-estimate of at least 2×.
+fn estimate_flag(ratio: Option<f64>) -> Option<String> {
+    let ratio = ratio?;
+    if ratio >= 2.0 {
+        Some(format!("↑{ratio:.1}×"))
+    } else if ratio > 0.0 && ratio <= 0.5 {
+        Some(format!("↓{:.1}×", 1.0 / ratio))
     } else {
-        format!("{} rows", result.rows.len())
+        None
+    }
+}
+
+/// The cost-share bar: red for the hottest node, amber for anything at 5 % or more, faint below.
+fn share_bar(share: f64, hottest: bool, width: f32) -> gpui::Div {
+    let colour = if hottest {
+        RED
+    } else if share >= 0.05 {
+        WARN
+    } else {
+        FAINT
+    };
+    div()
+        .relative()
+        .w(px(width))
+        .h(px(6.))
+        .rounded_full()
+        .bg(rgb(PANEL_LIGHT))
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .bottom(px(0.))
+                .w(px((width * share as f32).max(2.)))
+                .rounded_full()
+                .bg(rgb(colour)),
+        )
+}
+
+/// One straight segment of an elbow connector between two graph nodes.
+fn connector(x: f32, y: f32, width: f32, height: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(width.max(0.)))
+        .h(px(height.max(0.)))
+        .rounded_full()
+        .bg(rgb(PANEL_HIGH))
+}
+
+/// Connector thickness in pixels: 1 px for a row or none, growing with log10 of the rows, capped
+/// so a hundred-million-row scan does not paint a wall.
+fn edge_thickness(rows: f64) -> f32 {
+    (1.0 + rows.max(1.0).log10() as f32 * 1.2).clamp(1.0, 8.0)
+}
+
+fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl IntoElement {
+    let count = match &result.plan {
+        Some(plan) => format!("{} nodes", plan.node_count()),
+        None if result.columns.is_empty() => {
+            format!("{} affected", result.affected_rows.unwrap_or(0))
+        }
+        None => format!("{} rows", result.rows.len()),
     };
     div()
         .flex()
@@ -3947,6 +4706,14 @@ fn result_header(fonts: &Fonts, index: usize, result: &QueryResult) -> impl Into
             format!("{count} · {} ms", result.execution_time.as_millis()),
             ACCENT,
         ))
+        // ANALYZE executed the statement; say so where the result is read (FR3-019).
+        .children(
+            result
+                .plan
+                .as_ref()
+                .filter(|plan| plan.analysed)
+                .map(|_| metric_pill(fonts, "EXPLAIN ANALYZE".into(), WARN)),
+        )
         .children(
             result
                 .automatic_limit
@@ -4039,11 +4806,18 @@ fn data_row(values: &[CellValue]) -> gpui::Div {
     row
 }
 
+/// The status bar's summary of the last run: node count for a plan (FR3-020), row count
+/// otherwise — Explain Analyze's own timing is already the `elapsed` it reports (FR3-019).
 fn completion_status(results: &[QueryResult]) -> String {
     let elapsed: u128 = results
         .iter()
         .map(|result| result.execution_time.as_millis())
         .sum();
+    if let [result] = results
+        && let Some(plan) = &result.plan
+    {
+        return format!("Explained in {elapsed} ms · {} nodes", plan.node_count());
+    }
     let rows: usize = results.iter().map(|result| result.rows.len()).sum();
     format!("Completed in {elapsed} ms · {rows} rows")
 }
@@ -4078,6 +4852,7 @@ fn shortcut_command(
     let runnable = connected && !running;
     if command_modifier {
         return match key {
+            "enter" if shift && alt => runnable.then_some(command::EXPLAIN_ANALYSE),
             "enter" if shift => runnable.then_some(command::RUN_ALL),
             "enter" if alt => runnable.then_some(command::EXPLAIN),
             "enter" => runnable.then_some(command::RUN),
@@ -4300,6 +5075,47 @@ fn next_boundary(text: &str, offset: usize) -> usize {
         .map_or(text.len(), |(index, _)| offset + index)
 }
 
+/// What Ctrl+Arrow treats as belonging to a word. A SQL identifier carries underscores
+/// (`order_line`), so `_` is part of the word; the punctuation that surrounds identifiers —
+/// `.`, `,`, `(`, quotes, operators — separates one from the next, as does whitespace.
+fn is_word_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn char_before(text: &str, offset: usize) -> Option<char> {
+    text[..offset].chars().next_back()
+}
+
+/// Ctrl+Left: back over any separators, then over the word itself, landing on its first
+/// character.
+fn previous_word_start(text: &str, offset: usize) -> usize {
+    let mut index = offset.min(text.len());
+    while char_before(text, index).is_some_and(|character| !is_word_char(character)) {
+        index = previous_boundary(text, index);
+    }
+    while char_before(text, index).is_some_and(is_word_char) {
+        index = previous_boundary(text, index);
+    }
+    index
+}
+
+/// Ctrl+Right: forward over any separators, then over the word itself, landing just past its last
+/// character.
+fn next_word_end(text: &str, offset: usize) -> usize {
+    let mut index = offset.min(text.len());
+    while text[index..]
+        .chars()
+        .next()
+        .is_some_and(|character| !is_word_char(character))
+    {
+        index = next_boundary(text, index);
+    }
+    while text[index..].chars().next().is_some_and(is_word_char) {
+        index = next_boundary(text, index);
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -4360,6 +5176,23 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             Ok(QueryResult::default())
+        }
+
+        async fn explain(&self, _: &str, analyse: bool) -> Result<QueryResult, QueryError> {
+            while self.blocked.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let mut plan = crate::plan::sample_plan();
+            if !analyse {
+                plan.analysed = false;
+                plan.execution_time_ms = None;
+                fn strip(node: &mut crate::plan::PlanNode) {
+                    node.actual = None;
+                    node.children.iter_mut().for_each(strip);
+                }
+                strip(&mut plan.root);
+            }
+            Ok(plan.into_result(std::time::Duration::from_millis(38)))
         }
 
         async fn cancel(&self) -> Result<(), QueryError> {
@@ -4447,6 +5280,37 @@ mod tests {
                 .expect("a test should supply one provider per session it opens")
                 as Arc<dyn DatabaseProvider>
         })
+    }
+
+    /// On Linux the desktop entry *is* the icon mechanism: the compositor matches the window's
+    /// `app_id` against `StartupWMClass` and takes `Icon` from the entry it finds. gpui offers no
+    /// window-icon API to fall back on, so if the entry and `APP_ID` ever drift apart the icon
+    /// silently disappears with nothing to report it — which is what this pins.
+    #[test]
+    fn the_desktop_entry_agrees_with_the_window_app_id() {
+        let entry = include_str!("../packaging/rusty-sql-tool.desktop");
+        let field = |key: &str| {
+            entry
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(key))
+                .map(str::trim)
+        };
+
+        assert_eq!(
+            field("StartupWMClass="),
+            Some(APP_ID),
+            "the entry must claim the same identity the window announces"
+        );
+        assert_eq!(
+            field("Icon="),
+            Some(APP_ID),
+            "the icon is installed into the hicolor theme under APP_ID"
+        );
+        assert_eq!(
+            field("Exec="),
+            Some(env!("CARGO_PKG_NAME")),
+            "the template runs the installed binary; the installer rewrites this to a full path"
+        );
     }
 
     fn build_app_view(
@@ -5266,6 +6130,10 @@ mod tests {
             Some(command::EXPLAIN)
         );
         assert_eq!(
+            shortcut_command("enter", true, true, true, false, true),
+            Some(command::EXPLAIN_ANALYSE)
+        );
+        assert_eq!(
             shortcut_command("n", true, false, false, false, false),
             Some(command::NEW_EDITOR)
         );
@@ -5284,7 +6152,7 @@ mod tests {
     #[test]
     fn execution_shortcuts_are_refused_while_a_query_is_running() {
         for key in ["enter"] {
-            for (shift, alt) in [(false, false), (true, false), (false, true)] {
+            for (shift, alt) in [(false, false), (true, false), (false, true), (true, true)] {
                 assert_eq!(
                     shortcut_command(key, true, shift, alt, true, true),
                     None,
@@ -6176,6 +7044,366 @@ mod tests {
         }
     }
 
+    /// FR3-019: the toolbar carries Explain Analyze as its own action, and a refused statement
+    /// reports the refusal where every other failure is reported.
+    #[gpui::test]
+    fn explain_analyse_is_refused_for_a_modifying_statement(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "DELETE FROM customer;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| {
+            app.dispatch_command(command::EXPLAIN_ANALYSE, cx)
+        });
+        wait_for_execution_status(&view, cx, ExecutionStatus::Failed);
+
+        view.update(cx, |app, _| {
+            assert!(
+                app.status
+                    .starts_with("Query failed: Explain Analyze runs only")
+            );
+            assert!(app.editor.error.is_some());
+            assert_eq!(app.editor.document, "DELETE FROM customer;");
+        });
+    }
+
+    #[gpui::test]
+    fn explain_analyse_completes_with_a_plan_and_a_node_count(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        cx.simulate_keystrokes("ctrl-alt-shift-enter");
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+
+        view.update(cx, |app, _| {
+            let plan = app.editor.results[0].plan.as_ref().expect("a plan result");
+            assert!(plan.analysed);
+            assert_eq!(app.status, "Explained in 38 ms · 7 nodes");
+        });
+    }
+
+    #[gpui::test]
+    fn plain_explain_never_analyses(cx: &mut TestAppContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+
+        view.update(cx, |app, cx| app.dispatch_command(command::EXPLAIN, cx));
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+
+        view.update(cx, |app, _| {
+            let plan = app.editor.results[0].plan.as_ref().expect("a plan result");
+            assert!(!plan.analysed);
+            assert!(plan.root.actual.is_none());
+        });
+    }
+
+    /// Opens the app, connects, explains `SELECT 1` and waits for the sample plan to land.
+    fn explained_app(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
+        let provider = Arc::new(UiTestProvider::default());
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.provider_factory = provider_factory(provider.clone());
+        });
+        view.update(cx, |app, cx| {
+            app.editor.document = "SELECT 1;".into();
+            app.editor.cursor = 3;
+            app.connect(cx);
+        });
+        wait_for_connection_state(&view, cx, ConnectionState::Connected);
+        view.update(cx, |app, cx| {
+            app.dispatch_command(command::EXPLAIN_ANALYSE, cx)
+        });
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// FR3-020: a plan renders as one row per node, and the results header offers the three
+    /// views in place of TABLE/TEXT.
+    #[gpui::test]
+    fn a_plan_renders_as_a_tree_with_one_row_per_node(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+
+        for index in 0..7 {
+            let id: &'static str = Box::leak(format!("plan-node-{index}").into_boxed_str());
+            assert!(
+                cx.debug_bounds(id).is_some(),
+                "node {index} should be rendered"
+            );
+        }
+        assert!(cx.debug_bounds("plan-node-7").is_none());
+        assert!(cx.debug_bounds("plan-tree").is_some());
+        assert!(cx.debug_bounds("plan-graph").is_some());
+        assert!(cx.debug_bounds("plan-text").is_some());
+        // Not `cx.debug_bounds("display-table").is_none()`: gpui's test harness never evicts a
+        // selector from its debug-bounds map once painted (verified against this pinned gpui
+        // version — it stays "found" for the life of the window even after the element leaves
+        // the tree for good), so that check would report `Some` regardless of what is on screen
+        // now. `AppView::render` puts `plan_segments`/`display_segments` in mutually exclusive
+        // branches of one `if`, so the TREE/GRAPH/TEXT assertions above already prove
+        // `display-table` is not part of the current render.
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.plan_display, PlanDisplay::Tree)
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_a_node_selects_it_and_clicking_again_clears_it(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+        // Node 4 sits below the fold of the fixed-height result pane; scroll it into view first
+        // so the click lands on the row rather than on clipped, unhittable content.
+        view.update(cx, |app, cx| {
+            let max = app.results_scroll.handle.max_offset();
+            app.results_scroll
+                .handle
+                .set_offset(point(px(0.), -max.height));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let row = cx.debug_bounds("plan-node-4").expect("the hot node row");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, Some(4)));
+        assert!(cx.debug_bounds("plan-detail").is_some());
+
+        let row = cx
+            .debug_bounds("plan-node-4")
+            .expect("the row is still there");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        // Not `cx.debug_bounds("plan-detail").is_none()`: see the note above — the map cannot
+        // report an element's removal. `plan_detail` only ever joins `plan_surface` when
+        // `plan_selection` is `Some`, so this state check already proves the panel is gone.
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, None));
+    }
+
+    #[gpui::test]
+    fn the_graph_view_places_nodes_by_depth_and_selects_on_click(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+        let segment = cx.debug_bounds("plan-graph").expect("the GRAPH segment");
+        cx.simulate_click(segment.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.plan_display, PlanDisplay::Graph)
+        });
+
+        let limit = cx.debug_bounds("plan-node-0").expect("root box");
+        let sort = cx.debug_bounds("plan-node-1").expect("child box");
+        let orders = cx.debug_bounds("plan-node-4").expect("scan box");
+        let hash = cx.debug_bounds("plan-node-5").expect("hash box");
+        assert!(
+            sort.origin.x > limit.origin.x,
+            "children sit to the right of their parent"
+        );
+        assert_eq!(orders.origin.x, hash.origin.x, "siblings share a column");
+        assert!(
+            hash.origin.y > orders.origin.y,
+            "siblings are stacked in leaf order"
+        );
+        assert_eq!(limit.size.width, px(PLAN_GRAPH_NODE_WIDTH));
+
+        cx.simulate_click(orders.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, Some(4)));
+        assert!(cx.debug_bounds("plan-detail").is_some());
+    }
+
+    #[gpui::test]
+    fn the_text_segment_shows_the_text_plan_and_a_new_result_clears_the_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = explained_app(cx);
+        view.update(cx, |app, cx| app.select_plan_node(2, cx));
+
+        let segment = cx.debug_bounds("plan-text").expect("the TEXT segment");
+        cx.simulate_click(segment.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.plan_display, PlanDisplay::Text)
+        });
+        // Not `cx.debug_bounds("plan-node-0").is_none()`: see the note in
+        // `a_plan_renders_as_a_tree_with_one_row_per_node` — the map cannot report an element's
+        // removal. `results_surface` only builds `plan_tree` (and so `plan-node-*`) while
+        // `plan_display != PlanDisplay::Text`, so the state assertion above already proves it.
+        //
+        // Text mode renders result lines; the first is the column name.
+        assert!(cx.debug_bounds("result-line-0").is_some());
+
+        view.update(cx, |app, cx| app.dispatch_command(command::EXPLAIN, cx));
+        wait_for_execution_status(&view, cx, ExecutionStatus::Completed);
+        view.update(cx, |app, _| assert_eq!(app.plan_selection, None));
+    }
+
+    /// Whatever view is showing, COPY ALL puts the text plan on the clipboard.
+    #[gpui::test]
+    fn copying_a_plan_copies_its_text_form(cx: &mut TestAppContext) {
+        let (view, cx) = explained_app(cx);
+        view.update(cx, |app, cx| app.copy_results(cx));
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(copied.starts_with("QUERY PLAN\nLimit  (cost=4821.14..4821.16"));
+        assert!(copied.contains("->  Seq Scan on orders o"));
+    }
+
+    /// `debug_bounds` takes a `&'static str`, so a per-index selector has to outlive the frame.
+    fn line_selector(index: usize) -> &'static str {
+        Box::leak(format!("result-line-{index}").into_boxed_str())
+    }
+
+    /// The tree/graph branch of `results_surface` used to advance `line_index` by
+    /// `result.rows.len()`, which is short of what `selectable_lines()` counts for a plan —
+    /// `result.as_text().lines()` — because that also carries the `QUERY PLAN` header, the blank
+    /// line before the summary, and the status line. This pins the fix by clicking into the
+    /// result that follows a plan and checking it lands where `selectable_lines()` says it should.
+    #[gpui::test]
+    fn a_line_index_after_a_plan_accounts_for_its_full_text_form(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let plan = crate::plan::QueryPlan {
+            root: crate::plan::PlanNode {
+                operation: "Result".into(),
+                ..crate::plan::PlanNode::default()
+            },
+            analysed: false,
+            planning_time_ms: None,
+            execution_time_ms: None,
+        };
+        let plan_result = plan.into_result(std::time::Duration::from_millis(1));
+        let expected_offset = plan_result.as_text().lines().count();
+
+        view.update(cx, |app, _| {
+            app.editor.display = ResultDisplay::Text;
+            app.editor.results = vec![plan_result, result_with_rows(&["only"])];
+            // The plan tree pushes the following result past the default pane height, and a
+            // click outside the pane is clipped away before it reaches the line.
+            app.result_pane_height = px(500.);
+        });
+        // Force a layout pass so the surface is painted and its lines have measured geometry.
+        cx.simulate_resize(size(px(1280.), px(1000.)));
+        cx.run_until_parked();
+
+        let lines = view.update(cx, |app, _| app.selectable_lines());
+        assert_eq!(
+            lines[expected_offset], "value",
+            "the second result's own header should sit at the offset its predecessor's full text implies"
+        );
+
+        // The plan renders as a tree, never as result lines, so every `result-line-*` element on
+        // the surface belongs to the second result — and the topmost of them is its header. Under
+        // the old `result.rows.len()` arithmetic this one-node plan advanced the index by 1 rather
+        // than 4, so that header rendered as `result-line-1` and a click on it selected the wrong
+        // line. Asserting the index alone would not catch it: whichever element is clicked reports
+        // its own index, so the check has to be that the *first* rendered line is the expected one.
+        let first_rendered =
+            (0..lines.len()).find(|index| cx.debug_bounds(line_selector(*index)).is_some());
+        assert_eq!(
+            first_rendered,
+            Some(expected_offset),
+            "the second result's first rendered line should carry the index selectable_lines() gives it"
+        );
+
+        let bounds = cx
+            .debug_bounds(line_selector(expected_offset))
+            .expect("the second result's header line should render at the correct index");
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.result_selection.map(|selection| selection.anchor.line),
+                Some(expected_offset)
+            );
+        });
+    }
+
+    /// §15.2: the estimate flag is WARN-coloured wherever it appears, not only in the tree row —
+    /// it must render as its own element in the detail panel rather than being folded into the
+    /// value text, or it would inherit ordinary foreground colour.
+    #[gpui::test]
+    fn selecting_a_node_with_an_estimate_miss_shows_a_separate_flag_in_the_detail_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = explained_app(cx);
+        // Node 4 ("Seq Scan on orders o") is the row whose estimate the sample plan misses by
+        // more than 2x, so `estimate_flag` is `Some` for it.
+        view.update(cx, |app, cx| app.select_plan_node(4, cx));
+        assert!(cx.debug_bounds("plan-detail-flag").is_some());
+    }
+
+    #[gpui::test]
+    fn selecting_a_node_with_an_accurate_estimate_shows_no_flag_in_the_detail_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = explained_app(cx);
+        // Node 0 ("Limit") estimated 10 rows and got exactly 10, so there is no flag to show.
+        view.update(cx, |app, cx| app.select_plan_node(0, cx));
+        assert!(cx.debug_bounds("plan-detail-flag").is_none());
+    }
+
+    #[test]
+    fn a_plan_result_reports_nodes_rather_than_rows() {
+        let result = crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38));
+        assert_eq!(completion_status(&[result]), "Explained in 38 ms · 7 nodes");
+    }
+
+    #[test]
+    fn counts_group_thousands_with_spaces() {
+        assert_eq!(format_count(0.0), "0");
+        assert_eq!(format_count(999.0), "999");
+        assert_eq!(format_count(4960.0), "4 960");
+        assert_eq!(format_count(151683.0), "151 683");
+    }
+
+    #[test]
+    fn edge_thickness_grows_with_the_logarithm_of_rows() {
+        assert_eq!(edge_thickness(0.0), 1.0);
+        assert_eq!(edge_thickness(1.0), 1.0);
+        assert!(edge_thickness(10.0) > edge_thickness(1.0));
+        assert!(edge_thickness(48317.0) > edge_thickness(4960.0));
+        assert!(edge_thickness(1e12) <= 8.0);
+    }
+
+    #[test]
+    fn estimate_flags_mark_two_fold_misses_in_either_direction() {
+        assert_eq!(estimate_flag(None), None);
+        assert_eq!(estimate_flag(Some(1.0)), None);
+        assert_eq!(estimate_flag(Some(1.9)), None);
+        assert_eq!(
+            estimate_flag(Some(48317.0 / 21092.0)).as_deref(),
+            Some("↑2.3×")
+        );
+        assert_eq!(estimate_flag(Some(0.25)).as_deref(), Some("↓4.0×"));
+    }
+
     /// Re-entering a corrected URL replaces the manual row rather than stacking a second one that
     /// still points at the unreachable host.
     #[gpui::test]
@@ -6236,6 +7464,254 @@ mod tests {
             app.editor.cursor = 0;
         });
         (view, cx)
+    }
+
+    /// A document whose words are separated by the punctuation SQL actually uses, so word-wise
+    /// movement is exercised against identifiers rather than prose.
+    const WORD_DOCUMENT: &str = "SELECT order_line.id, qty\nFROM order_line;";
+
+    fn word_editor(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<AppView>, &mut gpui::VisualTestContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = WORD_DOCUMENT.into();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        (view, cx)
+    }
+
+    /// Ctrl+Right lands on the end of the next word and Ctrl+Left on the start of the previous
+    /// one, the way Zed binds them. `_` is a word character because a SQL identifier carries it:
+    /// `order_line` is one word, and the `.` and `,` around it are separators.
+    #[gpui::test]
+    fn ctrl_arrow_moves_by_word_over_sql_identifiers(cx: &mut TestAppContext) {
+        let (view, cx) = word_editor(cx);
+
+        for expected in ["SELECT", "SELECT order_line", "SELECT order_line.id"] {
+            cx.simulate_keystrokes("ctrl-right");
+            view.update(cx, |app, _| {
+                assert_eq!(&WORD_DOCUMENT[..app.editor.cursor], expected);
+            });
+        }
+
+        // And back again, landing on the first character of each word rather than past it.
+        for expected in ["SELECT order_line.", "SELECT ", ""] {
+            cx.simulate_keystrokes("ctrl-left");
+            view.update(cx, |app, _| {
+                assert_eq!(&WORD_DOCUMENT[..app.editor.cursor], expected);
+            });
+        }
+    }
+
+    /// Word movement is caret movement, so Shift extends the selection exactly as a plain arrow
+    /// does rather than dropping it.
+    #[gpui::test]
+    fn ctrl_shift_arrow_extends_the_selection_by_word(cx: &mut TestAppContext) {
+        let (view, cx) = word_editor(cx);
+
+        cx.simulate_keystrokes("ctrl-shift-right ctrl-shift-right");
+
+        view.update(cx, |app, _| {
+            let selection = app.editor.selection.clone().expect("a selection");
+            assert_eq!(&WORD_DOCUMENT[selection], "SELECT order_line");
+        });
+    }
+
+    /// Ctrl+Home and Ctrl+End reach the ends of the whole document, where plain Home and End stay
+    /// on the current line.
+    #[gpui::test]
+    fn ctrl_home_and_end_reach_the_document_edges(cx: &mut TestAppContext) {
+        let (view, cx) = word_editor(cx);
+        view.update(cx, |app, _| app.editor.cursor = 12);
+
+        cx.simulate_keystrokes("ctrl-end");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, WORD_DOCUMENT.len());
+            assert!(app.editor.selection.is_none());
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-home");
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.cursor, 0);
+            assert_eq!(
+                app.editor.selection.clone().expect("a selection"),
+                0..WORD_DOCUMENT.len(),
+                "Shift from the far end should select the whole document"
+            );
+        });
+    }
+
+    /// Page Down moves by however many whole lines the viewport shows, holding the column the way
+    /// Up and Down do. The measured viewport in these tests is ten lines tall.
+    #[gpui::test]
+    fn page_up_and_down_move_by_a_viewport_of_lines(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..40)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(1000.)));
+        cx.run_until_parked();
+
+        let page = view.update(cx, |app, _| app.editor_page_lines());
+        assert!(page > 1, "the viewport should have measured, got {page}");
+
+        cx.simulate_keystrokes("pagedown");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor).line,
+                page
+            );
+        });
+
+        cx.simulate_keystrokes("pageup");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor).line,
+                0,
+                "back to where it started"
+            );
+        });
+
+        // Past the last line, Page Down stops on it rather than running off the end, holding the
+        // column the way Down already does rather than jumping to the final character.
+        cx.simulate_keystrokes("pagedown pagedown pagedown pagedown pagedown pagedown");
+        view.update(cx, |app, _| {
+            assert_eq!(
+                document_position(&app.editor.document, app.editor.cursor),
+                DocumentPosition {
+                    line: 39,
+                    column: 0
+                }
+            );
+            assert!(app.editor.cursor < app.editor.document.len());
+        });
+    }
+
+    /// Asserts the caret sits on one of the lines the editor viewport is actually showing.
+    #[track_caller]
+    fn assert_caret_visible(app: &AppView, what: &str) {
+        let handle = &app.editor_scroll.handle;
+        let top = (-f32::from(handle.offset().y) / EDITOR_LINE_HEIGHT)
+            .max(0.)
+            .round() as usize;
+        let visible = app.editor_page_lines();
+        let line = document_position(&app.editor.document, app.editor.cursor).line;
+        assert!(
+            (top..top + visible).contains(&line),
+            "after {what} the caret is on line {line}, outside the visible lines {top}..{}",
+            top + visible
+        );
+    }
+
+    /// Moving the caret is only half of a movement command — the caret has to stay on screen.
+    /// Page Down moves by exactly one viewport, so with a viewport that does not follow it the
+    /// caret lands precisely past the bottom edge and the screen does not change at all, which
+    /// makes the key look broken however correct the caret offset underneath is.
+    #[gpui::test]
+    fn the_viewport_follows_the_caret_when_paging(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        // Without the layout pass nothing has measured, so nothing overflows and every offset
+        // clamps back to zero.
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        for page in 1..=3 {
+            cx.simulate_keystrokes("pagedown");
+            cx.run_until_parked();
+            view.update(cx, |app, _| {
+                assert_caret_visible(app, &format!("page down {page}"));
+            });
+        }
+
+        for page in 1..=3 {
+            cx.simulate_keystrokes("pageup");
+            cx.run_until_parked();
+            view.update(cx, |app, _| {
+                assert_caret_visible(app, &format!("page up {page}"));
+            });
+        }
+
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(0.),
+                "back on the first line, the viewport should be back at the top"
+            );
+        });
+    }
+
+    /// The same follow applies to the arrow keys, which walk off the bottom edge one line at a
+    /// time, and to Ctrl+End, which leaves the viewport in one jump.
+    #[gpui::test]
+    fn the_viewport_follows_the_caret_off_either_edge(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        let document = (0..400)
+            .map(|line| format!("SELECT {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.update(cx, |app, _| {
+            app.editor.document = document.clone();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+
+        // One line past the bottom edge scrolls by one line, not by a screenful: the caret is
+        // brought just inside, so the text does not jump under the user.
+        let visible = view.update(cx, |app, _| app.editor_page_lines());
+        for _ in 0..visible {
+            cx.simulate_keystrokes("down");
+        }
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "walking off the bottom");
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(-EDITOR_LINE_HEIGHT),
+                "one line past the edge should scroll by exactly one line"
+            );
+        });
+
+        // A movement that stays inside the viewport leaves the scroll position alone.
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.editor_scroll.handle.offset().y,
+                px(-EDITOR_LINE_HEIGHT),
+                "a caret still on screen should not move the viewport"
+            );
+        });
+
+        // Ctrl+End leaves the viewport far behind in a single jump, and Ctrl+Home comes back.
+        cx.simulate_keystrokes("ctrl-end");
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_caret_visible(app, "ctrl-end"));
+
+        cx.simulate_keystrokes("ctrl-home");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_caret_visible(app, "ctrl-home");
+            assert_eq!(app.editor_scroll.handle.offset().y, px(0.));
+        });
     }
 
     #[gpui::test]
@@ -6422,6 +7898,35 @@ mod tests {
         let visible = visible_lines(500, px(0.), px(0.), 3);
 
         assert!(!visible.range.is_empty());
+    }
+
+    /// Undo history describes one document, so it belongs to the editor holding that document.
+    /// Kept on `AppView` it survived an editor switch, and Ctrl+Z then replaced the document in
+    /// front with a snapshot taken against a different one — silently, and destructively, because
+    /// undo restores the whole document (§46, §47: one editor must not disturb another).
+    #[gpui::test]
+    fn undo_history_belongs_to_the_editor_it_was_recorded_against(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.document = "EDITOR ONE".into();
+            app.editor.cursor = 10;
+            app.insert_text("!", cx);
+
+            app.new_editor(cx);
+            app.editor.document = "EDITOR TWO".into();
+            app.editor.cursor = 10;
+            app.undo(cx);
+            assert_eq!(
+                app.editor.document, "EDITOR TWO",
+                "a fresh editor has no history of its own, so undo must leave it alone"
+            );
+
+            // And the history did not merely get cleared: it travelled with the editor that owns it.
+            app.switch_editor(0, cx);
+            assert_eq!(app.editor.document, "EDITOR ONE!");
+            app.undo(cx);
+            assert_eq!(app.editor.document, "EDITOR ONE");
+        });
     }
 
     #[gpui::test]
@@ -7097,6 +8602,47 @@ mod tests {
 
             assert!(app.background_editors.is_empty());
             assert_eq!(app.editor.document, "SELECT 1");
+        });
+    }
+
+    /// `plan_selection` is reset by `close_active_editor` exactly where `result_selection`
+    /// already is: an index that meant something against the closed editor's plan means nothing
+    /// against whichever editor is promoted in its place.
+    #[gpui::test]
+    fn closing_an_editor_clears_a_stale_plan_selection(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.results =
+                vec![crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38))];
+            app.plan_selection = Some(4);
+            app.new_editor(cx);
+        });
+
+        view.update(cx, |app, cx| {
+            app.close_active_editor(cx);
+
+            assert_eq!(app.plan_selection, None);
+        });
+    }
+
+    /// Switching editors is the same hazard as closing one: an index that meant something
+    /// against the previous editor's plan or result means nothing against the one now in front.
+    #[gpui::test]
+    fn switching_editors_clears_a_stale_plan_and_result_selection(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, cx| {
+            app.editor.results =
+                vec![crate::plan::sample_plan().into_result(std::time::Duration::from_millis(38))];
+            app.plan_selection = Some(4);
+            app.result_selection = Some(ResultSelection::whole_lines(0, 0));
+            app.new_editor(cx);
+        });
+
+        view.update(cx, |app, cx| {
+            app.switch_editor(0, cx);
+
+            assert_eq!(app.plan_selection, None);
+            assert!(app.result_selection.is_none());
         });
     }
 

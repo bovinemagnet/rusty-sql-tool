@@ -7,13 +7,17 @@ use crate::config::ConnectionProfile;
 use crate::database::{ConnectionInfo, ConnectionState, DatabaseObject, DatabaseProvider};
 use crate::definition::ObjectDefinition;
 use crate::result::{ExecutionStatus, QueryError, QueryResult};
-use crate::sql::{SqlError, prepare_explain, prepare_statement, relevant_sql, split_statements};
+use crate::sql::{
+    SqlError, StatementKind, analyse_statement, prepare_statement, relevant_sql, split_statements,
+};
 use crate::{DEFAULT_ROW_LIMIT, MAX_ROW_LIMIT};
 
 pub mod command {
     pub const RUN: &str = "sql.run";
     pub const RUN_ALL: &str = "sql.run_all";
     pub const EXPLAIN: &str = "sql.explain";
+    /// FR3-019: `EXPLAIN ANALYZE`, deliberately its own command because it executes the statement.
+    pub const EXPLAIN_ANALYSE: &str = "sql.explain_analyse";
     pub const CANCEL: &str = "sql.cancel";
     pub const NEW_EDITOR: &str = "sql.new_editor";
     pub const CLOSE_EDITOR: &str = "sql.close_editor";
@@ -42,6 +46,16 @@ pub enum ResultDestination {
     Window,
 }
 
+/// How a plan result is shown (FR3-020). Separate from `ResultDisplay` so switching a table result
+/// between TABLE and TEXT never changes how a plan shows, and vice versa.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanDisplay {
+    #[default]
+    Tree,
+    Graph,
+    Text,
+}
+
 /// State owned by one editor. Failures never clear its document or old results (FR-047).
 #[derive(Clone, Debug)]
 pub struct EditorState {
@@ -54,9 +68,16 @@ pub struct EditorState {
     pub row_limit: u32,
     pub display: ResultDisplay,
     pub destination: ResultDestination,
+    pub plan_display: PlanDisplay,
     pub execution_status: ExecutionStatus,
     pub results: Vec<QueryResult>,
     pub error: Option<QueryError>,
+    /// Document snapshots paired with the caret they were taken at. History describes one
+    /// document, so it belongs beside that document rather than to the view: held on the view it
+    /// outlived an editor switch, and undo then restored one editor's text over another's
+    /// (§46, §47).
+    pub undo: Vec<(String, usize)>,
+    pub redo: Vec<(String, usize)>,
 }
 
 impl EditorState {
@@ -71,9 +92,12 @@ impl EditorState {
             row_limit: DEFAULT_ROW_LIMIT,
             display: ResultDisplay::Table,
             destination: ResultDestination::Pane,
+            plan_display: PlanDisplay::Tree,
             execution_status: ExecutionStatus::Queued,
             results: Vec::new(),
             error: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
@@ -205,13 +229,58 @@ impl CommandService {
         Ok(outcome)
     }
 
+    /// Plain `EXPLAIN` (FR-016): `analyse` is hard-wired to `false` here, so no caller can reach
+    /// `ANALYZE` through the ordinary Explain command.
     pub async fn explain(&self, editor: &mut EditorState) -> Result<QueryResult, QueryError> {
         let sql = relevant_sql(&editor.document, editor.selection.clone(), editor.cursor)
+            .map_err(query_selection_error)?
+            .to_string();
+        self.run_explain(editor, &sql, false).await
+    }
+
+    /// `EXPLAIN ANALYZE` (FR3-019). Because it executes the statement, only a plain row-returning
+    /// query may be analysed; anything else is refused before the provider is asked (§15.1).
+    pub async fn explain_analyse(
+        &self,
+        editor: &mut EditorState,
+    ) -> Result<QueryResult, QueryError> {
+        let sql = relevant_sql(&editor.document, editor.selection.clone(), editor.cursor)
             .map_err(query_selection_error)?;
-        let explained = prepare_explain(sql);
+        let analysis = analyse_statement(sql);
+        // `has_returning` must be checked alongside `kind`: a data-modifying CTE such as
+        // `WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d` is classified `RowReturning`
+        // by its outer SELECT (the DML sits at paren depth 1), so `kind` alone would let it
+        // through to `ANALYZE`, which executes it. This is the same reasoning `safe_to_limit`
+        // already applies. Multi-statement input (`SELECT 1; DELETE FROM t;`) is rejected
+        // downstream by `client.prepare`, which refuses multiple commands in Parse — this
+        // safeguard currently depends on that, and a future switch to a `simple_query`-only
+        // path would reopen it.
+        if analysis.kind != StatementKind::RowReturning || analysis.has_returning {
+            let error = QueryError {
+                message: "Explain Analyze runs only row-returning statements (SELECT, WITH … SELECT, VALUES); the statement would execute".into(),
+                severity: None,
+                code: None,
+                detail: None,
+                hint: None,
+                position: None,
+            };
+            editor.execution_status = ExecutionStatus::Failed;
+            editor.error = Some(error.clone());
+            return Err(error);
+        }
+        let sql_string = sql.to_string();
+        self.run_explain(editor, &sql_string, true).await
+    }
+
+    async fn run_explain(
+        &self,
+        editor: &mut EditorState,
+        sql: &str,
+        analyse: bool,
+    ) -> Result<QueryResult, QueryError> {
         editor.execution_status = ExecutionStatus::Running;
         editor.error = None;
-        match self.provider.execute(&explained).await {
+        match self.provider.explain(sql, analyse).await {
             Ok(result) => {
                 editor.execution_status = ExecutionStatus::Completed;
                 editor.results = vec![result.clone()];
@@ -323,6 +392,17 @@ mod tests {
             if sql.contains("FAIL") {
                 return Err(test_error("synthetic failure", None));
             }
+            if sql.contains("CANCELLED") {
+                return Err(test_error("cancelled", Some("57014")));
+            }
+            Ok(QueryResult::default())
+        }
+
+        async fn explain(&self, sql: &str, analyse: bool) -> Result<QueryResult, QueryError> {
+            self.statements
+                .lock()
+                .unwrap()
+                .push(format!("EXPLAIN analyse={analyse} {sql}"));
             if sql.contains("CANCELLED") {
                 return Err(test_error("cancelled", Some("57014")));
             }
@@ -447,8 +527,7 @@ mod tests {
         service.explain(&mut editor).await.unwrap();
 
         let sql = &provider.statements.lock().unwrap()[0];
-        assert_eq!(sql, "EXPLAIN SELECT 1;");
-        assert!(!sql.contains("ANALYZE"));
+        assert_eq!(sql, "EXPLAIN analyse=false SELECT 1;");
     }
 
     #[tokio::test]
@@ -615,5 +694,93 @@ mod tests {
             panic!("expected a table definition");
         };
         assert_eq!(table.columns[0].name, "id");
+    }
+
+    /// FR3-019: Explain Analyze is its own command and is the only path that analyses.
+    #[tokio::test]
+    async fn explain_analyse_runs_analyze_for_a_row_returning_statement() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider.clone());
+        let mut editor = editor();
+        editor.document = "SELECT 1;".into();
+        editor.cursor = 3;
+
+        service.explain_analyse(&mut editor).await.unwrap();
+
+        assert_eq!(
+            provider.statements.lock().unwrap()[0],
+            "EXPLAIN analyse=true SELECT 1;"
+        );
+        assert_eq!(editor.execution_status, ExecutionStatus::Completed);
+        assert_eq!(editor.results.len(), 1);
+    }
+
+    /// `ANALYZE` executes the statement, so anything that is not a plain row-returning query is
+    /// refused before it reaches the server (§15.1).
+    #[tokio::test]
+    async fn explain_analyse_refuses_statements_that_are_not_row_returning() {
+        for document in [
+            "UPDATE customer SET name = 'x';",
+            "DELETE FROM customer;",
+            "INSERT INTO customer VALUES (1) RETURNING id;",
+            "CREATE TABLE t (id int);",
+            "SELECT 1 INTO t;",
+            "WITH d AS (DELETE FROM customer RETURNING *) SELECT * FROM d;",
+        ] {
+            let provider = Arc::new(FakeProvider::default());
+            let service = CommandService::new(provider.clone());
+            let mut editor = editor();
+            editor.document = document.into();
+            editor.cursor = 2;
+            editor.results = vec![QueryResult {
+                command_tag: Some("PREVIOUS".into()),
+                ..QueryResult::default()
+            }];
+
+            let error = service.explain_analyse(&mut editor).await.unwrap_err();
+
+            assert!(
+                provider.statements.lock().unwrap().is_empty(),
+                "{document} must not reach the provider"
+            );
+            assert_eq!(
+                error.message,
+                "Explain Analyze runs only row-returning statements (SELECT, WITH … SELECT, VALUES); the statement would execute"
+            );
+            assert_eq!(editor.execution_status, ExecutionStatus::Failed);
+            assert_eq!(editor.error.as_ref(), Some(&error));
+            assert_eq!(editor.results[0].command_tag.as_deref(), Some("PREVIOUS"));
+        }
+    }
+
+    /// A data-modifying CTE is classified `RowReturning` by its outer `SELECT` — `kind` alone
+    /// would let it through to `ANALYZE`. Only `has_returning` catches it, which is why the
+    /// guard above checks both.
+    #[test]
+    fn a_data_modifying_cte_passes_the_kind_check_and_is_caught_only_by_has_returning() {
+        let analysis =
+            analyse_statement("WITH d AS (DELETE FROM customer RETURNING *) SELECT * FROM d;");
+        assert_eq!(analysis.kind, StatementKind::RowReturning);
+        assert!(analysis.has_returning);
+    }
+
+    #[tokio::test]
+    async fn explain_analyse_cancellation_sets_cancelled_state() {
+        let provider = Arc::new(FakeProvider::default());
+        let service = CommandService::new(provider);
+        let mut editor = editor();
+        editor.document = "SELECT 'CANCELLED';".into();
+        editor.cursor = 3;
+
+        let error = service.explain_analyse(&mut editor).await.unwrap_err();
+
+        assert_eq!(error.code.as_deref(), Some("57014"));
+        assert_eq!(editor.execution_status, ExecutionStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_new_editor_shows_plans_as_a_tree() {
+        assert_eq!(editor().plan_display, PlanDisplay::Tree);
+        assert_eq!(command::EXPLAIN_ANALYSE, "sql.explain_analyse");
     }
 }
