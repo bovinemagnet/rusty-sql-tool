@@ -6,6 +6,7 @@ use thiserror::Error;
 pub enum StatementKind {
     RowReturning,
     DataModification,
+    SchemaModification,
     Other,
     Unknown,
 }
@@ -167,6 +168,9 @@ pub fn analyse_statement(sql: &str) -> StatementAnalysis {
     let kind = match main_word {
         Some("SELECT" | "VALUES") if !select_into => StatementKind::RowReturning,
         Some("INSERT" | "UPDATE" | "DELETE" | "MERGE") => StatementKind::DataModification,
+        // FR3-023: DDL is held apart from harmless session statements so a protected
+        // connection can refuse it rather than lumping both under `Other`.
+        Some("CREATE" | "DROP" | "ALTER" | "TRUNCATE") => StatementKind::SchemaModification,
         Some(_) => StatementKind::Other,
         None => StatementKind::Unknown,
     };
@@ -784,5 +788,26 @@ mod tests {
             prepare_explain("SELECT 1", true),
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1"
         );
+    }
+
+    /// FR3-023: a read-only profile has to fail closed, which it cannot do while DDL and
+    /// harmless session statements share `Other`.
+    #[test]
+    fn ddl_is_classified_apart_from_harmless_session_statements() {
+        for sql in [
+            "CREATE TABLE t (id int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN c int",
+            "TRUNCATE t",
+        ] {
+            assert_eq!(
+                analyse_statement(sql).kind,
+                StatementKind::SchemaModification,
+                "{sql}"
+            );
+        }
+        for sql in ["SET search_path TO public", "SHOW work_mem", "BEGIN"] {
+            assert_eq!(analyse_statement(sql).kind, StatementKind::Other, "{sql}");
+        }
     }
 }
