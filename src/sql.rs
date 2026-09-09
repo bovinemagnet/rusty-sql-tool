@@ -6,6 +6,7 @@ use thiserror::Error;
 pub enum StatementKind {
     RowReturning,
     DataModification,
+    SchemaModification,
     Other,
     Unknown,
 }
@@ -16,6 +17,15 @@ pub struct StatementAnalysis {
     pub has_explicit_limit: bool,
     pub has_returning: bool,
     pub safe_to_limit: bool,
+}
+
+/// A relation named by a statement, with the alias it was bound to. Completion needs both:
+/// the name to look the columns up, the alias to know what the user typed before the dot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableReference {
+    pub schema: Option<String>,
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +177,9 @@ pub fn analyse_statement(sql: &str) -> StatementAnalysis {
     let kind = match main_word {
         Some("SELECT" | "VALUES") if !select_into => StatementKind::RowReturning,
         Some("INSERT" | "UPDATE" | "DELETE" | "MERGE") => StatementKind::DataModification,
+        // FR3-023: DDL is held apart from harmless session statements so a protected
+        // connection can refuse it rather than lumping both under `Other`.
+        Some("CREATE" | "DROP" | "ALTER" | "TRUNCATE") => StatementKind::SchemaModification,
         Some(_) => StatementKind::Other,
         None => StatementKind::Unknown,
     };
@@ -177,6 +190,190 @@ pub fn analyse_statement(sql: &str) -> StatementAnalysis {
         has_returning,
         safe_to_limit: kind == StatementKind::RowReturning && !has_limit && !has_returning,
     }
+}
+
+/// Collects the relations a statement names, flat across the whole statement (FR3-002, FR3-003).
+///
+/// Extraction is deliberately flat: a relation named inside a subquery is collected alongside the
+/// outer ones rather than scoped to it. Completion is the consumer, so over-suggesting a column
+/// that belongs to a sibling scope costs the user a glance, while under-suggesting hides a column
+/// that exists. Names that resolve to nothing — a CTE, a derived table — simply match no catalogue
+/// entry and offer nothing.
+pub fn referenced_tables(sql: &str) -> Vec<TableReference> {
+    let Ok(tokens) = tokenize(sql) else {
+        return Vec::new();
+    };
+    let significant: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Comment))
+        .collect();
+
+    let mut references = Vec::new();
+    let mut index = 0;
+    while index < significant.len() {
+        match relation_list_at(&significant, index) {
+            Some((start, comma_separated)) => {
+                index =
+                    read_relation_list(sql, &significant, start, comma_separated, &mut references);
+            }
+            None => index += 1,
+        }
+    }
+    references
+}
+
+/// Recognises the keywords that introduce a relation, reporting where the list starts and whether
+/// it may continue past a comma. `JOIN` and the write targets take exactly one relation.
+fn relation_list_at(tokens: &[&Token], index: usize) -> Option<(usize, bool)> {
+    match &tokens[index].kind {
+        TokenKind::Word(word) => match word.as_str() {
+            "FROM" => Some((index + 1, true)),
+            "JOIN" => Some((index + 1, false)),
+            "UPDATE" => Some((index + 1, false)),
+            // Only `INSERT INTO` and `MERGE INTO` name a relation; `SELECT … INTO` does too, but
+            // it creates the target rather than reading it, so completion gains nothing from it.
+            "INTO" if index > 0 => match &tokens[index - 1].kind {
+                TokenKind::Word(previous) if matches!(previous.as_str(), "INSERT" | "MERGE") => {
+                    Some((index + 1, false))
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Reads relations from `start` until the list ends, appending what it finds. Returns the position
+/// to resume scanning from, which is always past `start` so the outer loop cannot stall.
+fn read_relation_list(
+    sql: &str,
+    tokens: &[&Token],
+    start: usize,
+    comma_separated: bool,
+    references: &mut Vec<TableReference>,
+) -> usize {
+    let mut index = start;
+    loop {
+        index = match read_relation(sql, tokens, index, references) {
+            Some(next) => next,
+            None => break,
+        };
+        if !comma_separated
+            || !matches!(
+                tokens.get(index).map(|t| &t.kind),
+                Some(TokenKind::Symbol(','))
+            )
+        {
+            break;
+        }
+        index += 1;
+    }
+    index.max(start)
+}
+
+/// Reads one entry: a qualified name and its optional alias.
+fn read_relation(
+    sql: &str,
+    tokens: &[&Token],
+    start: usize,
+    references: &mut Vec<TableReference>,
+) -> Option<usize> {
+    // A derived table opens with a parenthesis and names no relation, so this reads nothing and
+    // leaves the scan to walk into the subquery, where the relations it reads are collected flat.
+    let mut parts = Vec::new();
+    let mut index = start;
+    loop {
+        parts.push(identifier(sql, tokens.get(index)?)?);
+        index += 1;
+        if matches!(
+            tokens.get(index).map(|t| &t.kind),
+            Some(TokenKind::Symbol('.'))
+        ) {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+
+    let (alias, index) = match read_alias(sql, tokens, index) {
+        Some((alias, next)) => (Some(alias), next),
+        None => (None, index),
+    };
+    // A qualified name may carry a catalogue as well as a schema; the last two parts are the ones
+    // the catalogue is queried by.
+    let name = parts.pop()?;
+    references.push(TableReference {
+        schema: parts.pop(),
+        name,
+        alias,
+    });
+    Some(index)
+}
+
+/// Reads `AS name`, or a bare name that is not a keyword continuing the clause.
+fn read_alias(sql: &str, tokens: &[&Token], start: usize) -> Option<(String, usize)> {
+    if token_is_word(tokens.get(start)?, "AS") {
+        return Some((identifier(sql, tokens.get(start + 1)?)?, start + 2));
+    }
+    Some((identifier(sql, tokens.get(start)?)?, start + 1))
+}
+
+/// Reads an identifier from the token's source text rather than its payload, because `Word` holds
+/// the text uppercased. Unquoted names fold to lower case as PostgreSQL folds them, so they match
+/// the catalogue; a quoted name keeps its exact spelling, with doubled quotes unescaped.
+fn identifier(sql: &str, token: &Token) -> Option<String> {
+    let text = &sql[token.range.clone()];
+    match &token.kind {
+        TokenKind::Word(word) if !is_clause_keyword(word) => Some(text.to_lowercase()),
+        // A double-quoted identifier and a string literal are the same token kind; only the
+        // opening byte tells them apart.
+        TokenKind::Literal if text.starts_with('"') => {
+            Some(text[1..text.len() - 1].replace("\"\"", "\""))
+        }
+        _ => None,
+    }
+}
+
+/// Words that continue the surrounding clause, and so can be neither a relation name nor an alias.
+fn is_clause_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "AND"
+            | "AS"
+            | "CROSS"
+            | "EXCEPT"
+            | "FETCH"
+            | "FOR"
+            | "FROM"
+            | "FULL"
+            | "GROUP"
+            | "HAVING"
+            | "INNER"
+            | "INTERSECT"
+            | "INTO"
+            | "JOIN"
+            | "LATERAL"
+            | "LEFT"
+            | "LIMIT"
+            | "NATURAL"
+            | "NOT"
+            | "OFFSET"
+            | "ON"
+            | "OR"
+            | "ORDER"
+            | "RETURNING"
+            | "RIGHT"
+            | "SELECT"
+            | "SET"
+            | "TABLESAMPLE"
+            | "UNION"
+            | "USING"
+            | "VALUES"
+            | "WHERE"
+            | "WINDOW"
+            | "WITH"
+    )
 }
 
 /// Adds a limit only when analysis can prove this is safe (FR-018–FR-020, FR-032).
@@ -783,6 +980,143 @@ mod tests {
         assert_eq!(
             prepare_explain("SELECT 1", true),
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1"
+        );
+    }
+
+    /// FR3-023: a read-only profile has to fail closed, which it cannot do while DDL and
+    /// harmless session statements share `Other`.
+    #[test]
+    fn ddl_is_classified_apart_from_harmless_session_statements() {
+        for sql in [
+            "CREATE TABLE t (id int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN c int",
+            "TRUNCATE t",
+        ] {
+            assert_eq!(
+                analyse_statement(sql).kind,
+                StatementKind::SchemaModification,
+                "{sql}"
+            );
+        }
+        for sql in ["SET search_path TO public", "SHOW work_mem", "BEGIN"] {
+            assert_eq!(analyse_statement(sql).kind, StatementKind::Other, "{sql}");
+        }
+    }
+
+    fn table(schema: Option<&str>, name: &str, alias: Option<&str>) -> TableReference {
+        TableReference {
+            schema: schema.map(str::to_owned),
+            name: name.to_owned(),
+            alias: alias.map(str::to_owned),
+        }
+    }
+
+    /// FR3-003: alias-aware column completion needs the alias bound to the relation it names.
+    #[test]
+    fn tables_and_aliases_come_from_from_and_join_clauses() {
+        assert_eq!(
+            referenced_tables(
+                "SELECT o.id, c.name FROM order_line o JOIN customer AS c ON c.id = o.customer_id"
+            ),
+            [
+                table(None, "order_line", Some("o")),
+                table(None, "customer", Some("c")),
+            ]
+        );
+    }
+
+    /// Names arrive folded the way PostgreSQL folds them, so a later catalogue lookup matches.
+    #[test]
+    fn unquoted_names_fold_to_lower_case_and_quoted_names_keep_their_spelling() {
+        assert_eq!(
+            referenced_tables(r#"SELECT * FROM "Order Line" AS "O", Public.Customer c"#),
+            [
+                table(None, "Order Line", Some("O")),
+                table(Some("public"), "customer", Some("c")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_doubled_quote_inside_a_quoted_identifier_is_unescaped() {
+        assert_eq!(
+            referenced_tables(r#"SELECT * FROM "the ""odd"" table""#),
+            [table(None, r#"the "odd" table"#, None)]
+        );
+    }
+
+    /// The write targets are relations too, and completion is wanted inside them.
+    #[test]
+    fn write_targets_are_collected() {
+        assert_eq!(
+            referenced_tables("INSERT INTO audit.entry (id) VALUES (1)"),
+            [table(Some("audit"), "entry", None)]
+        );
+        assert_eq!(
+            referenced_tables("UPDATE customer c SET name = 'x' WHERE c.id = 1"),
+            [table(None, "customer", Some("c"))]
+        );
+        assert_eq!(
+            referenced_tables("DELETE FROM customer WHERE id = 1"),
+            [table(None, "customer", None)]
+        );
+        assert_eq!(
+            referenced_tables("MERGE INTO target t USING source ON t.id = source.id"),
+            [table(None, "target", Some("t"))]
+        );
+    }
+
+    /// Flat extraction: the inner relation is collected, and the derived alias names no relation
+    /// so it is skipped rather than invented.
+    #[test]
+    fn a_relation_inside_a_subquery_is_collected_and_the_derived_alias_is_not() {
+        assert_eq!(
+            referenced_tables("SELECT * FROM (SELECT id FROM orders) t JOIN customer c ON true"),
+            [
+                table(None, "orders", None),
+                table(None, "customer", Some("c"))
+            ]
+        );
+    }
+
+    /// A CTE name is recorded like any other reference; it resolves to nothing and offers nothing.
+    #[test]
+    fn a_cte_is_recorded_alongside_the_relation_it_reads() {
+        assert_eq!(
+            referenced_tables("WITH recent AS (SELECT * FROM orders) SELECT * FROM recent"),
+            [table(None, "orders", None), table(None, "recent", None)]
+        );
+    }
+
+    #[test]
+    fn a_comment_between_the_keyword_and_the_name_is_ignored() {
+        assert_eq!(
+            referenced_tables("SELECT * FROM /* which one? */ orders -- here\n"),
+            [table(None, "orders", None)]
+        );
+    }
+
+    #[test]
+    fn a_string_literal_naming_a_clause_introduces_no_relation() {
+        assert_eq!(referenced_tables("SELECT 'from orders' AS note"), []);
+    }
+
+    #[test]
+    fn unparseable_sql_yields_no_relations() {
+        assert_eq!(referenced_tables("SELECT * FROM (orders"), []);
+        assert_eq!(referenced_tables("SELECT * FROM 'unterminated"), []);
+    }
+
+    #[test]
+    fn a_clause_keyword_after_the_name_is_not_read_as_an_alias() {
+        assert_eq!(
+            referenced_tables("SELECT * FROM orders WHERE id = 1"),
+            [table(None, "orders", None)]
+        );
+        assert_eq!(
+            referenced_tables("SELECT * FROM orders ORDER BY id"),
+            [table(None, "orders", None)]
         );
     }
 }
