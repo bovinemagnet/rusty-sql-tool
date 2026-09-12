@@ -69,7 +69,12 @@ struct Token {
 
 /// Splits a document on top-level semicolons only (FR-029, 59.3).
 pub fn split_statements(sql: &str) -> Result<Vec<Range<usize>>, SqlError> {
-    let tokens = tokenize(sql)?;
+    Ok(statement_ranges(sql, &tokenize(sql)?))
+}
+
+/// The statements a token stream delimits, as trimmed byte ranges; each includes its own `;`.
+/// Shared with [`diagnose`], which already holds the tokens and must not scan again.
+fn statement_ranges(sql: &str, tokens: &[Token]) -> Vec<Range<usize>> {
     let mut statements = Vec::new();
     let mut start = 0;
     for token in tokens {
@@ -83,7 +88,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<Range<usize>>, SqlError> {
     if let Some(range) = trimmed_range(sql, start..sql.len()) {
         statements.push(range);
     }
-    Ok(statements)
+    statements
 }
 
 /// Resolves selection-first/current-statement behaviour for Run and Explain (FR-013, FR-014).
@@ -472,8 +477,10 @@ pub struct Diagnostic {
 /// Advisory only. Run, Run All and Explain fail through [`SqlError`] on their own and never
 /// consult this (FR3-009).
 pub fn diagnose(sql: &str) -> Option<Diagnostic> {
-    let (_, error) = scan(sql);
-    let ScanError { error, range } = error?;
+    let (tokens, error) = scan(sql);
+    let Some(ScanError { error, range }) = error else {
+        return statement_warning(sql, &tokens);
+    };
     let text = &sql[range.clone()];
     let message = match error {
         SqlError::UnterminatedQuote if text.starts_with('$') => {
@@ -491,6 +498,55 @@ pub fn diagnose(sql: &str) -> Option<Diagnostic> {
         severity: Severity::Error,
         message,
     })
+}
+
+/// The first statement that looks wrong, judged by its first word (design decision 6: reached
+/// only on a clean scan). Only a word is judged — a statement opening with `(` or a literal is
+/// beyond a guess, and a guess that is often wrong is worse than none (FR3-009).
+fn statement_warning(sql: &str, tokens: &[Token]) -> Option<Diagnostic> {
+    let mut next = 0;
+    for statement in statement_ranges(sql, tokens) {
+        // Tokens and statements are both in document order, so each statement picks up its
+        // search where the last one left off.
+        while tokens
+            .get(next)
+            .is_some_and(|token| token.range.start < statement.start)
+        {
+            next += 1;
+        }
+        let first = tokens[next..]
+            .iter()
+            .take_while(|token| token.range.end <= statement.end)
+            .find(|token| token.kind != TokenKind::Comment);
+        match first {
+            Some(Token {
+                kind: TokenKind::Symbol(';'),
+                ..
+            }) => {
+                return Some(Diagnostic {
+                    range: statement,
+                    severity: Severity::Warning,
+                    message: "empty statement".to_owned(),
+                });
+            }
+            Some(Token {
+                kind: TokenKind::Word(word),
+                range,
+                ..
+            }) if !STATEMENT_KEYWORDS.contains(&word.as_str()) => {
+                return Some(Diagnostic {
+                    range: range.clone(),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "`{}` does not begin a PostgreSQL statement",
+                        &sql[range.clone()]
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// What the editor should paint a stretch of SQL as (FR-012).
@@ -623,6 +679,66 @@ const KEYWORDS: [&str; 27] = [
     "FIRST",
     "ROWS",
     "ONLY",
+];
+
+/// Every word that can open a PostgreSQL statement. Uppercase because [`TokenKind::Word`] already
+/// folds case. Deliberately generous: a name missing here is a false warning on valid SQL, which
+/// is the one thing a guess must not do. `ANALYSE` is PostgreSQL's own accepted alternative
+/// spelling of `ANALYZE`.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "ABORT",
+    "ALTER",
+    "ANALYSE",
+    "ANALYZE",
+    "BEGIN",
+    "CALL",
+    "CHECKPOINT",
+    "CLOSE",
+    "CLUSTER",
+    "COMMENT",
+    "COMMIT",
+    "COPY",
+    "CREATE",
+    "DEALLOCATE",
+    "DECLARE",
+    "DELETE",
+    "DISCARD",
+    "DO",
+    "DROP",
+    "END",
+    "EXECUTE",
+    "EXPLAIN",
+    "FETCH",
+    "GRANT",
+    "IMPORT",
+    "INSERT",
+    "LISTEN",
+    "LOAD",
+    "LOCK",
+    "MERGE",
+    "MOVE",
+    "NOTIFY",
+    "PREPARE",
+    "REASSIGN",
+    "REFRESH",
+    "REINDEX",
+    "RELEASE",
+    "RESET",
+    "REVOKE",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "SECURITY",
+    "SELECT",
+    "SET",
+    "SHOW",
+    "START",
+    "TABLE",
+    "TRUNCATE",
+    "UNLISTEN",
+    "UPDATE",
+    "VACUUM",
+    "VALUES",
+    "WITH",
 ];
 
 fn has_top_level_word(tokens: &[&Token], expected: &str) -> bool {
@@ -1281,6 +1397,84 @@ mod tests {
         assert_eq!(
             diagnose("SELECT 1)"),
             error_at(8..9, "unmatched closing parenthesis")
+        );
+    }
+
+    fn warning_at(range: Range<usize>, message: &str) -> Option<Diagnostic> {
+        Some(Diagnostic {
+            range,
+            severity: Severity::Warning,
+            message: message.to_owned(),
+        })
+    }
+
+    /// The guard against false positives: every statement PostgreSQL accepts opens a statement
+    /// here without comment, in either case.
+    #[test]
+    fn every_statement_keyword_opens_a_statement_without_a_warning() {
+        for keyword in STATEMENT_KEYWORDS {
+            assert_eq!(
+                diagnose(&format!("{keyword} something;")),
+                None,
+                "{keyword}"
+            );
+            assert_eq!(
+                diagnose(&format!("{} something;", keyword.to_ascii_lowercase())),
+                None,
+                "{keyword}"
+            );
+        }
+    }
+
+    /// FR3-009, design decision 5: a first word that is not a statement is a guess, so a warning,
+    /// pointing at the word in the user's own spelling.
+    #[test]
+    fn an_unrecognised_first_word_is_a_warning_on_that_word() {
+        assert_eq!(
+            diagnose("selct 1"),
+            warning_at(0..5, "`selct` does not begin a PostgreSQL statement")
+        );
+        assert_eq!(
+            diagnose("SELECT 1; SELCT 2"),
+            warning_at(10..15, "`SELCT` does not begin a PostgreSQL statement")
+        );
+    }
+
+    /// Only the first offending statement is reported.
+    #[test]
+    fn only_the_first_offending_statement_is_reported() {
+        assert_eq!(
+            diagnose("SELCT 1; SELCT 2"),
+            warning_at(0..5, "`SELCT` does not begin a PostgreSQL statement")
+        );
+    }
+
+    /// A statement that is nothing but its semicolon is empty; a trailing comment with no
+    /// semicolon is not a statement at all and is left alone.
+    #[test]
+    fn an_empty_statement_is_a_warning_but_a_trailing_comment_is_not() {
+        assert_eq!(diagnose("SELECT 1;;"), warning_at(9..10, "empty statement"));
+        assert_eq!(
+            diagnose("SELECT 1; /* gap */ ;"),
+            warning_at(10..21, "empty statement")
+        );
+        assert_eq!(diagnose("SELECT 1; -- done"), None);
+        assert_eq!(diagnose("-- note\nSELECT 1"), None);
+    }
+
+    /// A statement opening with something other than a word is beyond a guess and is not judged.
+    #[test]
+    fn a_statement_that_does_not_open_with_a_word_is_not_judged() {
+        assert_eq!(diagnose("(SELECT 1) UNION (SELECT 2)"), None);
+    }
+
+    /// Design decision 6: the statement tier runs only on a clean scan, so a lexical error is
+    /// reported as itself and never as a misread statement.
+    #[test]
+    fn a_lexical_error_suppresses_the_statement_tier() {
+        assert_eq!(
+            diagnose("SELCT 'x"),
+            error_at(6..8, "unterminated quoted string or identifier")
         );
     }
 
