@@ -443,6 +443,56 @@ pub fn prepare_explain(sql: &str, analyse: bool) -> String {
     format!("EXPLAIN ({options}) {}", sql.trim())
 }
 
+/// How sure the editor is about what it points at (FR3-009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    /// The text cannot be read: every command would refuse it.
+    Error,
+    /// A statement-level guess — "check this", not "this is broken".
+    Warning,
+}
+
+/// One problem for the editor to point at. `range` is a byte range into the document handed to
+/// [`diagnose`], the same addressing [`HighlightSpan`] uses.
+///
+/// Deliberately not a [`SqlError`]: that answers "why did this command fail" and is compared by
+/// value in the command layer, and some of its variants have no position at all. This answers
+/// "what should the editor point at" (FR3-009).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub range: Range<usize>,
+    pub severity: Severity,
+    pub message: String,
+}
+
+/// The earliest problem in a whole document, or `None` when there is nothing to report. One at
+/// most: an unterminated quote turns everything after it into a string, so a second finding would
+/// be an artefact of the first rather than a second mistake.
+///
+/// Advisory only. Run, Run All and Explain fail through [`SqlError`] on their own and never
+/// consult this (FR3-009).
+pub fn diagnose(sql: &str) -> Option<Diagnostic> {
+    let (_, error) = scan(sql);
+    let ScanError { error, range } = error?;
+    let text = &sql[range.clone()];
+    let message = match error {
+        SqlError::UnterminatedQuote if text.starts_with('$') => {
+            "unterminated dollar-quoted string".to_owned()
+        }
+        SqlError::UnterminatedQuote => "unterminated quoted string or identifier".to_owned(),
+        SqlError::UnterminatedComment => "unterminated block comment".to_owned(),
+        SqlError::UnbalancedParentheses if text == "(" => "unclosed parenthesis".to_owned(),
+        SqlError::UnbalancedParentheses => "unmatched closing parenthesis".to_owned(),
+        // `scan` reports nothing else; the generic text keeps this honest if that ever changes.
+        other => other.to_string(),
+    };
+    Some(Diagnostic {
+        range,
+        severity: Severity::Error,
+        message,
+    })
+}
+
 /// What the editor should paint a stretch of SQL as (FR-012).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Highlight {
@@ -1194,5 +1244,50 @@ mod tests {
             scan_error("SELECT (1, 'x"),
             Some((SqlError::UnterminatedQuote, 11..13))
         );
+    }
+
+    fn error_at(range: Range<usize>, message: &str) -> Option<Diagnostic> {
+        Some(Diagnostic {
+            range,
+            severity: Severity::Error,
+            message: message.to_owned(),
+        })
+    }
+
+    /// FR3-009, design decision 5: lexical problems are certain, so they are errors, and each
+    /// names what is open rather than repeating the generic `SqlError` text.
+    #[test]
+    fn each_lexical_problem_is_an_error_with_its_own_message_and_range() {
+        assert_eq!(
+            diagnose("SELECT 'abc"),
+            error_at(7..11, "unterminated quoted string or identifier")
+        );
+        assert_eq!(
+            diagnose("SELECT \"abc"),
+            error_at(7..11, "unterminated quoted string or identifier")
+        );
+        assert_eq!(
+            diagnose("SELECT $body$abc"),
+            error_at(7..16, "unterminated dollar-quoted string")
+        );
+        assert_eq!(
+            diagnose("SELECT 1 /* note"),
+            error_at(9..16, "unterminated block comment")
+        );
+        assert_eq!(
+            diagnose("SELECT (1, (2"),
+            error_at(11..12, "unclosed parenthesis")
+        );
+        assert_eq!(
+            diagnose("SELECT 1)"),
+            error_at(8..9, "unmatched closing parenthesis")
+        );
+    }
+
+    /// A clean document reports nothing, and so does an empty one.
+    #[test]
+    fn a_clean_document_has_no_diagnostic() {
+        assert_eq!(diagnose("SELECT (1, 'a''b') /* ok */ -- fine"), None);
+        assert_eq!(diagnose(""), None);
     }
 }
