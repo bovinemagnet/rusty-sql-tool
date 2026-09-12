@@ -69,7 +69,12 @@ struct Token {
 
 /// Splits a document on top-level semicolons only (FR-029, 59.3).
 pub fn split_statements(sql: &str) -> Result<Vec<Range<usize>>, SqlError> {
-    let tokens = tokenize(sql)?;
+    Ok(statement_ranges(sql, &tokenize(sql)?))
+}
+
+/// The statements a token stream delimits, as trimmed byte ranges; each includes its own `;`.
+/// Shared with [`diagnose`], which already holds the tokens and must not scan again.
+fn statement_ranges(sql: &str, tokens: &[Token]) -> Vec<Range<usize>> {
     let mut statements = Vec::new();
     let mut start = 0;
     for token in tokens {
@@ -83,7 +88,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<Range<usize>>, SqlError> {
     if let Some(range) = trimmed_range(sql, start..sql.len()) {
         statements.push(range);
     }
-    Ok(statements)
+    statements
 }
 
 /// Resolves selection-first/current-statement behaviour for Run and Explain (FR-013, FR-014).
@@ -443,6 +448,107 @@ pub fn prepare_explain(sql: &str, analyse: bool) -> String {
     format!("EXPLAIN ({options}) {}", sql.trim())
 }
 
+/// How sure the editor is about what it points at (FR3-009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    /// The text cannot be read: every command would refuse it.
+    Error,
+    /// A statement-level guess — "check this", not "this is broken".
+    Warning,
+}
+
+/// One problem for the editor to point at. `range` is a byte range into the document handed to
+/// [`diagnose`], the same addressing [`HighlightSpan`] uses.
+///
+/// Deliberately not a [`SqlError`]: that answers "why did this command fail" and is compared by
+/// value in the command layer, and some of its variants have no position at all. This answers
+/// "what should the editor point at" (FR3-009).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub range: Range<usize>,
+    pub severity: Severity,
+    pub message: String,
+}
+
+/// The earliest problem in a whole document, or `None` when there is nothing to report. One at
+/// most: an unterminated quote turns everything after it into a string, so a second finding would
+/// be an artefact of the first rather than a second mistake.
+///
+/// Advisory only. Run, Run All and Explain fail through [`SqlError`] on their own and never
+/// consult this (FR3-009).
+pub fn diagnose(sql: &str) -> Option<Diagnostic> {
+    let (tokens, error) = scan(sql);
+    let Some(ScanError { error, range }) = error else {
+        return statement_warning(sql, &tokens);
+    };
+    let text = &sql[range.clone()];
+    let message = match error {
+        SqlError::UnterminatedQuote if text.starts_with('$') => {
+            "unterminated dollar-quoted string".to_owned()
+        }
+        SqlError::UnterminatedQuote => "unterminated quoted string or identifier".to_owned(),
+        SqlError::UnterminatedComment => "unterminated block comment".to_owned(),
+        SqlError::UnbalancedParentheses if text == "(" => "unclosed parenthesis".to_owned(),
+        SqlError::UnbalancedParentheses => "unmatched closing parenthesis".to_owned(),
+        // `scan` reports nothing else; the generic text keeps this honest if that ever changes.
+        other => other.to_string(),
+    };
+    Some(Diagnostic {
+        range,
+        severity: Severity::Error,
+        message,
+    })
+}
+
+/// The first statement that looks wrong, judged by its first word (design decision 6: reached
+/// only on a clean scan). Only a word is judged — a statement opening with `(` or a literal is
+/// beyond a guess, and a guess that is often wrong is worse than none (FR3-009).
+fn statement_warning(sql: &str, tokens: &[Token]) -> Option<Diagnostic> {
+    let mut next = 0;
+    for statement in statement_ranges(sql, tokens) {
+        // Tokens and statements are both in document order, so each statement picks up its
+        // search where the last one left off.
+        while tokens
+            .get(next)
+            .is_some_and(|token| token.range.start < statement.start)
+        {
+            next += 1;
+        }
+        let first = tokens[next..]
+            .iter()
+            .take_while(|token| token.range.end <= statement.end)
+            .find(|token| token.kind != TokenKind::Comment);
+        match first {
+            Some(Token {
+                kind: TokenKind::Symbol(';'),
+                ..
+            }) => {
+                return Some(Diagnostic {
+                    range: statement,
+                    severity: Severity::Warning,
+                    message: "empty statement".to_owned(),
+                });
+            }
+            Some(Token {
+                kind: TokenKind::Word(word),
+                range,
+                ..
+            }) if !STATEMENT_KEYWORDS.contains(&word.as_str()) => {
+                return Some(Diagnostic {
+                    range: range.clone(),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "`{}` does not begin a PostgreSQL statement",
+                        &sql[range.clone()]
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// What the editor should paint a stretch of SQL as (FR-012).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Highlight {
@@ -575,6 +681,66 @@ const KEYWORDS: [&str; 27] = [
     "ONLY",
 ];
 
+/// Every word that can open a PostgreSQL statement. Uppercase because [`TokenKind::Word`] already
+/// folds case. Deliberately generous: a name missing here is a false warning on valid SQL, which
+/// is the one thing a guess must not do. `ANALYSE` is PostgreSQL's own accepted alternative
+/// spelling of `ANALYZE`.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "ABORT",
+    "ALTER",
+    "ANALYSE",
+    "ANALYZE",
+    "BEGIN",
+    "CALL",
+    "CHECKPOINT",
+    "CLOSE",
+    "CLUSTER",
+    "COMMENT",
+    "COMMIT",
+    "COPY",
+    "CREATE",
+    "DEALLOCATE",
+    "DECLARE",
+    "DELETE",
+    "DISCARD",
+    "DO",
+    "DROP",
+    "END",
+    "EXECUTE",
+    "EXPLAIN",
+    "FETCH",
+    "GRANT",
+    "IMPORT",
+    "INSERT",
+    "LISTEN",
+    "LOAD",
+    "LOCK",
+    "MERGE",
+    "MOVE",
+    "NOTIFY",
+    "PREPARE",
+    "REASSIGN",
+    "REFRESH",
+    "REINDEX",
+    "RELEASE",
+    "RESET",
+    "REVOKE",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "SECURITY",
+    "SELECT",
+    "SET",
+    "SHOW",
+    "START",
+    "TABLE",
+    "TRUNCATE",
+    "UNLISTEN",
+    "UPDATE",
+    "VACUUM",
+    "VALUES",
+    "WITH",
+];
+
 fn has_top_level_word(tokens: &[&Token], expected: &str) -> bool {
     tokens
         .iter()
@@ -594,20 +760,38 @@ fn trimmed_range(sql: &str, range: Range<usize>) -> Option<Range<usize>> {
 
 fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
     match scan(sql) {
-        (_, Some(error)) => Err(error),
+        (_, Some(ScanError { error, .. })) => Err(error),
         (tokens, None) => Ok(tokens),
+    }
+}
+
+/// What `scan` found wrong, and where. `tokenize` keeps only the error; `diagnose` keeps both,
+/// because a diagnostic with nothing to point at is not worth rendering (FR3-009).
+#[derive(Debug, PartialEq, Eq)]
+struct ScanError {
+    error: SqlError,
+    range: Range<usize>,
+}
+
+/// Records a problem unless an earlier one is already held: the first is the real one, and
+/// anything after it is likely an artefact of it.
+fn report(slot: &mut Option<ScanError>, error: SqlError, range: Range<usize>) {
+    if slot.is_none() {
+        *slot = Some(ScanError { error, range });
     }
 }
 
 /// Tokenises as far as the text allows, reporting the first thing wrong with it rather than
 /// stopping. Statement splitting refuses a document it cannot read; highlighting has to colour one
 /// that is halfway through being typed, and both need the same reading of the SQL (59.3).
-fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
+fn scan(sql: &str) -> (Vec<Token>, Option<ScanError>) {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut error = None;
     let mut index = 0;
-    let mut depth = 0usize;
+    // Every `(` still waiting for its `)`, innermost last. Its length is the nesting depth, and
+    // whichever is left over at the end is the bracket to point at.
+    let mut open: Vec<Range<usize>> = Vec::new();
     while index < bytes.len() {
         if bytes[index].is_ascii_whitespace() {
             index += 1;
@@ -622,7 +806,7 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
             tokens.push(Token {
                 kind: TokenKind::Comment,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -641,12 +825,12 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
                 }
             }
             if nesting != 0 {
-                error = error.or(Some(SqlError::UnterminatedComment));
+                report(&mut error, SqlError::UnterminatedComment, start..index);
             }
             tokens.push(Token {
                 kind: TokenKind::Comment,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -670,12 +854,12 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
                 }
             }
             if !closed {
-                error = error.or(Some(SqlError::UnterminatedQuote));
+                report(&mut error, SqlError::UnterminatedQuote, start..index);
             }
             tokens.push(Token {
                 kind: TokenKind::Literal,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -690,14 +874,14 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
             {
                 Some(relative_end) => index += relative_end + delimiter.len(),
                 None => {
-                    error = error.or(Some(SqlError::UnterminatedQuote));
                     index = bytes.len();
+                    report(&mut error, SqlError::UnterminatedQuote, start..index);
                 }
             }
             tokens.push(Token {
                 kind: TokenKind::Literal,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -709,37 +893,32 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
             tokens.push(Token {
                 kind: TokenKind::Word(sql[start..index].to_ascii_uppercase()),
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
         let character = sql[index..].chars().next().expect("valid UTF-8");
         index += character.len_utf8();
-        let token_depth = if character == ')' {
-            match depth.checked_sub(1) {
-                Some(outer) => {
-                    depth = outer;
-                    outer
-                }
-                None => {
-                    error = error.or(Some(SqlError::UnbalancedParentheses));
-                    0
-                }
-            }
-        } else {
-            depth
-        };
+        // A `)` is popped before its token is recorded, so it carries the depth outside it — the
+        // same depth its `(` carried.
+        if character == ')' && open.pop().is_none() {
+            report(&mut error, SqlError::UnbalancedParentheses, start..index);
+        }
         tokens.push(Token {
             kind: TokenKind::Symbol(character),
             range: start..index,
-            depth: token_depth,
+            depth: open.len(),
         });
         if character == '(' {
-            depth += 1;
+            open.push(start..index);
         }
     }
-    if depth != 0 {
-        error = error.or(Some(SqlError::UnbalancedParentheses));
+    if let Some(innermost) = open.last() {
+        report(
+            &mut error,
+            SqlError::UnbalancedParentheses,
+            innermost.clone(),
+        );
     }
     (tokens, error)
 }
@@ -1118,5 +1297,191 @@ mod tests {
             referenced_tables("SELECT * FROM orders ORDER BY id"),
             [table(None, "orders", None)]
         );
+    }
+
+    fn scan_error(sql: &str) -> Option<(SqlError, Range<usize>)> {
+        scan(sql).1.map(|found| (found.error, found.range))
+    }
+
+    /// Design decision 3: the scanner reports where each lexical problem is, opener to end of
+    /// input, so a diagnostic has something to point at.
+    #[test]
+    fn lexical_errors_carry_the_range_of_the_offending_token() {
+        assert_eq!(
+            scan_error("SELECT 'abc"),
+            Some((SqlError::UnterminatedQuote, 7..11))
+        );
+        assert_eq!(
+            scan_error("SELECT \"abc"),
+            Some((SqlError::UnterminatedQuote, 7..11))
+        );
+        assert_eq!(
+            scan_error("SELECT $$abc"),
+            Some((SqlError::UnterminatedQuote, 7..12))
+        );
+        assert_eq!(
+            scan_error("SELECT $fn$abc"),
+            Some((SqlError::UnterminatedQuote, 7..14))
+        );
+        assert_eq!(
+            scan_error("SELECT 1 /* note"),
+            Some((SqlError::UnterminatedComment, 9..16))
+        );
+    }
+
+    /// Design decision 4: a stray `)` is its own position; an unclosed `(` is the innermost one
+    /// still outstanding — not merely the last one opened.
+    #[test]
+    fn unbalanced_parentheses_point_at_the_unmatched_bracket() {
+        assert_eq!(
+            scan_error("SELECT 1)"),
+            Some((SqlError::UnbalancedParentheses, 8..9))
+        );
+        assert_eq!(
+            scan_error("SELECT (1, (2"),
+            Some((SqlError::UnbalancedParentheses, 11..12))
+        );
+        assert_eq!(
+            scan_error("SELECT ((1)"),
+            Some((SqlError::UnbalancedParentheses, 7..8))
+        );
+        assert_eq!(scan_error("SELECT (1)"), None);
+    }
+
+    /// The first problem wins, in the order the scanner meets them: a quote left open inside a
+    /// bracket is the quote's fault, because it is what stopped the bracket from closing.
+    #[test]
+    fn the_earliest_lexical_error_is_the_one_reported() {
+        assert_eq!(
+            scan_error("SELECT ) 'x"),
+            Some((SqlError::UnbalancedParentheses, 7..8))
+        );
+        assert_eq!(
+            scan_error("SELECT (1, 'x"),
+            Some((SqlError::UnterminatedQuote, 11..13))
+        );
+    }
+
+    fn error_at(range: Range<usize>, message: &str) -> Option<Diagnostic> {
+        Some(Diagnostic {
+            range,
+            severity: Severity::Error,
+            message: message.to_owned(),
+        })
+    }
+
+    /// FR3-009, design decision 5: lexical problems are certain, so they are errors, and each
+    /// names what is open rather than repeating the generic `SqlError` text.
+    #[test]
+    fn each_lexical_problem_is_an_error_with_its_own_message_and_range() {
+        assert_eq!(
+            diagnose("SELECT 'abc"),
+            error_at(7..11, "unterminated quoted string or identifier")
+        );
+        assert_eq!(
+            diagnose("SELECT \"abc"),
+            error_at(7..11, "unterminated quoted string or identifier")
+        );
+        assert_eq!(
+            diagnose("SELECT $body$abc"),
+            error_at(7..16, "unterminated dollar-quoted string")
+        );
+        assert_eq!(
+            diagnose("SELECT 1 /* note"),
+            error_at(9..16, "unterminated block comment")
+        );
+        assert_eq!(
+            diagnose("SELECT (1, (2"),
+            error_at(11..12, "unclosed parenthesis")
+        );
+        assert_eq!(
+            diagnose("SELECT 1)"),
+            error_at(8..9, "unmatched closing parenthesis")
+        );
+    }
+
+    fn warning_at(range: Range<usize>, message: &str) -> Option<Diagnostic> {
+        Some(Diagnostic {
+            range,
+            severity: Severity::Warning,
+            message: message.to_owned(),
+        })
+    }
+
+    /// The guard against false positives: every statement PostgreSQL accepts opens a statement
+    /// here without comment, in either case.
+    #[test]
+    fn every_statement_keyword_opens_a_statement_without_a_warning() {
+        for keyword in STATEMENT_KEYWORDS {
+            assert_eq!(
+                diagnose(&format!("{keyword} something;")),
+                None,
+                "{keyword}"
+            );
+            assert_eq!(
+                diagnose(&format!("{} something;", keyword.to_ascii_lowercase())),
+                None,
+                "{keyword}"
+            );
+        }
+    }
+
+    /// FR3-009, design decision 5: a first word that is not a statement is a guess, so a warning,
+    /// pointing at the word in the user's own spelling.
+    #[test]
+    fn an_unrecognised_first_word_is_a_warning_on_that_word() {
+        assert_eq!(
+            diagnose("selct 1"),
+            warning_at(0..5, "`selct` does not begin a PostgreSQL statement")
+        );
+        assert_eq!(
+            diagnose("SELECT 1; SELCT 2"),
+            warning_at(10..15, "`SELCT` does not begin a PostgreSQL statement")
+        );
+    }
+
+    /// Only the first offending statement is reported.
+    #[test]
+    fn only_the_first_offending_statement_is_reported() {
+        assert_eq!(
+            diagnose("SELCT 1; SELCT 2"),
+            warning_at(0..5, "`SELCT` does not begin a PostgreSQL statement")
+        );
+    }
+
+    /// A statement that is nothing but its semicolon is empty; a trailing comment with no
+    /// semicolon is not a statement at all and is left alone.
+    #[test]
+    fn an_empty_statement_is_a_warning_but_a_trailing_comment_is_not() {
+        assert_eq!(diagnose("SELECT 1;;"), warning_at(9..10, "empty statement"));
+        assert_eq!(
+            diagnose("SELECT 1; /* gap */ ;"),
+            warning_at(10..21, "empty statement")
+        );
+        assert_eq!(diagnose("SELECT 1; -- done"), None);
+        assert_eq!(diagnose("-- note\nSELECT 1"), None);
+    }
+
+    /// A statement opening with something other than a word is beyond a guess and is not judged.
+    #[test]
+    fn a_statement_that_does_not_open_with_a_word_is_not_judged() {
+        assert_eq!(diagnose("(SELECT 1) UNION (SELECT 2)"), None);
+    }
+
+    /// Design decision 6: the statement tier runs only on a clean scan, so a lexical error is
+    /// reported as itself and never as a misread statement.
+    #[test]
+    fn a_lexical_error_suppresses_the_statement_tier() {
+        assert_eq!(
+            diagnose("SELCT 'x"),
+            error_at(6..8, "unterminated quoted string or identifier")
+        );
+    }
+
+    /// A clean document reports nothing, and so does an empty one.
+    #[test]
+    fn a_clean_document_has_no_diagnostic() {
+        assert_eq!(diagnose("SELECT (1, 'a''b') /* ok */ -- fine"), None);
+        assert_eq!(diagnose(""), None);
     }
 }

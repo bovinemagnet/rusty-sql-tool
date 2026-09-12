@@ -19,7 +19,7 @@ use crate::definition::{DefinitionSection, ObjectDefinition};
 use crate::plan::{GraphLayout, PlanRow, QueryPlan};
 use crate::postgres::PostgresProvider;
 use crate::result::{CellValue, ExecutionStatus, QueryError, QueryResult};
-use crate::sql::{Highlight, HighlightSpan, highlight_lines};
+use crate::sql::{Diagnostic, Highlight, HighlightSpan, Severity, diagnose, highlight_lines};
 
 // RepFoundry desktop — Kinetic Green.
 const BACKGROUND: u32 = 0x0a0b0d; // window canvas
@@ -2894,6 +2894,7 @@ impl AppView {
                                         .child(highlight_line(
                                             line,
                                             spans.get(index).map_or(&[][..], Vec::as_slice),
+                                            None,
                                         )),
                                 );
                             }
@@ -2922,13 +2923,64 @@ impl AppView {
             .child(body)
     }
 
+    /// The one thing wrong with the front editor's document, computed afresh each frame beside
+    /// the highlighting so it can never be stale against the text it describes (FR3-009).
+    fn editor_diagnostic(&self) -> Option<Diagnostic> {
+        diagnose(&self.editor.document)
+    }
+
+    /// The message strip under the editor: severity, `line:column` and the message, from the
+    /// same diagnostic the underline was painted from (FR3-009). Positions are one-based, as
+    /// editors show them.
+    fn diagnostic_strip(&self, diagnostic: &Diagnostic) -> impl IntoElement {
+        let position = document_position(&self.editor.document, diagnostic.range.start);
+        let label = match diagnostic.severity {
+            Severity::Error => "ERROR",
+            Severity::Warning => "WARNING",
+        };
+        div()
+            .id("diagnostic-strip")
+            .debug_selector(|| "diagnostic-strip".to_owned())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .mx(px(30.))
+            .mb(px(12.))
+            .px(px(14.))
+            .py(px(8.))
+            .rounded(px(CARD_RADIUS))
+            .bg(rgb(PANEL))
+            .font_family(self.fonts.mono.clone())
+            .text_size(px(11.))
+            .child(
+                div()
+                    .text_color(rgb(severity_colour(diagnostic.severity)))
+                    .child(label),
+            )
+            .child(div().text_color(rgb(MUTED)).child(format!(
+                "{}:{}",
+                position.line + 1,
+                position.column + 1
+            )))
+            .child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .child(diagnostic.message.clone()),
+            )
+    }
+
     /// The SQL document, with the caret drawn where the cursor actually is and the selection
     /// painted behind the glyphs. GPUI paints neither of those itself, so both are placed
     /// arithmetically from the character advance — sound because the editor is monospace.
     ///
     /// The caret and selection are derived from the real document even while the placeholder is
     /// showing, so an empty editor still shows a caret at the point typing will start.
-    fn editor_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn editor_surface(
+        &self,
+        diagnostic: Option<&Diagnostic>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let document = &self.editor.document;
         let displayed = if document.is_empty() {
             "-- Write PostgreSQL here\nSELECT current_database();"
@@ -2985,6 +3037,13 @@ impl AppView {
                 .selection
                 .as_ref()
                 .and_then(|selection| selected_columns(document, selection, index));
+            let underline = diagnostic.and_then(|diagnostic| {
+                line_slice(document, &diagnostic.range, index).map(|range| Underline {
+                    line: index,
+                    range,
+                    severity: diagnostic.severity,
+                })
+            });
             lines = lines.child(
                 div()
                     .id(SharedString::from(format!("editor-line-{index}")))
@@ -3031,6 +3090,7 @@ impl AppView {
                     .child(highlight_line(
                         line,
                         highlights.get(index).map_or(&[][..], Vec::as_slice),
+                        underline.as_ref(),
                     ))
                     .children((caret.line == index).then(|| {
                         div()
@@ -3971,6 +4031,11 @@ impl Render for AppView {
         let editing_limit = self.limit_buffer.is_some();
         let pane_visible =
             self.editor.destination == ResultDestination::Pane && self.focus == Focus::Editor;
+        // Only the editor tab paints diagnostics, and only one scan per frame is paid for: the
+        // underline and the strip both read this.
+        let diagnostic = (self.focus == Focus::Editor)
+            .then(|| self.editor_diagnostic())
+            .flatten();
         div()
             .track_focus(&self.focus_handle)
             .key_context("SqlEditor")
@@ -4355,11 +4420,16 @@ impl Render for AppView {
                                             |view: &mut Self| &mut view.editor_scroll,
                                             &self.editor_scroll,
                                             "editor-scroll",
-                                            self.editor_surface(cx),
+                                            self.editor_surface(diagnostic.as_ref(), cx),
                                             cx,
                                         )
                                         .into_any_element(),
                                     }),
+                            )
+                            .children(
+                                diagnostic
+                                    .as_ref()
+                                    .map(|diagnostic| self.diagnostic_strip(diagnostic)),
                             )
                             .when(pane_visible, |column| {
                                 column.child(self.results_splitter(cx))
@@ -4599,12 +4669,24 @@ fn segment(
         .child(label.into())
 }
 
-/// Paints one line from the spans [`highlight_lines`] worked out for it. The view classifies
-/// nothing itself: reading SQL is the parser's job, and a second reading here would disagree with
-/// it (59.3).
-fn highlight_line(line: &str, spans: &[HighlightSpan]) -> impl IntoElement {
+/// Paints one line from the spans [`highlight_lines`] worked out for it, with the diagnostic's
+/// stretch of the line underlined. The view classifies nothing itself: reading SQL is the
+/// parser's job, and a second reading here would disagree with it (59.3).
+fn highlight_line(
+    line: &str,
+    spans: &[HighlightSpan],
+    underline: Option<&Underline>,
+) -> impl IntoElement {
     let mut row = div().flex().flex_row().whitespace_nowrap();
-    for span in spans {
+    let split;
+    let pieces: Box<dyn Iterator<Item = (&HighlightSpan, bool)>> = match underline {
+        Some(underline) => {
+            split = split_at_underline(spans, &underline.range);
+            Box::new(split.iter().map(|(span, underlined)| (span, *underlined)))
+        }
+        None => Box::new(spans.iter().map(|span| (span, false))),
+    };
+    for (span, underlined) in pieces {
         let colour = match span.highlight {
             Highlight::Keyword => ACCENT,
             Highlight::Literal => STRING,
@@ -4612,11 +4694,27 @@ fn highlight_line(line: &str, spans: &[HighlightSpan]) -> impl IntoElement {
             Highlight::Function => FUNCTION,
             Highlight::Plain => TEXT,
         };
-        row = row.child(
-            div()
-                .text_color(rgb(colour))
-                .child(line[span.range.clone()].to_owned()),
-        );
+        let piece = div()
+            .text_color(rgb(colour))
+            .child(line[span.range.clone()].to_owned());
+        row = row.child(match underline {
+            Some(underline) if underlined => {
+                // Selectable in tests by line and start byte, the way object rows and tabs are.
+                let selector = SharedString::from(format!(
+                    "diagnostic-underline-{}-{}",
+                    underline.line, span.range.start
+                ));
+                let id = selector.clone();
+                piece
+                    .id(id)
+                    .debug_selector(move || selector.to_string())
+                    .underline()
+                    .text_decoration_wavy()
+                    .text_decoration_color(rgb(severity_colour(underline.severity)))
+                    .into_any_element()
+            }
+            _ => piece.into_any_element(),
+        });
     }
     row
 }
@@ -4961,6 +5059,69 @@ fn document_position(document: &str, offset: usize) -> DocumentPosition {
     DocumentPosition {
         line: preceding.matches('\n').count(),
         column: preceding[line_start..].chars().count(),
+    }
+}
+
+/// The stretch of one editor line a diagnostic covers, and how loudly to paint it.
+struct Underline {
+    line: usize,
+    range: Range<usize>,
+    severity: Severity,
+}
+
+/// The bytes of `line` a document byte range covers, or `None` where it touches none of them.
+/// Bytes rather than columns because it addresses a [`HighlightSpan`], which is in bytes too.
+fn line_slice(document: &str, range: &Range<usize>, line: usize) -> Option<Range<usize>> {
+    let line_start = document
+        .split_inclusive('\n')
+        .take(line)
+        .map(str::len)
+        .sum::<usize>();
+    let line_end = document[line_start..]
+        .find('\n')
+        .map_or(document.len(), |offset| line_start + offset);
+    let start = range.start.max(line_start);
+    let end = range.end.min(line_end);
+    // `then_some` would evaluate the range eagerly and underflow whenever this line sits entirely
+    // after `range` (`end` then falls below `line_start`), so the subtraction must stay lazy.
+    (start < end).then(|| start - line_start..end - line_start)
+}
+
+/// Cuts a line's spans at the edges of `underline`, so every piece is either wholly under it or
+/// wholly clear of it. Colour and decoration stay independent — a keyword is still a keyword when
+/// it is also wrong — which is why [`Highlight`] gains no variant for this.
+fn split_at_underline(
+    spans: &[HighlightSpan],
+    underline: &Range<usize>,
+) -> Vec<(HighlightSpan, bool)> {
+    let mut pieces = Vec::new();
+    for span in spans {
+        let mut cuts = vec![span.range.start];
+        cuts.extend(
+            [underline.start, underline.end]
+                .into_iter()
+                .filter(|&edge| span.range.start < edge && edge < span.range.end),
+        );
+        cuts.push(span.range.end);
+        for pair in cuts.windows(2) {
+            let range = pair[0]..pair[1];
+            let underlined = underline.start <= range.start && range.end <= underline.end;
+            pieces.push((
+                HighlightSpan {
+                    range,
+                    highlight: span.highlight,
+                },
+                underlined,
+            ));
+        }
+    }
+    pieces
+}
+
+fn severity_colour(severity: Severity) -> u32 {
+    match severity {
+        Severity::Error => RED,
+        Severity::Warning => WARN,
     }
 }
 
@@ -6830,6 +6991,71 @@ mod tests {
         });
     }
 
+    /// FR3-009: the offending text is underlined where it sits, and the underline goes when the
+    /// text is fixed.
+    #[gpui::test]
+    fn an_unterminated_quote_is_underlined_until_it_is_closed(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        cx.simulate_input("SELECT 'abc");
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let diagnostic = app
+                .editor_diagnostic()
+                .expect("an open quote should be reported");
+            assert_eq!(diagnostic.range, 7..11);
+            assert_eq!(diagnostic.severity, Severity::Error);
+        });
+        assert!(
+            cx.debug_bounds("diagnostic-underline-0-7").is_some(),
+            "the literal on line 0 should be underlined from byte 7"
+        );
+
+        cx.simulate_input("'");
+        cx.run_until_parked();
+        // gpui's test harness never evicts a painted selector from its debug-bounds map (see the
+        // plan-tree tests), so the cleared underline is asserted on the state the render reads.
+        view.update(cx, |app, _| assert_eq!(app.editor_diagnostic(), None));
+    }
+
+    /// FR3-009: the strip names the problem and where it is, and clears when the text is fixed.
+    #[gpui::test]
+    fn the_strip_reports_the_problem_and_clears_when_it_is_fixed(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        cx.simulate_input("SELECT 1;");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("SELCT 2");
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let diagnostic = app
+                .editor_diagnostic()
+                .expect("a misspelt keyword should be reported");
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(
+                document_position(&app.editor.document, diagnostic.range.start),
+                DocumentPosition { line: 1, column: 0 }
+            );
+        });
+        assert!(
+            cx.debug_bounds("diagnostic-strip").is_some(),
+            "the strip should be rendered while there is something to report"
+        );
+
+        // Four to the left puts the caret after `SEL`; the `E` mends the keyword.
+        cx.simulate_keystrokes("left left left left");
+        cx.simulate_input("E");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "SELECT 1;\nSELECT 2");
+            // The harness never evicts a painted selector, so the cleared strip is asserted on
+            // the state the render reads rather than on `debug_bounds`.
+            assert_eq!(app.editor_diagnostic(), None);
+        });
+    }
+
     #[gpui::test]
     fn native_shortcut_opens_and_switches_to_a_new_editor(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
@@ -7862,8 +8088,11 @@ mod tests {
         cx.simulate_resize(size(px(1280.), px(820.)));
         cx.run_until_parked();
 
-        // An edit at the top, then away to the far end of the document.
-        cx.simulate_keystrokes("x");
+        // An edit at the top, then away to the far end of the document. A space rather than a
+        // letter, so the edit does not itself misspell the leading keyword and raise a
+        // diagnostic — the diagnostic strip's own height would then confound the viewport math
+        // this test is exercising.
+        cx.simulate_keystrokes("space");
         cx.simulate_keystrokes("ctrl-end");
         cx.run_until_parked();
         view.update(cx, |app, _| {
@@ -8457,6 +8686,69 @@ mod tests {
         assert_eq!(
             document_position(document, 11),
             DocumentPosition { line: 1, column: 2 }
+        );
+    }
+
+    /// The bytes of one line a document range covers; a range over several lines is cut at each
+    /// newline, and a line it does not touch gets nothing.
+    #[test]
+    fn line_slice_cuts_a_document_range_at_line_boundaries() {
+        let document = "SELECT 1\n/* open\ncomment";
+        let range = 9..24;
+        assert_eq!(line_slice(document, &range, 0), None);
+        assert_eq!(line_slice(document, &range, 1), Some(0..7));
+        assert_eq!(line_slice(document, &range, 2), Some(0..7));
+        assert_eq!(line_slice(document, &range, 3), None);
+        assert_eq!(line_slice("SELECT 'abc", &(7..11), 0), Some(7..11));
+
+        // The line after a trailing newline is empty, and starts at the document's own length.
+        let trailing = "SELECT 'abc\n";
+        assert_eq!(line_slice(trailing, &(7..11), 1), None);
+        assert_eq!(line_slice(trailing, &(7..11), 0), Some(7..11));
+    }
+
+    /// Spans are cut at the underline's edges so each piece is wholly under it or wholly clear of
+    /// it, and every piece keeps the colour of the span it came from.
+    #[test]
+    fn split_at_underline_cuts_spans_at_the_underline_edges() {
+        let spans = [
+            HighlightSpan {
+                range: 0..6,
+                highlight: Highlight::Keyword,
+            },
+            HighlightSpan {
+                range: 6..12,
+                highlight: Highlight::Plain,
+            },
+        ];
+        let piece = |range: Range<usize>, highlight, underlined| {
+            (HighlightSpan { range, highlight }, underlined)
+        };
+
+        assert_eq!(
+            split_at_underline(&spans, &(8..10)),
+            vec![
+                piece(0..6, Highlight::Keyword, false),
+                piece(6..8, Highlight::Plain, false),
+                piece(8..10, Highlight::Plain, true),
+                piece(10..12, Highlight::Plain, false),
+            ]
+        );
+        assert_eq!(
+            split_at_underline(&spans, &(3..9)),
+            vec![
+                piece(0..3, Highlight::Keyword, false),
+                piece(3..6, Highlight::Keyword, true),
+                piece(6..9, Highlight::Plain, true),
+                piece(9..12, Highlight::Plain, false),
+            ]
+        );
+        assert_eq!(
+            split_at_underline(&spans, &(0..12)),
+            vec![
+                piece(0..6, Highlight::Keyword, true),
+                piece(6..12, Highlight::Plain, true),
+            ]
         );
     }
 
