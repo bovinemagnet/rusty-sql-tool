@@ -2929,6 +2929,47 @@ impl AppView {
         diagnose(&self.editor.document)
     }
 
+    /// The message strip under the editor: severity, `line:column` and the message, from the
+    /// same diagnostic the underline was painted from (FR3-009). Positions are one-based, as
+    /// editors show them.
+    fn diagnostic_strip(&self, diagnostic: &Diagnostic) -> impl IntoElement {
+        let position = document_position(&self.editor.document, diagnostic.range.start);
+        let label = match diagnostic.severity {
+            Severity::Error => "ERROR",
+            Severity::Warning => "WARNING",
+        };
+        div()
+            .id("diagnostic-strip")
+            .debug_selector(|| "diagnostic-strip".to_owned())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .mx(px(30.))
+            .mb(px(12.))
+            .px(px(14.))
+            .py(px(8.))
+            .rounded(px(CARD_RADIUS))
+            .bg(rgb(PANEL))
+            .font_family(self.fonts.mono.clone())
+            .text_size(px(11.))
+            .child(
+                div()
+                    .text_color(rgb(severity_colour(diagnostic.severity)))
+                    .child(label),
+            )
+            .child(div().text_color(rgb(MUTED)).child(format!(
+                "{}:{}",
+                position.line + 1,
+                position.column + 1
+            )))
+            .child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .child(diagnostic.message.clone()),
+            )
+    }
+
     /// The SQL document, with the caret drawn where the cursor actually is and the selection
     /// painted behind the glyphs. GPUI paints neither of those itself, so both are placed
     /// arithmetically from the character advance — sound because the editor is monospace.
@@ -4384,6 +4425,11 @@ impl Render for AppView {
                                         )
                                         .into_any_element(),
                                     }),
+                            )
+                            .children(
+                                diagnostic
+                                    .as_ref()
+                                    .map(|diagnostic| self.diagnostic_strip(diagnostic)),
                             )
                             .when(pane_visible, |column| {
                                 column.child(self.results_splitter(cx))
@@ -6969,6 +7015,43 @@ mod tests {
         view.update(cx, |app, _| assert_eq!(app.editor_diagnostic(), None));
     }
 
+    /// FR3-009: the strip names the problem and where it is, and clears when the text is fixed.
+    #[gpui::test]
+    fn the_strip_reports_the_problem_and_clears_when_it_is_fixed(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        cx.simulate_input("SELECT 1;");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("SELCT 2");
+        cx.run_until_parked();
+
+        view.update(cx, |app, _| {
+            let diagnostic = app
+                .editor_diagnostic()
+                .expect("a misspelt keyword should be reported");
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(
+                document_position(&app.editor.document, diagnostic.range.start),
+                DocumentPosition { line: 1, column: 0 }
+            );
+        });
+        assert!(
+            cx.debug_bounds("diagnostic-strip").is_some(),
+            "the strip should be rendered while there is something to report"
+        );
+
+        // Four to the left puts the caret after `SEL`; the `E` mends the keyword.
+        cx.simulate_keystrokes("left left left left");
+        cx.simulate_input("E");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor.document, "SELECT 1;\nSELECT 2");
+            // The harness never evicts a painted selector, so the cleared strip is asserted on
+            // the state the render reads rather than on `debug_bounds`.
+            assert_eq!(app.editor_diagnostic(), None);
+        });
+    }
+
     #[gpui::test]
     fn native_shortcut_opens_and_switches_to_a_new_editor(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
@@ -8001,8 +8084,11 @@ mod tests {
         cx.simulate_resize(size(px(1280.), px(820.)));
         cx.run_until_parked();
 
-        // An edit at the top, then away to the far end of the document.
-        cx.simulate_keystrokes("x");
+        // An edit at the top, then away to the far end of the document. A space rather than a
+        // letter, so the edit does not itself misspell the leading keyword and raise a
+        // diagnostic — the diagnostic strip's own height would then confound the viewport math
+        // this test is exercising.
+        cx.simulate_keystrokes("space");
         cx.simulate_keystrokes("ctrl-end");
         cx.run_until_parked();
         view.update(cx, |app, _| {
