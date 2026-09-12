@@ -34,7 +34,7 @@ pub struct PreparedStatement {
     pub automatic_limit: Option<u32>,
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SqlError {
     #[error("SQL contains an unterminated quoted string or identifier")]
     UnterminatedQuote,
@@ -767,7 +767,7 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
 
 /// What `scan` found wrong, and where. `tokenize` keeps only the error; `diagnose` keeps both,
 /// because a diagnostic with nothing to point at is not worth rendering (FR3-009).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct ScanError {
     error: SqlError,
     range: Range<usize>,

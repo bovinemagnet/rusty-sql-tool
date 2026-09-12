@@ -4678,9 +4678,13 @@ fn highlight_line(
     underline: Option<&Underline>,
 ) -> impl IntoElement {
     let mut row = div().flex().flex_row().whitespace_nowrap();
-    let pieces = match underline {
-        Some(underline) => split_at_underline(spans, &underline.range),
-        None => spans.iter().map(|span| (span.clone(), false)).collect(),
+    let split;
+    let pieces: Box<dyn Iterator<Item = (&HighlightSpan, bool)>> = match underline {
+        Some(underline) => {
+            split = split_at_underline(spans, &underline.range);
+            Box::new(split.iter().map(|(span, underlined)| (span, *underlined)))
+        }
+        None => Box::new(spans.iter().map(|span| (span, false))),
     };
     for (span, underlined) in pieces {
         let colour = match span.highlight {
@@ -4693,8 +4697,8 @@ fn highlight_line(
         let piece = div()
             .text_color(rgb(colour))
             .child(line[span.range.clone()].to_owned());
-        row = row.child(match (underlined, underline) {
-            (true, Some(underline)) => {
+        row = row.child(match underline {
+            Some(underline) if underlined => {
                 // Selectable in tests by line and start byte, the way object rows and tabs are.
                 let selector = SharedString::from(format!(
                     "diagnostic-underline-{}-{}",
@@ -8696,6 +8700,11 @@ mod tests {
         assert_eq!(line_slice(document, &range, 2), Some(0..7));
         assert_eq!(line_slice(document, &range, 3), None);
         assert_eq!(line_slice("SELECT 'abc", &(7..11), 0), Some(7..11));
+
+        // The line after a trailing newline is empty, and starts at the document's own length.
+        let trailing = "SELECT 'abc\n";
+        assert_eq!(line_slice(trailing, &(7..11), 1), None);
+        assert_eq!(line_slice(trailing, &(7..11), 0), Some(7..11));
     }
 
     /// Spans are cut at the underline's edges so each piece is wholly under it or wholly clear of
