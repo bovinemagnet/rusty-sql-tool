@@ -34,7 +34,7 @@ pub struct PreparedStatement {
     pub automatic_limit: Option<u32>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SqlError {
     #[error("SQL contains an unterminated quoted string or identifier")]
     UnterminatedQuote,
@@ -594,20 +594,38 @@ fn trimmed_range(sql: &str, range: Range<usize>) -> Option<Range<usize>> {
 
 fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
     match scan(sql) {
-        (_, Some(error)) => Err(error),
+        (_, Some(ScanError { error, .. })) => Err(error),
         (tokens, None) => Ok(tokens),
+    }
+}
+
+/// What `scan` found wrong, and where. `tokenize` keeps only the error; `diagnose` keeps both,
+/// because a diagnostic with nothing to point at is not worth rendering (FR3-009).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScanError {
+    error: SqlError,
+    range: Range<usize>,
+}
+
+/// Records a problem unless an earlier one is already held: the first is the real one, and
+/// anything after it is likely an artefact of it.
+fn report(slot: &mut Option<ScanError>, error: SqlError, range: Range<usize>) {
+    if slot.is_none() {
+        *slot = Some(ScanError { error, range });
     }
 }
 
 /// Tokenises as far as the text allows, reporting the first thing wrong with it rather than
 /// stopping. Statement splitting refuses a document it cannot read; highlighting has to colour one
 /// that is halfway through being typed, and both need the same reading of the SQL (59.3).
-fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
+fn scan(sql: &str) -> (Vec<Token>, Option<ScanError>) {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut error = None;
     let mut index = 0;
-    let mut depth = 0usize;
+    // Every `(` still waiting for its `)`, innermost last. Its length is the nesting depth, and
+    // whichever is left over at the end is the bracket to point at.
+    let mut open: Vec<Range<usize>> = Vec::new();
     while index < bytes.len() {
         if bytes[index].is_ascii_whitespace() {
             index += 1;
@@ -622,7 +640,7 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
             tokens.push(Token {
                 kind: TokenKind::Comment,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -641,12 +659,12 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
                 }
             }
             if nesting != 0 {
-                error = error.or(Some(SqlError::UnterminatedComment));
+                report(&mut error, SqlError::UnterminatedComment, start..index);
             }
             tokens.push(Token {
                 kind: TokenKind::Comment,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -670,12 +688,12 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
                 }
             }
             if !closed {
-                error = error.or(Some(SqlError::UnterminatedQuote));
+                report(&mut error, SqlError::UnterminatedQuote, start..index);
             }
             tokens.push(Token {
                 kind: TokenKind::Literal,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -690,14 +708,14 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
             {
                 Some(relative_end) => index += relative_end + delimiter.len(),
                 None => {
-                    error = error.or(Some(SqlError::UnterminatedQuote));
                     index = bytes.len();
+                    report(&mut error, SqlError::UnterminatedQuote, start..index);
                 }
             }
             tokens.push(Token {
                 kind: TokenKind::Literal,
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
@@ -709,37 +727,32 @@ fn scan(sql: &str) -> (Vec<Token>, Option<SqlError>) {
             tokens.push(Token {
                 kind: TokenKind::Word(sql[start..index].to_ascii_uppercase()),
                 range: start..index,
-                depth,
+                depth: open.len(),
             });
             continue;
         }
         let character = sql[index..].chars().next().expect("valid UTF-8");
         index += character.len_utf8();
-        let token_depth = if character == ')' {
-            match depth.checked_sub(1) {
-                Some(outer) => {
-                    depth = outer;
-                    outer
-                }
-                None => {
-                    error = error.or(Some(SqlError::UnbalancedParentheses));
-                    0
-                }
-            }
-        } else {
-            depth
-        };
+        // A `)` is popped before its token is recorded, so it carries the depth outside it — the
+        // same depth its `(` carried.
+        if character == ')' && open.pop().is_none() {
+            report(&mut error, SqlError::UnbalancedParentheses, start..index);
+        }
         tokens.push(Token {
             kind: TokenKind::Symbol(character),
             range: start..index,
-            depth: token_depth,
+            depth: open.len(),
         });
         if character == '(' {
-            depth += 1;
+            open.push(start..index);
         }
     }
-    if depth != 0 {
-        error = error.or(Some(SqlError::UnbalancedParentheses));
+    if let Some(innermost) = open.last() {
+        report(
+            &mut error,
+            SqlError::UnbalancedParentheses,
+            innermost.clone(),
+        );
     }
     (tokens, error)
 }
@@ -1117,6 +1130,69 @@ mod tests {
         assert_eq!(
             referenced_tables("SELECT * FROM orders ORDER BY id"),
             [table(None, "orders", None)]
+        );
+    }
+
+    fn scan_error(sql: &str) -> Option<(SqlError, Range<usize>)> {
+        scan(sql).1.map(|found| (found.error, found.range))
+    }
+
+    /// Design decision 3: the scanner reports where each lexical problem is, opener to end of
+    /// input, so a diagnostic has something to point at.
+    #[test]
+    fn lexical_errors_carry_the_range_of_the_offending_token() {
+        assert_eq!(
+            scan_error("SELECT 'abc"),
+            Some((SqlError::UnterminatedQuote, 7..11))
+        );
+        assert_eq!(
+            scan_error("SELECT \"abc"),
+            Some((SqlError::UnterminatedQuote, 7..11))
+        );
+        assert_eq!(
+            scan_error("SELECT $$abc"),
+            Some((SqlError::UnterminatedQuote, 7..12))
+        );
+        assert_eq!(
+            scan_error("SELECT $fn$abc"),
+            Some((SqlError::UnterminatedQuote, 7..14))
+        );
+        assert_eq!(
+            scan_error("SELECT 1 /* note"),
+            Some((SqlError::UnterminatedComment, 9..16))
+        );
+    }
+
+    /// Design decision 4: a stray `)` is its own position; an unclosed `(` is the innermost one
+    /// still outstanding — not merely the last one opened.
+    #[test]
+    fn unbalanced_parentheses_point_at_the_unmatched_bracket() {
+        assert_eq!(
+            scan_error("SELECT 1)"),
+            Some((SqlError::UnbalancedParentheses, 8..9))
+        );
+        assert_eq!(
+            scan_error("SELECT (1, (2"),
+            Some((SqlError::UnbalancedParentheses, 11..12))
+        );
+        assert_eq!(
+            scan_error("SELECT ((1)"),
+            Some((SqlError::UnbalancedParentheses, 7..8))
+        );
+        assert_eq!(scan_error("SELECT (1)"), None);
+    }
+
+    /// The first problem wins, in the order the scanner meets them: a quote left open inside a
+    /// bracket is the quote's fault, because it is what stopped the bracket from closing.
+    #[test]
+    fn the_earliest_lexical_error_is_the_one_reported() {
+        assert_eq!(
+            scan_error("SELECT ) 'x"),
+            Some((SqlError::UnbalancedParentheses, 7..8))
+        );
+        assert_eq!(
+            scan_error("SELECT (1, 'x"),
+            Some((SqlError::UnterminatedQuote, 11..13))
         );
     }
 }
