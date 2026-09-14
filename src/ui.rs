@@ -537,6 +537,9 @@ struct AppView {
     selecting_results: bool,
     /// Whether a pointer drag is currently extending the SQL editor's selection.
     selecting_editor: bool,
+    /// Whether the last frame laid out the diagnostic strip. Layout state, not a cached
+    /// diagnostic: it only says whether the editor's height is about to change.
+    strip_shown: bool,
     /// Advance width of one monospace character at the result text size, used to turn a pointer
     /// position into a column and to size the selection highlight.
     mono_advance: Pixels,
@@ -669,6 +672,7 @@ impl AppView {
             plan_selection: None,
             selecting_results: false,
             selecting_editor: false,
+            strip_shown: false,
             mono_advance: measure_mono_advance(&fonts_for_advance, RESULT_TEXT_SIZE, cx),
             editor_advance: measure_mono_advance(&fonts_for_advance, EDITOR_TEXT_SIZE, cx),
             result_pane_height: px(RESULT_PANE_HEIGHT),
@@ -4035,7 +4039,7 @@ impl Focusable for AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.connection_state() == ConnectionState::Connected;
         let running = self.is_running();
         let editing_limit = self.limit_buffer.is_some();
@@ -4046,6 +4050,18 @@ impl Render for AppView {
         let diagnostic = (self.focus == Focus::Editor)
             .then(|| self.editor_diagnostic())
             .flatten();
+        // The strip takes its height from the editor, and `follow_caret` has already run against
+        // the height this frame is about to change. Once the frame is laid out, follow again
+        // with the real viewport, so a caret on the bottom row is not left under the strip.
+        // Deferred rather than scheduled for the next frame: a deferral queued during the draw
+        // runs as soon as the draw is over, in the app and in the test harness alike.
+        if diagnostic.is_some() != self.strip_shown {
+            self.strip_shown = diagnostic.is_some();
+            cx.defer_in(window, |view, _, cx| {
+                view.follow_caret();
+                cx.notify();
+            });
+        }
         div()
             .track_focus(&self.focus_handle)
             .key_context("SqlEditor")
@@ -7913,20 +7929,22 @@ mod tests {
         });
     }
 
-    /// Asserts the caret sits inside the editor viewport, on both axes.
+    /// Asserts the caret sits inside the editor viewport, on both axes. Measured in pixels, as
+    /// the viewport is: a strip under the editor leaves it a fraction of a row tall, and a
+    /// whole-row count would call the bottom row hidden while it is fully on screen.
     #[track_caller]
     fn assert_caret_visible(app: &AppView, what: &str) {
         let handle = &app.editor_scroll.handle;
-        let top = (-f32::from(handle.offset().y) / EDITOR_LINE_HEIGHT)
-            .max(0.)
-            .round() as usize;
-        let visible = app.editor_page_lines();
+        let top = (-f32::from(handle.offset().y)).max(0.);
+        let height = f32::from(handle.bounds().size.height);
         let position = document_position(&app.editor.document, app.editor.cursor);
+        let line_top = position.line as f32 * EDITOR_LINE_HEIGHT;
+        let line_bottom = line_top + EDITOR_LINE_HEIGHT;
         assert!(
-            (top..top + visible).contains(&position.line),
-            "after {what} the caret is on line {}, outside the visible lines {top}..{}",
-            position.line,
-            top + visible
+            line_top >= top && line_bottom <= top + height,
+            "after {what} the caret's line spans {line_top}..{line_bottom}, outside the visible \
+             {top}..{}",
+            top + height
         );
 
         let left = (-f32::from(handle.offset().x)).max(0.);
@@ -8131,6 +8149,36 @@ mod tests {
     /// Undo restores the caret to where the edit was made, which may be a screenful away from
     /// wherever the user has since scrolled to. Without the viewport following, the document
     /// visibly changes while the change itself happens off screen.
+    /// The strip takes its height from the editor, and `follow_caret` measured the editor before
+    /// the strip was there. A caret on the bottom row when a diagnostic first appears must still
+    /// be on screen once the strip has been laid out.
+    #[gpui::test]
+    fn the_caret_stays_visible_when_the_strip_appears_under_it(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+        view.update(cx, |app, _| {
+            app.editor.document = long_document();
+            app.editor.cursor = 0;
+            app.focus = Focus::Editor;
+        });
+        cx.simulate_resize(size(px(1280.), px(820.)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-end");
+        cx.run_until_parked();
+        view.update(cx, |app, _| assert_caret_visible(app, "ctrl-end"));
+
+        // An open quote is an error at the caret, so the strip appears at once.
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("'");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert!(
+                app.editor_diagnostic().is_some(),
+                "the open quote should be reported"
+            );
+            assert_caret_visible(app, "the strip appeared");
+        });
+    }
+
     #[gpui::test]
     fn undo_brings_the_viewport_back_to_the_edit(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
@@ -8142,11 +8190,10 @@ mod tests {
         cx.simulate_resize(size(px(1280.), px(820.)));
         cx.run_until_parked();
 
-        // An edit at the top, then away to the far end of the document. A space rather than a
-        // letter, so the edit does not itself misspell the leading keyword and raise a
-        // diagnostic — the diagnostic strip's own height would then confound the viewport math
-        // this test is exercising.
-        cx.simulate_keystrokes("space");
+        // An edit at the top, then away to the far end of the document. The letter misspells the
+        // leading keyword, so once the caret has left it a warning strip appears under the
+        // editor in the same frame the caret jumps — the viewport must still follow the caret.
+        cx.simulate_keystrokes("x");
         cx.simulate_keystrokes("ctrl-end");
         cx.run_until_parked();
         view.update(cx, |app, _| {
