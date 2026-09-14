@@ -7126,6 +7126,26 @@ mod tests {
         });
     }
 
+    /// The same rule, for the other warning: a stray `;` just typed is quiet until the caret
+    /// moves on, the way a half-typed word is. It may be about to be deleted again.
+    #[gpui::test]
+    fn an_empty_statement_just_typed_waits_until_the_caret_moves_on(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        cx.simulate_input("SELECT 1;;");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor_diagnostic(), None, "stray `;` at the caret");
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            let diagnostic = app.editor_diagnostic().expect("the caret has moved on");
+            assert_eq!(diagnostic.message, "empty statement");
+        });
+    }
+
     #[gpui::test]
     fn native_shortcut_opens_and_switches_to_a_new_editor(cx: &mut TestAppContext) {
         let (view, cx) = build_app_view(cx);
