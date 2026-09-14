@@ -2925,8 +2925,18 @@ impl AppView {
 
     /// The one thing wrong with the front editor's document, computed afresh each frame beside
     /// the highlighting so it can never be stale against the text it describes (FR3-009).
+    ///
+    /// A warning is a guess about a word, and a word with the caret inside or at the end of it is
+    /// still being typed — `SELEC` is on its way to `SELECT`, not wrong yet. The guess waits until
+    /// the caret leaves. Strictly after the start, so a caret placed in front of a misspelt word
+    /// still sees it. An error is certain and is reported wherever the caret is. The parser does
+    /// not know where the caret is, so this is the view's rule, not `diagnose`'s.
     fn editor_diagnostic(&self) -> Option<Diagnostic> {
-        diagnose(&self.editor.document)
+        let cursor = self.editor.cursor;
+        diagnose(&self.editor.document).filter(|diagnostic| {
+            diagnostic.severity != Severity::Warning
+                || !(diagnostic.range.start < cursor && cursor <= diagnostic.range.end)
+        })
     }
 
     /// The message strip under the editor: severity, `line:column` and the message, from the
@@ -7053,6 +7063,50 @@ mod tests {
             // The harness never evicts a painted selector, so the cleared strip is asserted on
             // the state the render reads rather than on `debug_bounds`.
             assert_eq!(app.editor_diagnostic(), None);
+        });
+    }
+
+    /// A warning is a guess about a word, and a word under the caret is still being typed: the
+    /// guess waits until the caret leaves it. An error at the caret is still reported.
+    #[gpui::test]
+    fn a_warning_on_the_word_being_typed_waits_until_the_caret_leaves_it(cx: &mut TestAppContext) {
+        let (view, cx) = build_app_view(cx);
+
+        cx.simulate_input("SELEC");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(
+                app.editor_diagnostic(),
+                None,
+                "half-typed keyword at the caret"
+            );
+        });
+
+        // Home puts the caret in front of the word, which is no longer typing it.
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            let diagnostic = app
+                .editor_diagnostic()
+                .expect("the caret has left the word");
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(diagnostic.range, 0..5);
+        });
+
+        // Back inside the word, and it is quiet again.
+        cx.simulate_keystrokes("right right");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            assert_eq!(app.editor_diagnostic(), None, "caret inside the word");
+        });
+
+        // An open quote at the caret is an error, not a guess, and is reported as it is typed.
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("T 'abc");
+        cx.run_until_parked();
+        view.update(cx, |app, _| {
+            let diagnostic = app.editor_diagnostic().expect("an open quote at the caret");
+            assert_eq!(diagnostic.severity, Severity::Error);
         });
     }
 
