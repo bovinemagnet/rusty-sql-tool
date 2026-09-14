@@ -91,6 +91,14 @@ absent from it produces a false warning on valid SQL, so the list is deliberatel
 The empty-statement check is the weakest member of the set and the first thing to cut if it proves
 noisy in use.
 
+A warning whose range the caret is inside or at the end of is not shown. A warning is a guess about
+a word, and a word being typed is not wrong yet — `SELEC` is on its way to `SELECT`, and without
+this rule the strip appeared and cleared on every keystroke of every statement. Strictly after the
+range's start, so a caret placed in front of a misspelt word still sees it. Errors are certain and
+are shown wherever the caret is: an open quote is worth knowing about while you are inside it.
+The parser does not know where the caret is, so this is the view's rule; `diagnose` still reports
+the document as it stands.
+
 ## Layering
 
 `diagnose` lives in `src/sql.rs`, the single PostgreSQL-aware tokenising layer (§59.3). The view
